@@ -1,0 +1,474 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ * MSPM0G3507 自动巡迹一圈
+ *
+ * 流程：
+ * A->B 直行 3.4s
+ * 停车 + 亮灯 + 蜂鸣 2.0s
+ * B->C 半圆黑线循迹 4.9s
+ * 停车 + 亮灯 + 蜂鸣 2.0s
+ * C->D 直行 3.4s
+ * 停车 + 亮灯 + 蜂鸣 2.0s
+ * D->A 半圆黑线循迹 4.9s
+ * 回到 A 点停车 + 亮灯 + 蜂鸣 2.0s
+ *
+ * 传感器：
+ * S1 -> PA17
+ * S2 -> PA18
+ * S3 -> PB19
+ * S4 -> PA21
+ * S5 -> PA22
+ * S6 -> PB20
+ * S7 -> PB24
+ * S8 -> PA23
+ *
+ * 电机方向：
+ * L_IN1 -> PB8
+ * L_IN2 -> PB9
+ * R_IN3 -> PB2
+ * R_IN4 -> PB3
+ *
+ * 电机使能：
+ * PWM_RIGHT -> PB4
+ * PWM_LEFT  -> PB6
+ *
+ * LED    -> PA24
+ * 蜂鸣器 -> PA1
+ */
+
+/* ================= 参数区 ================= */
+
+#define BLACK_IS_LOW              1
+
+#define LEFT_MOTOR_REVERSE        0
+#define RIGHT_MOTOR_REVERSE       0
+#define TURN_REVERSE              0
+
+/* LED 高电平亮 */
+#define LED_ACTIVE_HIGH           1
+
+/* 蜂鸣器低电平响 */
+#define BUZZER_ACTIVE_HIGH        0
+
+#define MOTOR_EN_ACTIVE_HIGH      1
+
+#define T_STRAIGHT_MS             3400u
+#define T_ARC_MS                  4900u
+#define T_ALERT_MS                2000u
+
+#define PWM_MAX                   10
+#define SOFT_DELAY                1200
+
+/*
+ * 直行补偿：
+ * 在“第一版略右偏”和“上一版略左偏”之间取中间值。
+ * 大多数脉冲右轮为 9，少数脉冲右轮为 8，平均约 8.9。
+ */
+#define SPEED_LEFT_FORWARD        10
+#define SPEED_RIGHT_FORWARD_HIGH  9
+#define SPEED_RIGHT_FORWARD_LOW   8
+
+/* 循迹参数 */
+#define FOLLOW_CENTER_SPEED       9
+#define FOLLOW_SOFT_INNER         7
+#define FOLLOW_HARD_INNER         4
+#define FOLLOW_OUTER_SPEED        10
+
+volatile uint32_t g_ms = 0;
+static int8_t g_last_err = 0;
+
+/* ================= 时基 ================= */
+
+void SysTick_Handler(void)
+{
+    g_ms++;
+}
+
+static uint32_t millis(void)
+{
+    return g_ms;
+}
+
+static void delay_ms(uint32_t ms)
+{
+    uint32_t start = millis();
+    while ((millis() - start) < ms)
+    {
+    }
+}
+
+static void delay_soft(uint32_t n)
+{
+    while (n--)
+    {
+        __asm(" nop");
+    }
+}
+
+/* ================= GPIO 基础 ================= */
+
+static void PinHigh(GPIO_Regs *port, uint32_t pin)
+{
+    DL_GPIO_setPins(port, pin);
+}
+
+static void PinLow(GPIO_Regs *port, uint32_t pin)
+{
+    DL_GPIO_clearPins(port, pin);
+}
+
+static uint8_t ReadRaw(GPIO_Regs *port, uint32_t pin)
+{
+    return (DL_GPIO_readPins(port, pin) & pin) ? 1 : 0;
+}
+
+static uint8_t ReadBlack(GPIO_Regs *port, uint32_t pin)
+{
+    uint8_t raw = ReadRaw(port, pin);
+
+#if BLACK_IS_LOW
+    return raw ? 0 : 1;
+#else
+    return raw ? 1 : 0;
+#endif
+}
+
+/* ================= LED / 蜂鸣器 ================= */
+
+static void LedOn(void)
+{
+#if LED_ACTIVE_HIGH
+    PinHigh(GPIOA, DL_GPIO_PIN_24);
+#else
+    PinLow(GPIOA, DL_GPIO_PIN_24);
+#endif
+}
+
+static void LedOff(void)
+{
+#if LED_ACTIVE_HIGH
+    PinLow(GPIOA, DL_GPIO_PIN_24);
+#else
+    PinHigh(GPIOA, DL_GPIO_PIN_24);
+#endif
+}
+
+static void BuzzerOn(void)
+{
+#if BUZZER_ACTIVE_HIGH
+    PinHigh(GPIOA, DL_GPIO_PIN_1);
+#else
+    PinLow(GPIOA, DL_GPIO_PIN_1);
+#endif
+}
+
+static void BuzzerOff(void)
+{
+#if BUZZER_ACTIVE_HIGH
+    PinLow(GPIOA, DL_GPIO_PIN_1);
+#else
+    PinHigh(GPIOA, DL_GPIO_PIN_1);
+#endif
+}
+
+static void AlertOn(void)
+{
+    LedOn();
+    BuzzerOn();
+}
+
+static void AlertOff(void)
+{
+    LedOff();
+    BuzzerOff();
+}
+
+/* ================= 电机使能 ================= */
+
+static void MotorEnableOn(void)
+{
+#if MOTOR_EN_ACTIVE_HIGH
+    PinHigh(GPIOB, DL_GPIO_PIN_4 | DL_GPIO_PIN_6);
+#else
+    PinLow(GPIOB, DL_GPIO_PIN_4 | DL_GPIO_PIN_6);
+#endif
+}
+
+static void MotorEnableOff(void)
+{
+#if MOTOR_EN_ACTIVE_HIGH
+    PinLow(GPIOB, DL_GPIO_PIN_4 | DL_GPIO_PIN_6);
+#else
+    PinHigh(GPIOB, DL_GPIO_PIN_4 | DL_GPIO_PIN_6);
+#endif
+}
+
+/* ================= 电机方向 ================= */
+
+static void LeftForward(void)
+{
+#if LEFT_MOTOR_REVERSE
+    PinLow(GPIOB, DL_GPIO_PIN_8);
+    PinHigh(GPIOB, DL_GPIO_PIN_9);
+#else
+    PinHigh(GPIOB, DL_GPIO_PIN_8);
+    PinLow(GPIOB, DL_GPIO_PIN_9);
+#endif
+}
+
+static void LeftStop(void)
+{
+    PinLow(GPIOB, DL_GPIO_PIN_8);
+    PinLow(GPIOB, DL_GPIO_PIN_9);
+}
+
+static void RightForward(void)
+{
+#if RIGHT_MOTOR_REVERSE
+    PinLow(GPIOB, DL_GPIO_PIN_2);
+    PinHigh(GPIOB, DL_GPIO_PIN_3);
+#else
+    PinHigh(GPIOB, DL_GPIO_PIN_2);
+    PinLow(GPIOB, DL_GPIO_PIN_3);
+#endif
+}
+
+static void RightStop(void)
+{
+    PinLow(GPIOB, DL_GPIO_PIN_2);
+    PinLow(GPIOB, DL_GPIO_PIN_3);
+}
+
+static void CarStop(void)
+{
+    LeftStop();
+    RightStop();
+    MotorEnableOff();
+}
+
+/* ================= 软件 PWM ================= */
+
+static void MotorForwardPulse(uint8_t leftSpeed, uint8_t rightSpeed)
+{
+    uint8_t i;
+
+    if (leftSpeed > PWM_MAX) leftSpeed = PWM_MAX;
+    if (rightSpeed > PWM_MAX) rightSpeed = PWM_MAX;
+
+    MotorEnableOn();
+
+    for (i = 0; i < PWM_MAX; i++)
+    {
+        if (i < leftSpeed) LeftForward();
+        else LeftStop();
+
+        if (i < rightSpeed) RightForward();
+        else RightStop();
+
+        delay_soft(SOFT_DELAY);
+    }
+}
+
+/* ================= 直行补偿 ================= */
+
+static void CarForwardComp(void)
+{
+    static uint8_t straight_cnt = 0;
+
+    straight_cnt++;
+
+    if (straight_cnt >= 10)
+    {
+        straight_cnt = 0;
+        MotorForwardPulse(SPEED_LEFT_FORWARD, SPEED_RIGHT_FORWARD_LOW);
+    }
+    else
+    {
+        MotorForwardPulse(SPEED_LEFT_FORWARD, SPEED_RIGHT_FORWARD_HIGH);
+    }
+}
+
+/* ================= 八路传感器 ================= */
+
+static uint8_t S1(void) { return ReadBlack(GPIOA, DL_GPIO_PIN_17); }
+static uint8_t S2(void) { return ReadBlack(GPIOA, DL_GPIO_PIN_18); }
+static uint8_t S3(void) { return ReadBlack(GPIOB, DL_GPIO_PIN_19); }
+static uint8_t S4(void) { return ReadBlack(GPIOA, DL_GPIO_PIN_21); }
+static uint8_t S5(void) { return ReadBlack(GPIOA, DL_GPIO_PIN_22); }
+static uint8_t S6(void) { return ReadBlack(GPIOB, DL_GPIO_PIN_20); }
+static uint8_t S7(void) { return ReadBlack(GPIOB, DL_GPIO_PIN_24); }
+static uint8_t S8(void) { return ReadBlack(GPIOA, DL_GPIO_PIN_23); }
+
+static int8_t ReadLineError(uint8_t *hasLine)
+{
+    static const int8_t weight[8] = { -7, -5, -3, -1, 1, 3, 5, 7 };
+    uint8_t s[8];
+    int16_t sum = 0;
+    int8_t cnt = 0;
+    uint8_t i;
+
+    s[0] = S1();
+    s[1] = S2();
+    s[2] = S3();
+    s[3] = S4();
+    s[4] = S5();
+    s[5] = S6();
+    s[6] = S7();
+    s[7] = S8();
+
+#if TURN_REVERSE
+    {
+        uint8_t t0 = s[0], t1 = s[1], t2 = s[2], t3 = s[3];
+        s[0] = s[7];
+        s[1] = s[6];
+        s[2] = s[5];
+        s[3] = s[4];
+        s[4] = t3;
+        s[5] = t2;
+        s[6] = t1;
+        s[7] = t0;
+    }
+#endif
+
+    for (i = 0; i < 8; i++)
+    {
+        if (s[i])
+        {
+            sum += weight[i];
+            cnt++;
+        }
+    }
+
+    if (cnt == 0)
+    {
+        *hasLine = 0;
+        return g_last_err;
+    }
+
+    *hasLine = 1;
+    return (int8_t)(sum / cnt);
+}
+
+/* ================= 循迹 ================= */
+
+static void LineFollowStep(void)
+{
+    uint8_t hasLine;
+    int8_t err = ReadLineError(&hasLine);
+
+    if (!hasLine)
+    {
+        if (g_last_err <= -3)
+        {
+            MotorForwardPulse(FOLLOW_SOFT_INNER, FOLLOW_OUTER_SPEED);
+        }
+        else if (g_last_err >= 3)
+        {
+            MotorForwardPulse(FOLLOW_OUTER_SPEED, FOLLOW_SOFT_INNER);
+        }
+        else
+        {
+            CarForwardComp();
+        }
+        return;
+    }
+
+    g_last_err = err;
+
+    if (err <= -5)
+    {
+        MotorForwardPulse(FOLLOW_HARD_INNER, FOLLOW_OUTER_SPEED);
+    }
+    else if (err <= -2)
+    {
+        MotorForwardPulse(FOLLOW_SOFT_INNER, FOLLOW_OUTER_SPEED);
+    }
+    else if (err < 2)
+    {
+        MotorForwardPulse(FOLLOW_CENTER_SPEED, FOLLOW_CENTER_SPEED);
+    }
+    else if (err < 5)
+    {
+        MotorForwardPulse(FOLLOW_OUTER_SPEED, FOLLOW_SOFT_INNER);
+    }
+    else
+    {
+        MotorForwardPulse(FOLLOW_OUTER_SPEED, FOLLOW_HARD_INNER);
+    }
+}
+
+/* ================= 分段动作 ================= */
+
+static void RunStraightMs(uint32_t duration_ms)
+{
+    uint32_t start = millis();
+    AlertOff();
+
+    while ((millis() - start) < duration_ms)
+    {
+        CarForwardComp();
+    }
+
+    CarStop();
+}
+
+static void RunArcFollowMs(uint32_t duration_ms)
+{
+    uint32_t start = millis();
+    AlertOff();
+
+    while ((millis() - start) < duration_ms)
+    {
+        LineFollowStep();
+    }
+
+    CarStop();
+}
+
+static void AlertStopMs(uint32_t duration_ms)
+{
+    CarStop();
+    AlertOn();
+    delay_ms(duration_ms);
+    AlertOff();
+}
+
+/* ================= main ================= */
+
+int main(void)
+{
+    SYSCFG_DL_init();
+
+    DL_GPIO_enableOutput(GPIOA, DL_GPIO_PIN_24 | DL_GPIO_PIN_1);
+    DL_GPIO_enableOutput(GPIOB, DL_GPIO_PIN_2 | DL_GPIO_PIN_3 |
+                                DL_GPIO_PIN_4 | DL_GPIO_PIN_6 |
+                                DL_GPIO_PIN_8 | DL_GPIO_PIN_9);
+
+    SysTick_Config(CPUCLK_FREQ / 1000);
+
+    CarStop();
+    AlertOff();
+    delay_ms(500);
+
+    RunStraightMs(T_STRAIGHT_MS);
+    AlertStopMs(T_ALERT_MS);
+
+    RunArcFollowMs(T_ARC_MS);
+    AlertStopMs(T_ALERT_MS);
+
+    RunStraightMs(T_STRAIGHT_MS);
+    AlertStopMs(T_ALERT_MS);
+
+    RunArcFollowMs(T_ARC_MS);
+    AlertStopMs(T_ALERT_MS);
+
+    CarStop();
+    AlertOff();
+
+    while (1)
+    {
+        CarStop();
+    }
+}
