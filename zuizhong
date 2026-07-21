@@ -1,0 +1,1065 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+#include <stdbool.h>
+
+/*
+ * MSPM0G3507 + MPU6050 + 小车低速强制直线修正
+ *
+ * 功能：
+ * 1. 读取 MPU6050
+ * 2. 开机静止校准陀螺仪
+ * 3. 小车低速直线行驶，速度约为原来的 1/3
+ * 4. 只要检测到偏航角有明显偏移，就让一边轮子停，另一边继续走
+ *
+ * MPU6050 接线：
+ * VCC -> 3.3V
+ * GND -> GND
+ * SDA -> 你的 I2C SDA
+ * SCL -> 你的 I2C SCL
+ * XDA / XCL 不接
+ *
+ * LED:
+ * PA24
+ *
+ * 电机方向：
+ * L_IN1 -> PB8
+ * L_IN2 -> PB9
+ * R_IN3 -> PB2
+ * R_IN4 -> PB3
+ *
+ * 电机使能 / PWM：
+ * PWM_RIGHT -> PB4
+ * PWM_LEFT  -> PB6
+ *
+ * 注意：
+ * 电机建议单独供电。
+ * 开发板 GND、MPU6050 GND、电机驱动 GND 必须共地。
+ */
+
+/* ================= 用户配置区 ================= */
+
+#define LED_PORT                    GPIOA
+#define LED_PIN                     DL_GPIO_PIN_24
+#define LED_ACTIVE_LOW              0
+
+/*
+ * 自动选择 SysConfig 生成的 I2C 实例
+ */
+#if defined(I2C_0_INST)
+#define MPU_I2C_INST                I2C_0_INST
+#elif defined(I2C_1_INST)
+#define MPU_I2C_INST                I2C_1_INST
+#else
+#error "No I2C instance found. Please check SysConfig."
+#endif
+
+#define MPU6050_ADDR_LOW            0x68
+#define MPU6050_ADDR_HIGH           0x69
+
+#define MPU6050_REG_WHO_AM_I        0x75
+#define MPU6050_REG_PWR_MGMT_1      0x6B
+#define MPU6050_REG_ACCEL_CONFIG    0x1C
+#define MPU6050_REG_GYRO_CONFIG     0x1B
+#define MPU6050_REG_ACCEL_XOUT_H    0x3B
+
+#define I2C_TIMEOUT                 1000000UL
+#define CPU_CLOCK_HZ                32000000UL
+
+#define ACC_LSB_PER_G               16384L
+#define GYRO_LSB_PER_DPS            131L
+
+#define CALIB_SAMPLES               120
+
+/* ================= 小车电机配置区 ================= */
+
+#define LEFT_IN1_PIN                DL_GPIO_PIN_8
+#define LEFT_IN2_PIN                DL_GPIO_PIN_9
+
+#define RIGHT_IN3_PIN               DL_GPIO_PIN_2
+#define RIGHT_IN4_PIN               DL_GPIO_PIN_3
+
+#define PWM_RIGHT_PIN               DL_GPIO_PIN_4
+#define PWM_LEFT_PIN                DL_GPIO_PIN_6
+
+/*
+ * 如果某个电机前进方向反了，把对应的 0 改成 1
+ */
+#define LEFT_MOTOR_REVERSE          0
+#define RIGHT_MOTOR_REVERSE         0
+
+/*
+ * 一般电机驱动 ENA / ENB 高电平使能，所以填 1
+ */
+#define MOTOR_EN_ACTIVE_HIGH        1
+
+/*
+ * 软件 PWM 最大值。
+ * 速度范围：0 ~ 10
+ */
+#define PWM_MAX                     10
+
+/*
+ * 软件 PWM 延时。
+ * 数值越大，PWM 周期越慢。
+ */
+#define SOFT_DELAY                  1000
+
+/*
+ * 正常直行速度。
+ * 之前如果大概是 5~6，现在改成 2，约为原来的 1/3。
+ */
+#define MOTOR_BASE_SPEED            2
+
+/*
+ * 允许某个轮子完全停下来。
+ */
+#define MOTOR_MIN_SPEED             0
+
+/*
+ * 限制最大速度，防止修正太猛。
+ */
+#define MOTOR_MAX_SPEED             4
+
+/*
+ * 偏航角死区，单位：毫度。
+ * 1000 = 1 度。
+ *
+ * 200 = 0.2 度。
+ * 数值越小，越容易触发修正。
+ */
+#define YAW_DEADBAND_MDEG           200
+
+/*
+ * 陀螺仪角速度死区。
+ * 单位：0.01°/s。
+ * 20 = 0.20°/s。
+ */
+#define GYRO_DPS100_DEADBAND        20
+
+/*
+ * 强制修正时，继续转的那个轮子的速度。
+ */
+#define STRONG_CORRECT_SPEED        2
+
+/*
+ * 强制修正时，另一边轮子完全停。
+ */
+#define STRONG_STOP_SPEED           0
+
+/*
+ * 如果发现小车越修越偏，把 0 改成 1。
+ */
+#define GYRO_CORRECT_REVERSE        0
+
+/*
+ * 1 = 一直直线行驶
+ * 0 = 只行驶 DRIVE_STRAIGHT_MS 毫秒
+ */
+#define DRIVE_FOREVER               1
+#define DRIVE_STRAIGHT_MS           2700u
+
+/* ================= CCS Expressions 观察变量 ================= */
+
+/*
+ * 状态：
+ * 0 = 启动
+ * 1 = 找到 MPU6050
+ * 2 = 初始化完成
+ * 3 = 校准完成
+ * 4 = 正常直线修正
+ * 100 = 找不到 MPU6050
+ * 200 = 初始化失败
+ * 300 = 校准失败
+ * 400 = 读取失败
+ */
+volatile uint32_t g_mpu_state = 0;
+
+volatile uint8_t g_who_am_i = 0;
+volatile uint8_t g_current_addr = 0;
+
+volatile int16_t g_ax_raw = 0;
+volatile int16_t g_ay_raw = 0;
+volatile int16_t g_az_raw = 0;
+
+volatile int32_t g_ax_mg = 0;
+volatile int32_t g_ay_mg = 0;
+volatile int32_t g_az_mg = 0;
+
+volatile int16_t g_gx_raw = 0;
+volatile int16_t g_gy_raw = 0;
+volatile int16_t g_gz_raw = 0;
+
+volatile int32_t g_gx_dps100 = 0;
+volatile int32_t g_gy_dps100 = 0;
+volatile int32_t g_gz_dps100 = 0;
+
+volatile int16_t g_temp_raw = 0;
+volatile int32_t g_temp_c100 = 0;
+
+volatile uint32_t g_read_count = 0;
+
+/*
+ * g_yaw_mdeg：
+ * 偏航角，单位毫度。
+ * 1000 = 1 度。
+ *
+ * g_correct_dir：
+ * 0 = 不修正
+ * 1 = 一种方向修正
+ * -1 = 另一种方向修正
+ */
+volatile int32_t g_yaw_mdeg = 0;
+volatile int8_t g_correct_dir = 0;
+
+volatile int32_t g_correction = 0;
+volatile uint8_t g_left_speed = 0;
+volatile uint8_t g_right_speed = 0;
+
+volatile uint32_t g_ms = 0;
+
+/* ================= 内部变量 ================= */
+
+static uint8_t g_mpu_addr = MPU6050_ADDR_LOW;
+
+static int16_t g_base_gx = 0;
+static int16_t g_base_gy = 0;
+static int16_t g_base_gz = 0;
+
+static uint32_t g_yaw_last_ms = 0;
+
+/*
+ * 提前声明，防止前面 LED_Error 函数调用 CarStop 时报错。
+ */
+static void CarStop(void);
+
+/* ================= SysTick 毫秒计时 ================= */
+
+void SysTick_Handler(void)
+{
+    g_ms++;
+}
+
+static uint32_t millis(void)
+{
+    return g_ms;
+}
+
+/* ================= 延时函数 ================= */
+
+static void DelayMs(uint32_t ms)
+{
+    while (ms--)
+    {
+        delay_cycles(CPU_CLOCK_HZ / 1000);
+    }
+}
+
+static void SoftDelay(uint32_t n)
+{
+    while (n--)
+    {
+        __asm(" nop");
+    }
+}
+
+/* ================= LED 控制 ================= */
+
+static void LED_On(void)
+{
+#if LED_ACTIVE_LOW
+    DL_GPIO_clearPins(LED_PORT, LED_PIN);
+#else
+    DL_GPIO_setPins(LED_PORT, LED_PIN);
+#endif
+}
+
+static void LED_Off(void)
+{
+#if LED_ACTIVE_LOW
+    DL_GPIO_setPins(LED_PORT, LED_PIN);
+#else
+    DL_GPIO_clearPins(LED_PORT, LED_PIN);
+#endif
+}
+
+static void LED_Blink(uint32_t times, uint32_t interval_ms)
+{
+    uint32_t i;
+
+    for (i = 0; i < times; i++)
+    {
+        LED_On();
+        DelayMs(interval_ms);
+        LED_Off();
+        DelayMs(interval_ms);
+    }
+}
+
+static void LED_ErrorSlowBlink(void)
+{
+    while (1)
+    {
+        CarStop();
+        LED_On();
+        DelayMs(500);
+        LED_Off();
+        DelayMs(500);
+    }
+}
+
+static void LED_ErrorFastBlink(void)
+{
+    while (1)
+    {
+        CarStop();
+        LED_On();
+        DelayMs(100);
+        LED_Off();
+        DelayMs(100);
+    }
+}
+
+/* ================= 工具函数 ================= */
+
+static int16_t MakeInt16(uint8_t high, uint8_t low)
+{
+    return (int16_t)(((uint16_t)high << 8) | low);
+}
+
+/* ================= 电机控制 ================= */
+
+static void LeftForward(void)
+{
+#if LEFT_MOTOR_REVERSE
+    DL_GPIO_clearPins(GPIOB, LEFT_IN1_PIN);
+    DL_GPIO_setPins(GPIOB, LEFT_IN2_PIN);
+#else
+    DL_GPIO_setPins(GPIOB, LEFT_IN1_PIN);
+    DL_GPIO_clearPins(GPIOB, LEFT_IN2_PIN);
+#endif
+}
+
+static void RightForward(void)
+{
+#if RIGHT_MOTOR_REVERSE
+    DL_GPIO_clearPins(GPIOB, RIGHT_IN3_PIN);
+    DL_GPIO_setPins(GPIOB, RIGHT_IN4_PIN);
+#else
+    DL_GPIO_setPins(GPIOB, RIGHT_IN3_PIN);
+    DL_GPIO_clearPins(GPIOB, RIGHT_IN4_PIN);
+#endif
+}
+
+static void LeftStop(void)
+{
+    DL_GPIO_clearPins(GPIOB, LEFT_IN1_PIN);
+    DL_GPIO_clearPins(GPIOB, LEFT_IN2_PIN);
+}
+
+static void RightStop(void)
+{
+    DL_GPIO_clearPins(GPIOB, RIGHT_IN3_PIN);
+    DL_GPIO_clearPins(GPIOB, RIGHT_IN4_PIN);
+}
+
+static void LeftPWM_On(void)
+{
+#if MOTOR_EN_ACTIVE_HIGH
+    DL_GPIO_setPins(GPIOB, PWM_LEFT_PIN);
+#else
+    DL_GPIO_clearPins(GPIOB, PWM_LEFT_PIN);
+#endif
+}
+
+static void LeftPWM_Off(void)
+{
+#if MOTOR_EN_ACTIVE_HIGH
+    DL_GPIO_clearPins(GPIOB, PWM_LEFT_PIN);
+#else
+    DL_GPIO_setPins(GPIOB, PWM_LEFT_PIN);
+#endif
+}
+
+static void RightPWM_On(void)
+{
+#if MOTOR_EN_ACTIVE_HIGH
+    DL_GPIO_setPins(GPIOB, PWM_RIGHT_PIN);
+#else
+    DL_GPIO_clearPins(GPIOB, PWM_RIGHT_PIN);
+#endif
+}
+
+static void RightPWM_Off(void)
+{
+#if MOTOR_EN_ACTIVE_HIGH
+    DL_GPIO_clearPins(GPIOB, PWM_RIGHT_PIN);
+#else
+    DL_GPIO_setPins(GPIOB, PWM_RIGHT_PIN);
+#endif
+}
+
+static void MotorPWM_Off(void)
+{
+    LeftPWM_Off();
+    RightPWM_Off();
+}
+
+static void CarStop(void)
+{
+    MotorPWM_Off();
+    LeftStop();
+    RightStop();
+}
+
+/*
+ * 软件 PWM 向前。
+ * leftSpeed / rightSpeed 范围：0 ~ 10。
+ */
+static void MotorForwardPWM(uint8_t leftSpeed, uint8_t rightSpeed)
+{
+    uint8_t i;
+
+    if (leftSpeed > PWM_MAX)
+    {
+        leftSpeed = PWM_MAX;
+    }
+
+    if (rightSpeed > PWM_MAX)
+    {
+        rightSpeed = PWM_MAX;
+    }
+
+    LeftForward();
+    RightForward();
+
+    for (i = 0; i < PWM_MAX; i++)
+    {
+        if (i < leftSpeed)
+        {
+            LeftPWM_On();
+        }
+        else
+        {
+            LeftPWM_Off();
+        }
+
+        if (i < rightSpeed)
+        {
+            RightPWM_On();
+        }
+        else
+        {
+            RightPWM_Off();
+        }
+
+        SoftDelay(SOFT_DELAY);
+    }
+
+    MotorPWM_Off();
+}
+
+/* ================= I2C 底层函数 ================= */
+
+static bool I2C_WaitFree(void)
+{
+    uint32_t timeout = I2C_TIMEOUT;
+
+    while ((DL_I2C_getControllerStatus(MPU_I2C_INST) &
+            DL_I2C_CONTROLLER_STATUS_BUSY_BUS) && timeout)
+    {
+        timeout--;
+    }
+
+    if (timeout == 0)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static bool I2C_WriteBytes(uint8_t dev_addr, uint8_t *data, uint8_t len)
+{
+    if (!I2C_WaitFree())
+    {
+        return false;
+    }
+
+    DL_I2C_flushControllerTXFIFO(MPU_I2C_INST);
+    DL_I2C_fillControllerTXFIFO(MPU_I2C_INST, data, len);
+
+    DL_I2C_startControllerTransfer(
+        MPU_I2C_INST,
+        dev_addr,
+        DL_I2C_CONTROLLER_DIRECTION_TX,
+        len
+    );
+
+    if (!I2C_WaitFree())
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static bool I2C_ReadBytes(uint8_t dev_addr, uint8_t reg_addr, uint8_t *data, uint8_t len)
+{
+    uint8_t i;
+    uint32_t timeout;
+
+    if (!I2C_WriteBytes(dev_addr, &reg_addr, 1))
+    {
+        return false;
+    }
+
+    DelayMs(1);
+
+    if (!I2C_WaitFree())
+    {
+        return false;
+    }
+
+    DL_I2C_flushControllerRXFIFO(MPU_I2C_INST);
+
+    DL_I2C_startControllerTransfer(
+        MPU_I2C_INST,
+        dev_addr,
+        DL_I2C_CONTROLLER_DIRECTION_RX,
+        len
+    );
+
+    for (i = 0; i < len; i++)
+    {
+        timeout = I2C_TIMEOUT;
+
+        while (DL_I2C_isControllerRXFIFOEmpty(MPU_I2C_INST) && timeout)
+        {
+            timeout--;
+        }
+
+        if (timeout == 0)
+        {
+            return false;
+        }
+
+        data[i] = DL_I2C_receiveControllerData(MPU_I2C_INST);
+    }
+
+    if (!I2C_WaitFree())
+    {
+        return false;
+    }
+
+    return true;
+}
+
+/* ================= MPU6050 寄存器读写 ================= */
+
+static bool MPU6050_WriteReg(uint8_t reg, uint8_t value)
+{
+    uint8_t buf[2];
+
+    buf[0] = reg;
+    buf[1] = value;
+
+    return I2C_WriteBytes(g_mpu_addr, buf, 2);
+}
+
+static bool MPU6050_ReadReg(uint8_t reg, uint8_t *value)
+{
+    return I2C_ReadBytes(g_mpu_addr, reg, value, 1);
+}
+
+static bool MPU6050_ReadRegs(uint8_t reg, uint8_t *buf, uint8_t len)
+{
+    return I2C_ReadBytes(g_mpu_addr, reg, buf, len);
+}
+
+/* ================= MPU6050 基本函数 ================= */
+
+static bool MPU6050_FindDevice(void)
+{
+    uint8_t who = 0;
+
+    /*
+     * 先试地址 0x68
+     */
+    g_mpu_addr = MPU6050_ADDR_LOW;
+    g_current_addr = g_mpu_addr;
+
+    if (MPU6050_ReadReg(MPU6050_REG_WHO_AM_I, &who))
+    {
+        g_who_am_i = who;
+
+        if (who == 0x68)
+        {
+            return true;
+        }
+    }
+
+    /*
+     * 再试地址 0x69
+     */
+    g_mpu_addr = MPU6050_ADDR_HIGH;
+    g_current_addr = g_mpu_addr;
+
+    if (MPU6050_ReadReg(MPU6050_REG_WHO_AM_I, &who))
+    {
+        g_who_am_i = who;
+
+        if (who == 0x68)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool MPU6050_Init(void)
+{
+    /*
+     * 退出睡眠模式
+     */
+    if (!MPU6050_WriteReg(MPU6050_REG_PWR_MGMT_1, 0x00))
+    {
+        return false;
+    }
+
+    DelayMs(100);
+
+    /*
+     * 加速度 ±2g
+     */
+    if (!MPU6050_WriteReg(MPU6050_REG_ACCEL_CONFIG, 0x00))
+    {
+        return false;
+    }
+
+    /*
+     * 陀螺仪 ±250°/s
+     */
+    if (!MPU6050_WriteReg(MPU6050_REG_GYRO_CONFIG, 0x00))
+    {
+        return false;
+    }
+
+    DelayMs(50);
+
+    return true;
+}
+
+/*
+ * 从 0x3B 开始连续读取 14 个字节：
+ * 加速度 X/Y/Z、温度、陀螺仪 X/Y/Z。
+ */
+static bool MPU6050_ReadAll(
+    int16_t *ax,
+    int16_t *ay,
+    int16_t *az,
+    int16_t *temp,
+    int16_t *gx,
+    int16_t *gy,
+    int16_t *gz
+)
+{
+    uint8_t buf[14];
+
+    if (!MPU6050_ReadRegs(MPU6050_REG_ACCEL_XOUT_H, buf, 14))
+    {
+        return false;
+    }
+
+    *ax   = MakeInt16(buf[0],  buf[1]);
+    *ay   = MakeInt16(buf[2],  buf[3]);
+    *az   = MakeInt16(buf[4],  buf[5]);
+    *temp = MakeInt16(buf[6],  buf[7]);
+    *gx   = MakeInt16(buf[8],  buf[9]);
+    *gy   = MakeInt16(buf[10], buf[11]);
+    *gz   = MakeInt16(buf[12], buf[13]);
+
+    return true;
+}
+
+/* ================= MPU6050 校准和读取 ================= */
+
+static bool MPU6050_Calibrate(void)
+{
+    int32_t sum_gx = 0;
+    int32_t sum_gy = 0;
+    int32_t sum_gz = 0;
+
+    int16_t ax = 0;
+    int16_t ay = 0;
+    int16_t az = 0;
+    int16_t temp = 0;
+    int16_t gx = 0;
+    int16_t gy = 0;
+    int16_t gz = 0;
+
+    uint32_t i;
+
+    /*
+     * 校准前 LED 快闪 5 下。
+     * 这时候小车和 MPU6050 必须静止。
+     */
+    LED_Blink(5, 80);
+    DelayMs(500);
+
+    for (i = 0; i < CALIB_SAMPLES; i++)
+    {
+        if (!MPU6050_ReadAll(&ax, &ay, &az, &temp, &gx, &gy, &gz))
+        {
+            return false;
+        }
+
+        sum_gx += gx;
+        sum_gy += gy;
+        sum_gz += gz;
+
+        DelayMs(10);
+    }
+
+    g_base_gx = (int16_t)(sum_gx / CALIB_SAMPLES);
+    g_base_gy = (int16_t)(sum_gy / CALIB_SAMPLES);
+    g_base_gz = (int16_t)(sum_gz / CALIB_SAMPLES);
+
+    /*
+     * 校准完成，LED 亮 1 秒。
+     */
+    LED_On();
+    DelayMs(1000);
+    LED_Off();
+
+    return true;
+}
+
+static bool MPU6050_UpdateXYZ(void)
+{
+    int16_t ax = 0;
+    int16_t ay = 0;
+    int16_t az = 0;
+    int16_t temp = 0;
+    int16_t gx = 0;
+    int16_t gy = 0;
+    int16_t gz = 0;
+
+    if (!MPU6050_ReadAll(&ax, &ay, &az, &temp, &gx, &gy, &gz))
+    {
+        return false;
+    }
+
+    g_ax_raw = ax;
+    g_ay_raw = ay;
+    g_az_raw = az;
+
+    g_gx_raw = gx;
+    g_gy_raw = gy;
+    g_gz_raw = gz;
+
+    g_temp_raw = temp;
+
+    g_ax_mg = ((int32_t)ax * 1000L) / ACC_LSB_PER_G;
+    g_ay_mg = ((int32_t)ay * 1000L) / ACC_LSB_PER_G;
+    g_az_mg = ((int32_t)az * 1000L) / ACC_LSB_PER_G;
+
+    g_gx_dps100 = ((int32_t)(gx - g_base_gx) * 100L) / GYRO_LSB_PER_DPS;
+    g_gy_dps100 = ((int32_t)(gy - g_base_gy) * 100L) / GYRO_LSB_PER_DPS;
+    g_gz_dps100 = ((int32_t)(gz - g_base_gz) * 100L) / GYRO_LSB_PER_DPS;
+
+    g_temp_c100 = ((int32_t)temp * 100L) / 340L + 3653L;
+
+    g_read_count++;
+
+    return true;
+}
+
+/* ================= 陀螺仪直线修正 ================= */
+
+static void Gyro_ResetYaw(void)
+{
+    g_yaw_mdeg = 0;
+    g_correct_dir = 0;
+    g_correction = 0;
+    g_yaw_last_ms = millis();
+}
+
+static void Gyro_UpdateYaw(void)
+{
+    uint32_t now;
+    uint32_t dt;
+    int32_t gz_dps100;
+
+    now = millis();
+    dt = now - g_yaw_last_ms;
+
+    if (dt == 0)
+    {
+        return;
+    }
+
+    g_yaw_last_ms = now;
+
+    gz_dps100 = g_gz_dps100;
+
+    /*
+     * 过滤很小的静止漂移。
+     */
+    if ((gz_dps100 > -GYRO_DPS100_DEADBAND) &&
+        (gz_dps100 <  GYRO_DPS100_DEADBAND))
+    {
+        gz_dps100 = 0;
+    }
+
+    /*
+     * g_gz_dps100 单位：0.01°/s
+     *
+     * 1 个 dps100 = 0.01°/s = 10 毫度/s
+     * dt 单位 ms
+     *
+     * yaw_mdeg += gz_dps100 * dt / 100
+     */
+    g_yaw_mdeg += (gz_dps100 * (int32_t)dt) / 100;
+}
+
+/*
+ * 低速强制修正：
+ *
+ * 正常：
+ * 左轮 = 2
+ * 右轮 = 2
+ *
+ * 检测到往右偏：
+ * 左轮 = 0
+ * 右轮 = 2
+ *
+ * 检测到往左偏：
+ * 左轮 = 2
+ * 右轮 = 0
+ */
+static bool CarForwardGyroCorrectStep(void)
+{
+    uint8_t left;
+    uint8_t right;
+
+    if (!MPU6050_UpdateXYZ())
+    {
+        return false;
+    }
+
+    Gyro_UpdateYaw();
+
+    /*
+     * 默认低速直行。
+     */
+    left = MOTOR_BASE_SPEED;
+    right = MOTOR_BASE_SPEED;
+    g_correct_dir = 0;
+    g_correction = 0;
+
+#if GYRO_CORRECT_REVERSE
+
+    /*
+     * 反向修正版。
+     * 如果默认版本越修越偏，就把 GYRO_CORRECT_REVERSE 改成 1。
+     */
+    if (g_yaw_mdeg > YAW_DEADBAND_MDEG)
+    {
+        /*
+         * 偏到一侧：左轮走，右轮停。
+         */
+        g_correct_dir = 1;
+        g_correction = 100;
+
+        left  = STRONG_CORRECT_SPEED;
+        right = STRONG_STOP_SPEED;
+    }
+    else if (g_yaw_mdeg < -YAW_DEADBAND_MDEG)
+    {
+        /*
+         * 偏到另一侧：右轮走，左轮停。
+         */
+        g_correct_dir = -1;
+        g_correction = 100;
+
+        left  = STRONG_STOP_SPEED;
+        right = STRONG_CORRECT_SPEED;
+    }
+
+#else
+
+    /*
+     * 默认强制修正版。
+     *
+     * 默认认为：
+     * g_yaw_mdeg > 0 表示小车往右偏。
+     *
+     * 往右偏：
+     * 左轮停，右轮走，把车头往左拉回来。
+     *
+     * 往左偏：
+     * 右轮停，左轮走，把车头往右拉回来。
+     */
+    if (g_yaw_mdeg > YAW_DEADBAND_MDEG)
+    {
+        g_correct_dir = 1;
+        g_correction = 100;
+
+        left  = STRONG_STOP_SPEED;
+        right = STRONG_CORRECT_SPEED;
+    }
+    else if (g_yaw_mdeg < -YAW_DEADBAND_MDEG)
+    {
+        g_correct_dir = -1;
+        g_correction = 100;
+
+        left  = STRONG_CORRECT_SPEED;
+        right = STRONG_STOP_SPEED;
+    }
+
+#endif
+
+    g_left_speed = left;
+    g_right_speed = right;
+
+    MotorForwardPWM(g_left_speed, g_right_speed);
+
+    return true;
+}
+
+static void RunStraightGyroForever(void)
+{
+    Gyro_ResetYaw();
+
+    while (1)
+    {
+        if (!CarForwardGyroCorrectStep())
+        {
+            g_mpu_state = 400;
+            LED_ErrorFastBlink();
+        }
+
+        g_mpu_state = 4;
+    }
+}
+
+static void RunStraightGyroMs(uint32_t duration_ms)
+{
+    uint32_t start;
+
+    Gyro_ResetYaw();
+    start = millis();
+
+    while ((millis() - start) < duration_ms)
+    {
+        if (!CarForwardGyroCorrectStep())
+        {
+            g_mpu_state = 400;
+            LED_ErrorFastBlink();
+        }
+
+        g_mpu_state = 4;
+    }
+
+    CarStop();
+}
+
+/* ================= 主函数 ================= */
+
+int main(void)
+{
+    SYSCFG_DL_init();
+
+    /*
+     * 1ms 系统计时。
+     */
+    SysTick_Config(CPU_CLOCK_HZ / 1000U);
+
+    /*
+     * 使能 LED 输出。
+     */
+    DL_GPIO_enableOutput(LED_PORT, LED_PIN);
+
+    /*
+     * 使能电机相关引脚输出。
+     */
+    DL_GPIO_enableOutput(GPIOB,
+                         LEFT_IN1_PIN  |
+                         LEFT_IN2_PIN  |
+                         RIGHT_IN3_PIN |
+                         RIGHT_IN4_PIN |
+                         PWM_RIGHT_PIN |
+                         PWM_LEFT_PIN);
+
+    LED_Off();
+    CarStop();
+
+    DelayMs(300);
+
+    /*
+     * 开机闪 1 下。
+     */
+    g_mpu_state = 0;
+    LED_Blink(1, 200);
+
+    /*
+     * 查找 MPU6050。
+     */
+    if (!MPU6050_FindDevice())
+    {
+        g_mpu_state = 100;
+        LED_ErrorSlowBlink();
+    }
+
+    g_mpu_state = 1;
+    LED_Blink(3, 150);
+
+    /*
+     * 初始化 MPU6050。
+     */
+    if (!MPU6050_Init())
+    {
+        g_mpu_state = 200;
+        LED_ErrorFastBlink();
+    }
+
+    g_mpu_state = 2;
+
+    /*
+     * 校准。
+     * 这个阶段不要碰小车，也不要碰 MPU6050。
+     */
+    if (!MPU6050_Calibrate())
+    {
+        g_mpu_state = 300;
+        LED_ErrorFastBlink();
+    }
+
+    g_mpu_state = 3;
+
+    DelayMs(500);
+
+#if DRIVE_FOREVER
+
+    /*
+     * 一直低速直线行驶，并强制修正。
+     */
+    RunStraightGyroForever();
+
+#else
+
+    /*
+     * 只直线行驶指定时间。
+     */
+    RunStraightGyroMs(DRIVE_STRAIGHT_MS);
+
+    LED_Blink(2, 200);
+
+    while (1)
+    {
+        CarStop();
+    }
+
+#endif
+}
