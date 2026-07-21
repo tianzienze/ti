@@ -1,0 +1,1212 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+#include <stdbool.h>
+
+/*
+ * MSPM0G3507 八路循迹——圆形轨道强转向丝滑版
+ *
+ * 左电机：
+ * IN1 -> PB8
+ * IN2 -> PB9
+ * ENA -> PA5
+ *
+ * 右电机：
+ * IN3 -> PB2
+ * IN4 -> PB3
+ * ENB -> PB16
+ *
+ * 八路循迹：
+ * S1 -> PA17
+ * S2 -> PA18
+ * S3 -> PB19
+ * S4 -> PA21
+ * S5 -> PA22
+ * S6 -> PB20
+ * S7 -> PB24
+ * S8 -> PA23
+ *
+ * 传感器：
+ * 黑线 = 高电平
+ * 白色 = 低电平
+ *
+ * 当前八路方向反了，因此LINE_SENSOR_REVERSE设置为1。
+ */
+
+
+/* =========================================================
+ * 电机引脚
+ * ========================================================= */
+
+#define LEFT_IN1_PIN                  DL_GPIO_PIN_8
+#define LEFT_IN2_PIN                  DL_GPIO_PIN_9
+
+#define RIGHT_IN3_PIN                 DL_GPIO_PIN_2
+#define RIGHT_IN4_PIN                 DL_GPIO_PIN_3
+
+#define ENA_LEFT_PIN                  DL_GPIO_PIN_5
+#define ENB_RIGHT_PIN                 DL_GPIO_PIN_16
+
+
+/* =========================================================
+ * 八路循迹引脚
+ * ========================================================= */
+
+/* GPIOA */
+#define LINE_S1_PIN                   DL_GPIO_PIN_17
+#define LINE_S2_PIN                   DL_GPIO_PIN_18
+#define LINE_S4_PIN                   DL_GPIO_PIN_21
+#define LINE_S5_PIN                   DL_GPIO_PIN_22
+#define LINE_S8_PIN                   DL_GPIO_PIN_23
+
+/* GPIOB */
+#define LINE_S3_PIN                   DL_GPIO_PIN_19
+#define LINE_S6_PIN                   DL_GPIO_PIN_20
+#define LINE_S7_PIN                   DL_GPIO_PIN_24
+
+
+/* =========================================================
+ * 电机和传感器配置
+ * ========================================================= */
+
+#define LEFT_MOTOR_REVERSE            0
+#define RIGHT_MOTOR_REVERSE           0
+
+#define MOTOR_EN_ACTIVE_HIGH          1
+
+/*
+ * 黑线为高电平。
+ */
+#define BLACK_IS_HIGH                 1
+
+/*
+ * 八路循迹左右方向反了，保持为1。
+ */
+#define LINE_SENSOR_REVERSE           1
+
+
+/* =========================================================
+ * 软件PWM
+ * ========================================================= */
+
+#define PWM_MAX                       100
+
+/*
+ * 原来是45。
+ * 降低到30，提高电机控制和循迹刷新速度。
+ */
+#define PWM_STEP_DELAY                30
+
+
+/* =========================================================
+ * 动态基础速度
+ * ========================================================= */
+
+/*
+ * 直线或小弯速度。
+ */
+#define STRAIGHT_BASE_SPEED           82
+
+/*
+ * 中等弯道速度。
+ */
+#define MEDIUM_CURVE_BASE_SPEED       77
+
+/*
+ * 大弯道速度。
+ *
+ * 急弯时主动降低整体速度，
+ * 给小车更多转向时间。
+ */
+#define STRONG_CURVE_BASE_SPEED       70
+
+
+/*
+ * 左右轮最低速度。
+ *
+ * 急弯时内侧轮可以降低到8，
+ * 使转弯半径明显减小。
+ */
+#define TRACK_MIN_SPEED               8
+
+/*
+ * 外侧轮可以跑到100。
+ */
+#define TRACK_MAX_SPEED               100
+
+
+/* =========================================================
+ * 丢线找线速度
+ * ========================================================= */
+
+#define SEARCH_OUTER_SPEED            82
+#define SEARCH_INNER_SPEED            8
+
+
+/* =========================================================
+ * PD控制参数
+ * ========================================================= */
+
+/*
+ * 原来为13。
+ * 改为7，P修正明显增强。
+ *
+ * 数值越小，转向越强。
+ */
+#define KP_DIVISOR                    7
+
+
+/*
+ * 微分修正。
+ *
+ * 数值越小，检测到快速偏移时反应越强。
+ */
+#define KD_DIVISOR                    10
+
+
+/*
+ * 当误差超过此值时，
+ * 加入额外的非线性急弯修正。
+ */
+#define NONLINEAR_START_ERROR         150
+
+
+/*
+ * 数值越小，急弯附加修正越强。
+ */
+#define NONLINEAR_DIVISOR             5
+
+
+/*
+ * 最大差速修正。
+ */
+#define MAX_CORRECTION                60
+
+
+/* =========================================================
+ * 左右转向补偿
+ * ========================================================= */
+
+/*
+ * 左转修正倍率：
+ * 11/10 = 1.1倍。
+ */
+#define LEFT_GAIN_NUM                 11
+#define LEFT_GAIN_DEN                 10
+
+
+/*
+ * 右转修正倍率：
+ * 13/10 = 1.3倍。
+ *
+ * 你现在右转角度不够，
+ * 所以单独加强右转。
+ */
+#define RIGHT_GAIN_NUM                13
+#define RIGHT_GAIN_DEN                10
+
+
+/* =========================================================
+ * 误差滤波
+ * ========================================================= */
+
+/*
+ * 原来：
+ * 旧误差占3/4，新误差占1/4。
+ *
+ * 现在：
+ * 旧误差占1/2，新误差占1/2。
+ *
+ * 响应会更快，但仍然保留平滑效果。
+ */
+#define ERROR_FILTER_OLD              1
+#define ERROR_FILTER_TOTAL            2
+
+
+/* =========================================================
+ * 电机速度渐变
+ * ========================================================= */
+
+/*
+ * 每次循环电机速度最多变化12。
+ *
+ * 数值太大容易顿；
+ * 数值太小转弯反应慢。
+ */
+#define SPEED_SLEW_STEP               12
+
+
+/* =========================================================
+ * 传感器滤波
+ * ========================================================= */
+
+/*
+ * 读取3次，至少2次为高电平才确认。
+ *
+ * 比之前5次采样响应更快。
+ */
+#define SENSOR_SAMPLE_COUNT           3U
+#define SENSOR_HIGH_CONFIRM           2U
+#define SENSOR_SAMPLE_DELAY           10U
+
+
+/* =========================================================
+ * 八路位定义
+ * ========================================================= */
+
+#define BIT_S1                        (1U << 0)
+#define BIT_S2                        (1U << 1)
+#define BIT_S3                        (1U << 2)
+#define BIT_S4                        (1U << 3)
+#define BIT_S5                        (1U << 4)
+#define BIT_S6                        (1U << 5)
+#define BIT_S7                        (1U << 6)
+#define BIT_S8                        (1U << 7)
+
+
+/* =========================================================
+ * CCS观察变量
+ * ========================================================= */
+
+volatile uint8_t g_raw_pattern = 0;
+volatile uint8_t g_line_pattern = 0;
+volatile uint8_t g_black_count = 0;
+
+volatile int16_t g_raw_error = 0;
+volatile int16_t g_filtered_error = 0;
+volatile int16_t g_previous_error = 0;
+volatile int16_t g_last_valid_error = 0;
+
+volatile int16_t g_p_correction = 0;
+volatile int16_t g_d_correction = 0;
+volatile int16_t g_extra_correction = 0;
+volatile int16_t g_correction = 0;
+
+volatile uint8_t g_dynamic_base_speed = 0;
+
+volatile uint8_t g_left_target_speed = 0;
+volatile uint8_t g_right_target_speed = 0;
+
+volatile uint8_t g_left_speed = 0;
+volatile uint8_t g_right_speed = 0;
+
+/*
+ * 0 = 从未检测到黑线
+ * 1 = 正常循迹
+ * 2 = 向左找线
+ * 3 = 向右找线
+ * 4 = 宽黑线
+ */
+volatile uint8_t g_track_state = 0;
+
+volatile uint8_t g_has_seen_line = 0;
+volatile uint32_t g_pwm_cycles = 0;
+
+
+/* =========================================================
+ * 软件延时
+ * ========================================================= */
+
+static void SoftDelay(uint32_t count)
+{
+    while (count--)
+    {
+        __asm(" nop");
+    }
+}
+
+
+/* =========================================================
+ * 数学工具
+ * ========================================================= */
+
+static int16_t ClampInt16(
+    int16_t value,
+    int16_t minimum,
+    int16_t maximum
+)
+{
+    if (value < minimum)
+    {
+        return minimum;
+    }
+
+    if (value > maximum)
+    {
+        return maximum;
+    }
+
+    return value;
+}
+
+
+static int16_t AbsInt16(int16_t value)
+{
+    if (value < 0)
+    {
+        return (int16_t)(-value);
+    }
+
+    return value;
+}
+
+
+/*
+ * 让速度逐渐接近目标速度。
+ */
+static uint8_t ApproachSpeed(
+    uint8_t current,
+    uint8_t target
+)
+{
+    uint8_t difference;
+
+    if (current < target)
+    {
+        difference = target - current;
+
+        if (difference > SPEED_SLEW_STEP)
+        {
+            difference = SPEED_SLEW_STEP;
+        }
+
+        return current + difference;
+    }
+
+    if (current > target)
+    {
+        difference = current - target;
+
+        if (difference > SPEED_SLEW_STEP)
+        {
+            difference = SPEED_SLEW_STEP;
+        }
+
+        return current - difference;
+    }
+
+    return current;
+}
+
+
+/* =========================================================
+ * 左电机方向
+ * ========================================================= */
+
+static void LeftMotorForward(void)
+{
+#if LEFT_MOTOR_REVERSE
+
+    DL_GPIO_clearPins(GPIOB, LEFT_IN1_PIN);
+    DL_GPIO_setPins(GPIOB, LEFT_IN2_PIN);
+
+#else
+
+    DL_GPIO_setPins(GPIOB, LEFT_IN1_PIN);
+    DL_GPIO_clearPins(GPIOB, LEFT_IN2_PIN);
+
+#endif
+}
+
+
+static void LeftMotorStop(void)
+{
+    DL_GPIO_clearPins(
+        GPIOB,
+        LEFT_IN1_PIN | LEFT_IN2_PIN
+    );
+}
+
+
+/* =========================================================
+ * 右电机方向
+ * ========================================================= */
+
+static void RightMotorForward(void)
+{
+#if RIGHT_MOTOR_REVERSE
+
+    DL_GPIO_clearPins(GPIOB, RIGHT_IN3_PIN);
+    DL_GPIO_setPins(GPIOB, RIGHT_IN4_PIN);
+
+#else
+
+    DL_GPIO_setPins(GPIOB, RIGHT_IN3_PIN);
+    DL_GPIO_clearPins(GPIOB, RIGHT_IN4_PIN);
+
+#endif
+}
+
+
+static void RightMotorStop(void)
+{
+    DL_GPIO_clearPins(
+        GPIOB,
+        RIGHT_IN3_PIN | RIGHT_IN4_PIN
+    );
+}
+
+
+/* =========================================================
+ * ENA：PA5
+ * ========================================================= */
+
+static void LeftEnableOn(void)
+{
+#if MOTOR_EN_ACTIVE_HIGH
+
+    DL_GPIO_setPins(GPIOA, ENA_LEFT_PIN);
+
+#else
+
+    DL_GPIO_clearPins(GPIOA, ENA_LEFT_PIN);
+
+#endif
+}
+
+
+static void LeftEnableOff(void)
+{
+#if MOTOR_EN_ACTIVE_HIGH
+
+    DL_GPIO_clearPins(GPIOA, ENA_LEFT_PIN);
+
+#else
+
+    DL_GPIO_setPins(GPIOA, ENA_LEFT_PIN);
+
+#endif
+}
+
+
+/* =========================================================
+ * ENB：PB16
+ * ========================================================= */
+
+static void RightEnableOn(void)
+{
+#if MOTOR_EN_ACTIVE_HIGH
+
+    DL_GPIO_setPins(GPIOB, ENB_RIGHT_PIN);
+
+#else
+
+    DL_GPIO_clearPins(GPIOB, ENB_RIGHT_PIN);
+
+#endif
+}
+
+
+static void RightEnableOff(void)
+{
+#if MOTOR_EN_ACTIVE_HIGH
+
+    DL_GPIO_clearPins(GPIOB, ENB_RIGHT_PIN);
+
+#else
+
+    DL_GPIO_setPins(GPIOB, ENB_RIGHT_PIN);
+
+#endif
+}
+
+
+static void MotorEnableOff(void)
+{
+    LeftEnableOff();
+    RightEnableOff();
+}
+
+
+/* =========================================================
+ * 停车
+ * ========================================================= */
+
+static void CarStop(void)
+{
+    MotorEnableOff();
+
+    LeftMotorStop();
+    RightMotorStop();
+
+    g_left_speed = 0;
+    g_right_speed = 0;
+}
+
+
+/* =========================================================
+ * 软件PWM前进
+ * ========================================================= */
+
+static void MotorForwardPWM(
+    uint8_t leftSpeed,
+    uint8_t rightSpeed
+)
+{
+    uint16_t pwmCount;
+
+    if (leftSpeed > PWM_MAX)
+    {
+        leftSpeed = PWM_MAX;
+    }
+
+    if (rightSpeed > PWM_MAX)
+    {
+        rightSpeed = PWM_MAX;
+    }
+
+    g_left_speed = leftSpeed;
+    g_right_speed = rightSpeed;
+
+    if ((leftSpeed == 0) && (rightSpeed == 0))
+    {
+        CarStop();
+        return;
+    }
+
+    LeftMotorForward();
+    RightMotorForward();
+
+    for (pwmCount = 0;
+         pwmCount < PWM_MAX;
+         pwmCount++)
+    {
+        if (pwmCount < leftSpeed)
+        {
+            LeftEnableOn();
+        }
+        else
+        {
+            LeftEnableOff();
+        }
+
+        if (pwmCount < rightSpeed)
+        {
+            RightEnableOn();
+        }
+        else
+        {
+            RightEnableOff();
+        }
+
+        SoftDelay(PWM_STEP_DELAY);
+    }
+
+    MotorEnableOff();
+
+    g_pwm_cycles++;
+}
+
+
+/*
+ * 对目标速度进行渐变后再输出。
+ */
+static void MotorForwardSmooth(
+    uint8_t leftTarget,
+    uint8_t rightTarget
+)
+{
+    uint8_t leftOutput;
+    uint8_t rightOutput;
+
+    g_left_target_speed = leftTarget;
+    g_right_target_speed = rightTarget;
+
+    leftOutput =
+        ApproachSpeed(g_left_speed, leftTarget);
+
+    rightOutput =
+        ApproachSpeed(g_right_speed, rightTarget);
+
+    MotorForwardPWM(
+        leftOutput,
+        rightOutput
+    );
+}
+
+
+/* =========================================================
+ * 传感器读取
+ * ========================================================= */
+
+static bool ReadBlackA(uint32_t pin)
+{
+    bool highLevel;
+
+    highLevel =
+        ((DL_GPIO_readPins(GPIOA, pin) & pin) != 0);
+
+#if BLACK_IS_HIGH
+
+    return highLevel;
+
+#else
+
+    return !highLevel;
+
+#endif
+}
+
+
+static bool ReadBlackB(uint32_t pin)
+{
+    bool highLevel;
+
+    highLevel =
+        ((DL_GPIO_readPins(GPIOB, pin) & pin) != 0);
+
+#if BLACK_IS_HIGH
+
+    return highLevel;
+
+#else
+
+    return !highLevel;
+
+#endif
+}
+
+
+/* =========================================================
+ * 原始八路读取
+ * ========================================================= */
+
+static uint8_t LineReadRawPattern(void)
+{
+    uint8_t pattern = 0;
+
+    if (ReadBlackA(LINE_S1_PIN))
+    {
+        pattern |= BIT_S1;
+    }
+
+    if (ReadBlackA(LINE_S2_PIN))
+    {
+        pattern |= BIT_S2;
+    }
+
+    if (ReadBlackB(LINE_S3_PIN))
+    {
+        pattern |= BIT_S3;
+    }
+
+    if (ReadBlackA(LINE_S4_PIN))
+    {
+        pattern |= BIT_S4;
+    }
+
+    if (ReadBlackA(LINE_S5_PIN))
+    {
+        pattern |= BIT_S5;
+    }
+
+    if (ReadBlackB(LINE_S6_PIN))
+    {
+        pattern |= BIT_S6;
+    }
+
+    if (ReadBlackB(LINE_S7_PIN))
+    {
+        pattern |= BIT_S7;
+    }
+
+    if (ReadBlackA(LINE_S8_PIN))
+    {
+        pattern |= BIT_S8;
+    }
+
+    g_raw_pattern = pattern;
+
+    return pattern;
+}
+
+
+/* =========================================================
+ * 八位顺序反转
+ * ========================================================= */
+
+static uint8_t ReverseBits8(uint8_t value)
+{
+    value =
+        (uint8_t)(((value & 0x55U) << 1) |
+                  ((value & 0xAAU) >> 1));
+
+    value =
+        (uint8_t)(((value & 0x33U) << 2) |
+                  ((value & 0xCCU) >> 2));
+
+    value =
+        (uint8_t)(((value & 0x0FU) << 4) |
+                  ((value & 0xF0U) >> 4));
+
+    return value;
+}
+
+
+/* =========================================================
+ * 传感器多数表决滤波
+ * ========================================================= */
+
+static uint8_t LineReadFilteredPattern(void)
+{
+    uint8_t votes[8] = {0};
+
+    uint8_t sample;
+    uint8_t bit;
+    uint8_t pattern;
+    uint8_t result = 0;
+
+    for (sample = 0;
+         sample < SENSOR_SAMPLE_COUNT;
+         sample++)
+    {
+        pattern = LineReadRawPattern();
+
+        for (bit = 0; bit < 8; bit++)
+        {
+            if ((pattern & (1U << bit)) != 0)
+            {
+                votes[bit]++;
+            }
+        }
+
+        SoftDelay(SENSOR_SAMPLE_DELAY);
+    }
+
+    for (bit = 0; bit < 8; bit++)
+    {
+        if (votes[bit] >= SENSOR_HIGH_CONFIRM)
+        {
+            result |= (1U << bit);
+        }
+    }
+
+#if LINE_SENSOR_REVERSE
+
+    result = ReverseBits8(result);
+
+#endif
+
+    g_line_pattern = result;
+
+    return result;
+}
+
+
+/* =========================================================
+ * 统计黑线传感器数量
+ * ========================================================= */
+
+static uint8_t CountBits8(uint8_t value)
+{
+    uint8_t count = 0;
+
+    while (value != 0)
+    {
+        count += (uint8_t)(value & 0x01U);
+        value >>= 1;
+    }
+
+    return count;
+}
+
+
+/* =========================================================
+ * 计算黑线位置误差
+ * ========================================================= */
+
+/*
+ * 左侧为负，右侧为正。
+ */
+static int16_t LineCalculateError(uint8_t pattern)
+{
+    static const int16_t weights[8] =
+    {
+        -350,
+        -250,
+        -150,
+         -50,
+          50,
+         150,
+         250,
+         350
+    };
+
+    int32_t sum = 0;
+    uint8_t count = 0;
+    uint8_t i;
+
+    for (i = 0; i < 8; i++)
+    {
+        if ((pattern & (1U << i)) != 0)
+        {
+            sum += weights[i];
+            count++;
+        }
+    }
+
+    if (count == 0)
+    {
+        return 0;
+    }
+
+    return (int16_t)(sum / count);
+}
+
+
+/* =========================================================
+ * 丢线找线
+ * ========================================================= */
+
+static void ProcessLineLost(void)
+{
+    if (g_has_seen_line == 0)
+    {
+        g_track_state = 0;
+
+        CarStop();
+
+        return;
+    }
+
+    /*
+     * 上一次黑线在左侧。
+     */
+    if (g_last_valid_error < 0)
+    {
+        g_track_state = 2;
+
+        MotorForwardSmooth(
+            SEARCH_INNER_SPEED,
+            SEARCH_OUTER_SPEED
+        );
+    }
+
+    /*
+     * 上一次黑线在右侧。
+     */
+    else if (g_last_valid_error > 0)
+    {
+        g_track_state = 3;
+
+        MotorForwardSmooth(
+            SEARCH_OUTER_SPEED,
+            SEARCH_INNER_SPEED
+        );
+    }
+
+    else
+    {
+        g_track_state = 1;
+
+        MotorForwardSmooth(
+            MEDIUM_CURVE_BASE_SPEED,
+            MEDIUM_CURVE_BASE_SPEED
+        );
+    }
+}
+
+
+/* =========================================================
+ * 强转向丝滑PD循迹
+ * ========================================================= */
+
+static void ProcessSmoothTrack(uint8_t pattern)
+{
+    int16_t rawError;
+    int16_t filteredError;
+    int16_t errorChange;
+
+    int16_t absoluteError;
+
+    int32_t proportional;
+    int32_t derivative;
+    int32_t extraCorrection;
+    int32_t correction;
+
+    int16_t baseSpeed;
+    int16_t leftTarget;
+    int16_t rightTarget;
+
+
+    rawError = LineCalculateError(pattern);
+
+    g_raw_error = rawError;
+
+
+    /*
+     * 从丢线状态重新找到黑线时，
+     * 直接用当前误差初始化，避免微分突变。
+     */
+    if (g_track_state != 1)
+    {
+        filteredError = rawError;
+        errorChange = 0;
+    }
+    else
+    {
+        filteredError =
+            (int16_t)(
+                ((int32_t)g_filtered_error *
+                 ERROR_FILTER_OLD +
+                 rawError) /
+                ERROR_FILTER_TOTAL
+            );
+
+        errorChange =
+            filteredError - g_previous_error;
+    }
+
+
+    g_filtered_error = filteredError;
+    g_previous_error = filteredError;
+    g_last_valid_error = filteredError;
+
+    absoluteError = AbsInt16(filteredError);
+
+
+    /*
+     * 根据弯道大小动态降低基础速度。
+     */
+    if (absoluteError < 80)
+    {
+        baseSpeed = STRAIGHT_BASE_SPEED;
+    }
+    else if (absoluteError < 180)
+    {
+        baseSpeed = MEDIUM_CURVE_BASE_SPEED;
+    }
+    else
+    {
+        baseSpeed = STRONG_CURVE_BASE_SPEED;
+    }
+
+    g_dynamic_base_speed = (uint8_t)baseSpeed;
+
+
+    /*
+     * P项。
+     */
+    proportional =
+        (int32_t)filteredError / KP_DIVISOR;
+
+
+    /*
+     * D项。
+     */
+    derivative =
+        (int32_t)errorChange / KD_DIVISOR;
+
+
+    /*
+     * 急弯非线性附加修正。
+     *
+     * 误差越大，附加修正越强。
+     */
+    extraCorrection = 0;
+
+    if (absoluteError > NONLINEAR_START_ERROR)
+    {
+        extraCorrection =
+            (absoluteError - NONLINEAR_START_ERROR) /
+            NONLINEAR_DIVISOR;
+
+        if (filteredError < 0)
+        {
+            extraCorrection = -extraCorrection;
+        }
+    }
+
+
+    correction =
+        proportional +
+        derivative +
+        extraCorrection;
+
+
+    g_p_correction = (int16_t)proportional;
+    g_d_correction = (int16_t)derivative;
+    g_extra_correction = (int16_t)extraCorrection;
+
+
+    /*
+     * 左右转向分别进行补偿。
+     *
+     * correction > 0：
+     * 黑线在右侧，需要右转。
+     */
+    if (correction > 0)
+    {
+        correction =
+            correction *
+            RIGHT_GAIN_NUM /
+            RIGHT_GAIN_DEN;
+    }
+    else if (correction < 0)
+    {
+        correction =
+            correction *
+            LEFT_GAIN_NUM /
+            LEFT_GAIN_DEN;
+    }
+
+
+    correction =
+        ClampInt16(
+            (int16_t)correction,
+            -MAX_CORRECTION,
+            MAX_CORRECTION
+        );
+
+
+    g_correction = (int16_t)correction;
+
+
+    /*
+     * correction为正：
+     *
+     * 左轮加速，右轮减速，
+     * 小车向右转。
+     */
+    leftTarget =
+        baseSpeed + (int16_t)correction;
+
+    rightTarget =
+        baseSpeed - (int16_t)correction;
+
+
+    leftTarget =
+        ClampInt16(
+            leftTarget,
+            TRACK_MIN_SPEED,
+            TRACK_MAX_SPEED
+        );
+
+    rightTarget =
+        ClampInt16(
+            rightTarget,
+            TRACK_MIN_SPEED,
+            TRACK_MAX_SPEED
+        );
+
+
+    g_track_state = 1;
+
+
+    MotorForwardSmooth(
+        (uint8_t)leftTarget,
+        (uint8_t)rightTarget
+    );
+}
+
+
+/* =========================================================
+ * 执行一次循迹
+ * ========================================================= */
+
+static void LineFollowStep(void)
+{
+    uint8_t pattern;
+
+    pattern = LineReadFilteredPattern();
+
+    g_black_count = CountBits8(pattern);
+
+
+    /*
+     * 完全丢线。
+     */
+    if (pattern == 0)
+    {
+        ProcessLineLost();
+
+        return;
+    }
+
+
+    g_has_seen_line = 1;
+
+
+    /*
+     * 七路或八路同时检测到黑线。
+     */
+    if (g_black_count >= 7U)
+    {
+        g_track_state = 4;
+
+        g_raw_error = 0;
+        g_filtered_error = 0;
+        g_previous_error = 0;
+        g_last_valid_error = 0;
+        g_correction = 0;
+
+        MotorForwardSmooth(
+            MEDIUM_CURVE_BASE_SPEED,
+            MEDIUM_CURVE_BASE_SPEED
+        );
+
+        return;
+    }
+
+
+    ProcessSmoothTrack(pattern);
+}
+
+
+/* =========================================================
+ * 主函数
+ * ========================================================= */
+
+int main(void)
+{
+    SYSCFG_DL_init();
+
+
+    /*
+     * ENA：PA5。
+     */
+    DL_GPIO_enableOutput(
+        GPIOA,
+        ENA_LEFT_PIN
+    );
+
+
+    /*
+     * 电机方向引脚和ENB。
+     */
+    DL_GPIO_enableOutput(
+        GPIOB,
+        LEFT_IN1_PIN |
+        LEFT_IN2_PIN |
+        RIGHT_IN3_PIN |
+        RIGHT_IN4_PIN |
+        ENB_RIGHT_PIN
+    );
+
+
+    /*
+     * 八路循迹引脚在SysConfig中设置为Input：
+     *
+     * S1 -> PA17
+     * S2 -> PA18
+     * S3 -> PB19
+     * S4 -> PA21
+     * S5 -> PA22
+     * S6 -> PB20
+     * S7 -> PB24
+     * S8 -> PA23
+     *
+     * Input Inversion：Disabled
+     * Internal Resistor：None
+     */
+
+
+    CarStop();
+
+    delay_cycles(3200000U);
+
+
+    while (1)
+    {
+        LineFollowStep();
+    }
+}
