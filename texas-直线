@@ -1,0 +1,1892 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ * MSPM0G3507
+ * 编码器差速PID + JY60快速航向PD
+ *
+ * 电机：
+ * PB8  -> IN1
+ * PB9  -> IN2
+ * PA31 -> ENA
+ *
+ * PB2  -> IN3
+ * PB3  -> IN4
+ * PB16 -> ENB
+ *
+ * 编码器：
+ * PA26 -> 左A
+ * PA27 -> 左B
+ * PA24 -> 右A
+ * PA25 -> 右B
+ *
+ * JY60：
+ * TX  -> PA11，UART0 RX
+ * RX  -> PA10，UART0 TX，可不接
+ * GND -> MCU GND
+ *
+ * UART：9600、8N1
+ *
+ * 编码器PID周期：20ms
+ * JY60航向周期：10ms
+ * 软件PWM：200Hz
+ * 基础PWM：40%
+ */
+
+/*==================================================
+ * 系统参数
+ *==================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                         32000000UL
+#endif
+
+#define SYSTICK_FREQUENCY_HZ                20000U
+
+/*
+ * 20000 / 100 = 200Hz软件PWM。
+ */
+#define PWM_PERIOD_COUNT                    100U
+
+/*
+ * 编码器PID：20ms。
+ */
+#define ENCODER_CONTROL_INTERVAL_TICKS      400U
+
+/*
+ * JY60航向：10ms。
+ */
+#define HEADING_CONTROL_INTERVAL_TICKS      200U
+
+#define SYSTICK_TICKS_PER_MS                20U
+
+/*==================================================
+ * UART实例
+ *==================================================*/
+
+#ifndef UART_0_INST
+#error "UART_0_INST未定义，请检查SysConfig中的UART实例名称"
+#endif
+
+#define JY60_UART_INST                      UART_0_INST
+
+/*==================================================
+ * 编码器参数
+ *==================================================*/
+
+#define LEFT_COUNTS_PER_REV                 760L
+#define RIGHT_COUNTS_PER_REV                740L
+
+/*==================================================
+ * 电机参数
+ *==================================================*/
+
+#define MOTOR_BASE_PWM                      40
+#define MOTOR_MIN_PWM                       24
+#define MOTOR_MAX_PWM                       56
+
+#define STARTUP_PWM_STEP                    2
+
+/*
+ * 每次控制更新最多改变1%。
+ *
+ * 航向每10ms刷新，所以响应会比原来快。
+ */
+#define PWM_CHANGE_LIMIT                    1
+
+#define PID_START_STABLE_CYCLES             15U
+
+/*
+ * 编码器PID和JY60修正相加后的最大修正。
+ */
+#define TOTAL_CORRECTION_LIMIT_X100         1000L
+
+/*==================================================
+ * 电机映射
+ *==================================================*/
+
+/*
+ * 保持你纯编码器版本中的设置。
+ *
+ * 0：
+ * 驱动A = 物理左轮
+ * 驱动B = 物理右轮
+ *
+ * 1：
+ * 驱动A = 物理右轮
+ * 驱动B = 物理左轮
+ */
+#define MOTOR_CHANNELS_SWAPPED              0
+
+#define DRIVER_A_FORWARD_REVERSE            0
+#define DRIVER_B_FORWARD_REVERSE            0
+
+/*==================================================
+ * 编码器PID参数
+ *==================================================*/
+
+/*
+ * 保留当前已经基本能走直线的参数。
+ */
+#define PID_INITIAL_KP_X1000                550L
+#define PID_INITIAL_KI_X1000                8L
+#define PID_INITIAL_KD_X1000                80L
+
+#define PID_MAX_CORRECTION_X100             800L
+#define PID_CORRECTION_STEP_X100            100L
+
+#define PID_ERROR_DEADBAND_X100             10L
+#define PID_INTEGRAL_LIMIT_X100             15000L
+
+/*
+ * 保留原来已经调好的目标差速。
+ */
+#define INITIAL_TARGET_DIFFERENCE_X100      35L
+
+/*==================================================
+ * JY60航向PD参数
+ *==================================================*/
+
+/*
+ * 航向误差小于1°时使用近区Kp。
+ */
+#define HEADING_NEAR_ZONE_X100              100L
+
+/*
+ * 近区：
+ * 1.00 PWM/°。
+ *
+ * 以前只有0.20，容易被整数PWM舍掉。
+ */
+#define HEADING_KP_NEAR_X100                100L
+
+/*
+ * 远区：
+ * 1.80 PWM/°。
+ */
+#define HEADING_KP_FAR_X100                 180L
+
+/*
+ * 角速度阻尼：
+ * 0.15 PWM/(°/s)。
+ */
+#define HEADING_KD_X100                     15L
+
+/*
+ * JY60最大修正±7% PWM。
+ */
+#define HEADING_MAX_CORRECTION_X100         700L
+
+/*
+ * 每10ms航向输出最多改变1.5% PWM。
+ */
+#define HEADING_CORRECTION_STEP_X100        150L
+
+/*
+ * 出现有效偏差后，最小输出1% PWM。
+ *
+ * 解决计算出来0.2、0.4 PWM，
+ * 转成整数后变成0的问题。
+ */
+#define HEADING_MIN_ACTIVE_X100             100L
+
+/*==================================================
+ * 航向死区
+ *==================================================*/
+
+/*
+ * 小于0.15°进入死区。
+ */
+#define HEADING_DEADBAND_ENTER_X100         15L
+
+/*
+ * 超过0.30°退出死区。
+ */
+#define HEADING_DEADBAND_EXIT_X100          30L
+
+/*
+ * 角速度小于0.20°/s忽略。
+ */
+#define GYRO_DEADBAND_X100                  20L
+
+/*==================================================
+ * JY60在线参数
+ *==================================================*/
+
+#define JY60_OFFLINE_TIMEOUT_MS             300U
+#define JY60_START_TIMEOUT_MS               2500U
+#define JY60_STABLE_TIME_MS                 300U
+#define JY60_REQUIRED_ANGLE_FRAMES          8U
+
+/*==================================================
+ * 电机引脚
+ *==================================================*/
+
+#define DRIVER_A_IN1_PORT                   GPIOB
+#define DRIVER_A_IN1_PIN                    DL_GPIO_PIN_8
+
+#define DRIVER_A_IN2_PORT                   GPIOB
+#define DRIVER_A_IN2_PIN                    DL_GPIO_PIN_9
+
+#define DRIVER_A_EN_PORT                    GPIOA
+#define DRIVER_A_EN_PIN                     DL_GPIO_PIN_31
+
+#define DRIVER_B_IN3_PORT                   GPIOB
+#define DRIVER_B_IN3_PIN                    DL_GPIO_PIN_2
+
+#define DRIVER_B_IN4_PORT                   GPIOB
+#define DRIVER_B_IN4_PIN                    DL_GPIO_PIN_3
+
+#define DRIVER_B_EN_PORT                    GPIOB
+#define DRIVER_B_EN_PIN                     DL_GPIO_PIN_16
+
+/*==================================================
+ * 编码器引脚
+ *==================================================*/
+
+#define LEFT_ENCODER_A_PIN                  DL_GPIO_PIN_26
+#define LEFT_ENCODER_B_PIN                  DL_GPIO_PIN_27
+
+#define RIGHT_ENCODER_A_PIN                 DL_GPIO_PIN_24
+#define RIGHT_ENCODER_B_PIN                 DL_GPIO_PIN_25
+
+/*==================================================
+ * 运行状态
+ *==================================================*/
+
+/*
+ * 0：初始化
+ * 1：等待JY60稳定
+ * 2：缓启动
+ * 3：等待编码器速度稳定
+ * 4：编码器PID + JY60
+ * 5：仅编码器PID
+ * 900：SysTick错误
+ */
+volatile uint32_t g_run_state = 0U;
+
+/*==================================================
+ * 编码器PID可调参数
+ *==================================================*/
+
+volatile int32_t g_pid_kp_x1000 =
+    PID_INITIAL_KP_X1000;
+
+volatile int32_t g_pid_ki_x1000 =
+    PID_INITIAL_KI_X1000;
+
+volatile int32_t g_pid_kd_x1000 =
+    PID_INITIAL_KD_X1000;
+
+volatile int32_t g_target_left_minus_right_x100 =
+    INITIAL_TARGET_DIFFERENCE_X100;
+
+volatile int32_t g_pid_max_correction_x100 =
+    PID_MAX_CORRECTION_X100;
+
+/*
+ * 改成1，清空编码器PID。
+ */
+volatile uint32_t g_pid_reset_command = 0U;
+
+/*
+ * 改成1，将当前朝向重新设为目标朝向。
+ */
+volatile uint32_t g_capture_heading_command = 0U;
+
+/*==================================================
+ * JY60方向可调变量
+ *==================================================*/
+
+/*
+ * 当前按照以前的使用结果设为1。
+ *
+ * 0：不反转Yaw
+ * 1：反转Yaw
+ */
+volatile uint32_t g_jy60_yaw_reverse = 0U;
+
+/*
+ * 你之前测得左转时Z轴角速度为正，
+ * 因此保持0。
+ */
+volatile uint32_t g_jy60_gyro_reverse = 0U;
+
+/*
+ * 最终修正方向。
+ *
+ * 正常保持0。
+ */
+volatile uint32_t g_heading_output_reverse = 0U;
+
+/*
+ * 手动修正测试。
+ *
+ * 0：正常使用JY60
+ * 300：强制+3%修正
+ * -300：强制-3%修正
+ *
+ * 正修正：
+ * 左轮快、右轮慢，车头向右。
+ */
+volatile int32_t g_manual_heading_correction_x100 = 0;
+
+/*==================================================
+ * 系统变量
+ *==================================================*/
+
+volatile uint32_t g_system_ms = 0U;
+volatile uint32_t g_systick_heartbeat = 0U;
+
+/*==================================================
+ * 编码器变量
+ *==================================================*/
+
+volatile uint32_t g_left_speed_count = 0U;
+volatile uint32_t g_right_speed_count = 0U;
+
+volatile uint32_t g_left_encoder_total = 0U;
+volatile uint32_t g_right_encoder_total = 0U;
+
+volatile uint32_t g_left_invalid_count = 0U;
+volatile uint32_t g_right_invalid_count = 0U;
+
+volatile int32_t g_left_speed_filtered_x100 = 0;
+volatile int32_t g_right_speed_filtered_x100 = 0;
+
+volatile int32_t g_left_speed_normalized_x100 = 0;
+volatile int32_t g_right_speed_normalized_x100 = 0;
+
+volatile int32_t g_measured_left_minus_right_x100 = 0;
+
+volatile int32_t g_left_rpm_x100 = 0;
+volatile int32_t g_right_rpm_x100 = 0;
+
+/*==================================================
+ * 编码器PID变量
+ *==================================================*/
+
+volatile int32_t g_pid_error_x100 = 0;
+volatile int32_t g_pid_previous_error_x100 = 0;
+volatile int32_t g_pid_derivative_x100 = 0;
+volatile int32_t g_pid_integral_x100 = 0;
+
+volatile int32_t g_pid_p_x100 = 0;
+volatile int32_t g_pid_i_x100 = 0;
+volatile int32_t g_pid_d_x100 = 0;
+
+volatile int32_t g_pid_raw_correction_x100 = 0;
+volatile int32_t g_pid_correction_x100 = 0;
+
+/*==================================================
+ * JY60变量
+ *==================================================*/
+
+volatile int32_t g_jy60_yaw_deg_x100 = 0;
+volatile int32_t g_jy60_yaw_filtered_x100 = 0;
+
+volatile int32_t g_jy60_gyro_z_dps_x100 = 0;
+volatile int32_t g_jy60_gyro_filtered_x100 = 0;
+
+volatile int32_t g_target_yaw_deg_x100 = 0;
+
+volatile int32_t g_heading_error_x100 = 0;
+
+volatile int32_t g_heading_p_x100 = 0;
+volatile int32_t g_heading_d_x100 = 0;
+
+volatile int32_t g_heading_raw_correction_x100 = 0;
+volatile int32_t g_heading_correction_x100 = 0;
+
+volatile uint32_t g_heading_deadband_active = 1U;
+
+volatile uint32_t g_jy60_online = 0U;
+volatile uint32_t g_jy60_gyro_online = 0U;
+volatile uint32_t g_heading_target_valid = 0U;
+
+/*
+ * 这些计数必须不断增加。
+ */
+volatile uint32_t g_jy60_angle_frame_count = 0U;
+volatile uint32_t g_jy60_gyro_frame_count = 0U;
+volatile uint32_t g_jy60_checksum_errors = 0U;
+
+volatile uint32_t g_jy60_last_angle_ms = 0U;
+volatile uint32_t g_jy60_last_gyro_ms = 0U;
+
+volatile uint32_t g_heading_update_count = 0U;
+
+/*==================================================
+ * PWM变量
+ *==================================================*/
+
+volatile int32_t g_current_base_pwm = 0;
+
+volatile int32_t g_total_correction_x100 = 0;
+
+volatile int32_t g_left_target_pwm = 0;
+volatile int32_t g_right_target_pwm = 0;
+
+volatile int32_t g_left_pwm = 0;
+volatile int32_t g_right_pwm = 0;
+
+volatile int32_t g_driver_a_pwm = 0;
+volatile int32_t g_driver_b_pwm = 0;
+
+volatile uint32_t g_motor_output_enabled = 0U;
+
+/*==================================================
+ * 中断内部变量
+ *==================================================*/
+
+static volatile uint32_t g_pwm_phase = 0U;
+
+static volatile uint32_t g_encoder_control_tick = 0U;
+static volatile uint32_t g_heading_control_tick = 0U;
+
+static volatile uint32_t g_encoder_control_due = 0U;
+static volatile uint32_t g_heading_control_due = 0U;
+
+static volatile uint32_t g_ms_divider = 0U;
+
+static volatile uint32_t g_left_period_count = 0U;
+static volatile uint32_t g_right_period_count = 0U;
+
+static volatile uint32_t g_left_previous_state = 0U;
+static volatile uint32_t g_right_previous_state = 0U;
+
+static uint32_t g_pid_stable_cycle_count = 0U;
+
+/*==================================================
+ * JY60内部变量
+ *==================================================*/
+
+static uint32_t g_jy60_wait_start_ms = 0U;
+static uint32_t g_jy60_stable_start_ms = 0U;
+
+static uint8_t g_jy60_frame[11];
+static uint32_t g_jy60_frame_index = 0U;
+
+static uint32_t g_last_used_angle_frame = 0U;
+static uint32_t g_last_used_gyro_frame = 0U;
+
+/*==================================================
+ * 编码器四倍频表
+ *==================================================*/
+
+static const int8_t g_quadrature_table[16] = {
+     0, -1,  1,  0,
+     1,  0,  0, -1,
+    -1,  0,  0,  1,
+     0,  1, -1,  0
+};
+
+/*==================================================
+ * 工具函数
+ *==================================================*/
+
+static int32_t ClampInt32(
+    int32_t value,
+    int32_t minimum,
+    int32_t maximum)
+{
+    if (value < minimum) {
+        return minimum;
+    }
+
+    if (value > maximum) {
+        return maximum;
+    }
+
+    return value;
+}
+
+static int32_t AbsInt32(int32_t value)
+{
+    if (value < 0) {
+        return -value;
+    }
+
+    return value;
+}
+
+static int32_t MoveToward(
+    int32_t current,
+    int32_t target,
+    int32_t step)
+{
+    if (current < target) {
+        current += step;
+
+        if (current > target) {
+            current = target;
+        }
+    } else if (current > target) {
+        current -= step;
+
+        if (current < target) {
+            current = target;
+        }
+    }
+
+    return current;
+}
+
+static int32_t WrapAngleErrorX100(int32_t error)
+{
+    while (error > 18000) {
+        error -= 36000;
+    }
+
+    while (error < -18000) {
+        error += 36000;
+    }
+
+    return error;
+}
+
+static int32_t CorrectionX100ToPWM(int32_t value)
+{
+    if (value >= 0) {
+        return (value + 50L) / 100L;
+    }
+
+    return (value - 50L) / 100L;
+}
+
+/*==================================================
+ * 电机GPIO
+ *==================================================*/
+
+static void Motor_GPIO_Init(void)
+{
+    DL_GPIO_clearPins(
+        GPIOA,
+        DRIVER_A_EN_PIN
+    );
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        DRIVER_A_IN1_PIN |
+        DRIVER_A_IN2_PIN |
+        DRIVER_B_IN3_PIN |
+        DRIVER_B_IN4_PIN |
+        DRIVER_B_EN_PIN
+    );
+
+    DL_GPIO_enableOutput(
+        GPIOA,
+        DRIVER_A_EN_PIN
+    );
+
+    DL_GPIO_enableOutput(
+        GPIOB,
+        DRIVER_A_IN1_PIN |
+        DRIVER_A_IN2_PIN |
+        DRIVER_B_IN3_PIN |
+        DRIVER_B_IN4_PIN |
+        DRIVER_B_EN_PIN
+    );
+}
+
+static void DriverA_Enable(void)
+{
+    DL_GPIO_setPins(
+        DRIVER_A_EN_PORT,
+        DRIVER_A_EN_PIN
+    );
+}
+
+static void DriverA_Disable(void)
+{
+    DL_GPIO_clearPins(
+        DRIVER_A_EN_PORT,
+        DRIVER_A_EN_PIN
+    );
+}
+
+static void DriverB_Enable(void)
+{
+    DL_GPIO_setPins(
+        DRIVER_B_EN_PORT,
+        DRIVER_B_EN_PIN
+    );
+}
+
+static void DriverB_Disable(void)
+{
+    DL_GPIO_clearPins(
+        DRIVER_B_EN_PORT,
+        DRIVER_B_EN_PIN
+    );
+}
+
+/*==================================================
+ * 电机方向
+ *==================================================*/
+
+static void Motor_SetForwardDirection(void)
+{
+    DriverA_Disable();
+    DriverB_Disable();
+
+#if DRIVER_A_FORWARD_REVERSE == 0
+
+    DL_GPIO_clearPins(
+        DRIVER_A_IN2_PORT,
+        DRIVER_A_IN2_PIN
+    );
+
+    DL_GPIO_setPins(
+        DRIVER_A_IN1_PORT,
+        DRIVER_A_IN1_PIN
+    );
+
+#else
+
+    DL_GPIO_clearPins(
+        DRIVER_A_IN1_PORT,
+        DRIVER_A_IN1_PIN
+    );
+
+    DL_GPIO_setPins(
+        DRIVER_A_IN2_PORT,
+        DRIVER_A_IN2_PIN
+    );
+
+#endif
+
+#if DRIVER_B_FORWARD_REVERSE == 0
+
+    DL_GPIO_clearPins(
+        DRIVER_B_IN4_PORT,
+        DRIVER_B_IN4_PIN
+    );
+
+    DL_GPIO_setPins(
+        DRIVER_B_IN3_PORT,
+        DRIVER_B_IN3_PIN
+    );
+
+#else
+
+    DL_GPIO_clearPins(
+        DRIVER_B_IN3_PORT,
+        DRIVER_B_IN3_PIN
+    );
+
+    DL_GPIO_setPins(
+        DRIVER_B_IN4_PORT,
+        DRIVER_B_IN4_PIN
+    );
+
+#endif
+}
+
+/*==================================================
+ * 电机停止
+ *==================================================*/
+
+static void Motor_Stop(void)
+{
+    g_motor_output_enabled = 0U;
+
+    g_current_base_pwm = 0;
+
+    g_left_target_pwm = 0;
+    g_right_target_pwm = 0;
+
+    g_left_pwm = 0;
+    g_right_pwm = 0;
+
+    g_driver_a_pwm = 0;
+    g_driver_b_pwm = 0;
+
+    DriverA_Disable();
+    DriverB_Disable();
+}
+
+/*==================================================
+ * 映射物理左右轮
+ *==================================================*/
+
+static void Motor_UpdateDriverPWM(void)
+{
+#if MOTOR_CHANNELS_SWAPPED == 0
+
+    g_driver_a_pwm = g_left_pwm;
+    g_driver_b_pwm = g_right_pwm;
+
+#else
+
+    g_driver_a_pwm = g_right_pwm;
+    g_driver_b_pwm = g_left_pwm;
+
+#endif
+
+    g_driver_a_pwm =
+        ClampInt32(g_driver_a_pwm, 0, 100);
+
+    g_driver_b_pwm =
+        ClampInt32(g_driver_b_pwm, 0, 100);
+}
+
+/*==================================================
+ * 编码器
+ *==================================================*/
+
+static uint32_t Encoder_ReadLeftState(uint32_t gpioValue)
+{
+    uint32_t a;
+    uint32_t b;
+
+    a = ((gpioValue & LEFT_ENCODER_A_PIN) != 0U) ?
+        1U : 0U;
+
+    b = ((gpioValue & LEFT_ENCODER_B_PIN) != 0U) ?
+        1U : 0U;
+
+    return (a << 1U) | b;
+}
+
+static uint32_t Encoder_ReadRightState(uint32_t gpioValue)
+{
+    uint32_t a;
+    uint32_t b;
+
+    a = ((gpioValue & RIGHT_ENCODER_A_PIN) != 0U) ?
+        1U : 0U;
+
+    b = ((gpioValue & RIGHT_ENCODER_B_PIN) != 0U) ?
+        1U : 0U;
+
+    return (a << 1U) | b;
+}
+
+static void Encoder_Initialize(void)
+{
+    uint32_t gpioValue;
+
+    gpioValue = DL_GPIO_readPins(
+        GPIOA,
+        LEFT_ENCODER_A_PIN |
+        LEFT_ENCODER_B_PIN |
+        RIGHT_ENCODER_A_PIN |
+        RIGHT_ENCODER_B_PIN
+    );
+
+    g_left_previous_state =
+        Encoder_ReadLeftState(gpioValue);
+
+    g_right_previous_state =
+        Encoder_ReadRightState(gpioValue);
+
+    g_left_period_count = 0U;
+    g_right_period_count = 0U;
+}
+
+/*==================================================
+ * 编码器PID
+ *==================================================*/
+
+static void Straight_PID_Reset(void)
+{
+    g_pid_error_x100 = 0;
+    g_pid_previous_error_x100 = 0;
+    g_pid_derivative_x100 = 0;
+    g_pid_integral_x100 = 0;
+
+    g_pid_p_x100 = 0;
+    g_pid_i_x100 = 0;
+    g_pid_d_x100 = 0;
+
+    g_pid_raw_correction_x100 = 0;
+    g_pid_correction_x100 = 0;
+}
+
+static void Encoder_UpdateSpeed20ms(void)
+{
+    uint32_t leftCount;
+    uint32_t rightCount;
+
+    __disable_irq();
+
+    leftCount = g_left_period_count;
+    rightCount = g_right_period_count;
+
+    g_left_period_count = 0U;
+    g_right_period_count = 0U;
+
+    g_encoder_control_due = 0U;
+
+    __enable_irq();
+
+    g_left_speed_count = leftCount;
+    g_right_speed_count = rightCount;
+
+    g_left_speed_filtered_x100 =
+        (g_left_speed_filtered_x100 +
+         ((int32_t)leftCount * 100L)) / 2L;
+
+    g_right_speed_filtered_x100 =
+        (g_right_speed_filtered_x100 +
+         ((int32_t)rightCount * 100L)) / 2L;
+
+    g_left_speed_normalized_x100 =
+        (int32_t)(
+            ((int64_t)g_left_speed_filtered_x100 *
+             RIGHT_COUNTS_PER_REV) /
+            LEFT_COUNTS_PER_REV
+        );
+
+    g_right_speed_normalized_x100 =
+        g_right_speed_filtered_x100;
+
+    g_measured_left_minus_right_x100 =
+        g_left_speed_normalized_x100 -
+        g_right_speed_normalized_x100;
+
+    g_left_rpm_x100 =
+        (int32_t)(
+            ((int64_t)g_left_speed_filtered_x100 *
+             3000LL) /
+            LEFT_COUNTS_PER_REV
+        );
+
+    g_right_rpm_x100 =
+        (int32_t)(
+            ((int64_t)g_right_speed_filtered_x100 *
+             3000LL) /
+            RIGHT_COUNTS_PER_REV
+        );
+}
+
+static int32_t Straight_PID_Update(void)
+{
+    int32_t error;
+    int32_t derivative;
+
+    int32_t oldIntegral;
+    int32_t candidateIntegral;
+
+    int32_t pOutput;
+    int32_t iOutput;
+    int32_t dOutput;
+
+    int32_t rawOutput;
+    int32_t limitedOutput;
+    int32_t maxCorrection;
+
+    error =
+        g_target_left_minus_right_x100 -
+        g_measured_left_minus_right_x100;
+
+    if (AbsInt32(error) <= PID_ERROR_DEADBAND_X100) {
+        error = 0;
+    }
+
+    if (((error > 0) &&
+         (g_pid_previous_error_x100 < 0)) ||
+        ((error < 0) &&
+         (g_pid_previous_error_x100 > 0))) {
+
+        g_pid_integral_x100 = 0;
+    }
+
+    derivative =
+        error - g_pid_previous_error_x100;
+
+    oldIntegral =
+        g_pid_integral_x100;
+
+    candidateIntegral =
+        oldIntegral + error;
+
+    candidateIntegral =
+        ClampInt32(
+            candidateIntegral,
+            -PID_INTEGRAL_LIMIT_X100,
+            PID_INTEGRAL_LIMIT_X100
+        );
+
+    pOutput =
+        (g_pid_kp_x1000 * error) / 1000L;
+
+    iOutput =
+        (g_pid_ki_x1000 *
+         candidateIntegral) / 1000L;
+
+    dOutput =
+        (g_pid_kd_x1000 *
+         derivative) / 1000L;
+
+    rawOutput =
+        pOutput + iOutput + dOutput;
+
+    maxCorrection =
+        AbsInt32(g_pid_max_correction_x100);
+
+    if (maxCorrection > 1600) {
+        maxCorrection = 1600;
+    }
+
+    limitedOutput =
+        ClampInt32(
+            rawOutput,
+            -maxCorrection,
+            maxCorrection
+        );
+
+    if (((rawOutput > maxCorrection) &&
+         (error > 0)) ||
+        ((rawOutput < -maxCorrection) &&
+         (error < 0))) {
+
+        candidateIntegral = oldIntegral;
+
+        iOutput =
+            (g_pid_ki_x1000 *
+             candidateIntegral) / 1000L;
+
+        rawOutput =
+            pOutput + iOutput + dOutput;
+
+        limitedOutput =
+            ClampInt32(
+                rawOutput,
+                -maxCorrection,
+                maxCorrection
+            );
+    }
+
+    if (error == 0) {
+        candidateIntegral =
+            (candidateIntegral * 95L) / 100L;
+    }
+
+    g_pid_error_x100 = error;
+    g_pid_derivative_x100 = derivative;
+    g_pid_integral_x100 = candidateIntegral;
+
+    g_pid_p_x100 = pOutput;
+    g_pid_i_x100 = iOutput;
+    g_pid_d_x100 = dOutput;
+
+    g_pid_raw_correction_x100 =
+        limitedOutput;
+
+    g_pid_correction_x100 =
+        MoveToward(
+            g_pid_correction_x100,
+            limitedOutput,
+            PID_CORRECTION_STEP_X100
+        );
+
+    g_pid_previous_error_x100 = error;
+
+    return g_pid_correction_x100;
+}
+
+/*==================================================
+ * JY60解析
+ *==================================================*/
+
+static void JY60_ParseCompleteFrame(void)
+{
+    uint32_t i;
+    uint8_t checksum;
+    int16_t rawValue;
+
+    int32_t newValue;
+    int32_t difference;
+
+    checksum = 0U;
+
+    for (i = 0U; i < 10U; i++) {
+        checksum =
+            (uint8_t)(checksum + g_jy60_frame[i]);
+    }
+
+    if (checksum != g_jy60_frame[10]) {
+        g_jy60_checksum_errors++;
+        return;
+    }
+
+    if (g_jy60_frame[1] == 0x52U) {
+        rawValue = (int16_t)(
+            ((uint16_t)g_jy60_frame[7] << 8U) |
+            g_jy60_frame[6]
+        );
+
+        newValue =
+            (int32_t)(
+                ((int64_t)rawValue * 200000LL) /
+                32768LL
+            );
+
+        g_jy60_gyro_z_dps_x100 = newValue;
+
+        if (g_jy60_gyro_frame_count == 0U) {
+            g_jy60_gyro_filtered_x100 =
+                newValue;
+        } else {
+            g_jy60_gyro_filtered_x100 =
+                (g_jy60_gyro_filtered_x100 +
+                 newValue) / 2L;
+        }
+
+        g_jy60_last_gyro_ms =
+            g_system_ms;
+
+        g_jy60_gyro_frame_count++;
+    }
+
+    if (g_jy60_frame[1] == 0x53U) {
+        rawValue = (int16_t)(
+            ((uint16_t)g_jy60_frame[7] << 8U) |
+            g_jy60_frame[6]
+        );
+
+        newValue =
+            (int32_t)(
+                ((int64_t)rawValue * 18000LL) /
+                32768LL
+            );
+
+        g_jy60_yaw_deg_x100 = newValue;
+
+        if (g_jy60_angle_frame_count == 0U) {
+            g_jy60_yaw_filtered_x100 =
+                newValue;
+        } else {
+            difference =
+                newValue -
+                g_jy60_yaw_filtered_x100;
+
+            difference =
+                WrapAngleErrorX100(difference);
+
+            /*
+             * 50%滤波，响应更快。
+             */
+            g_jy60_yaw_filtered_x100 +=
+                difference / 2L;
+
+            if (g_jy60_yaw_filtered_x100 > 18000) {
+                g_jy60_yaw_filtered_x100 -= 36000;
+            }
+
+            if (g_jy60_yaw_filtered_x100 < -18000) {
+                g_jy60_yaw_filtered_x100 += 36000;
+            }
+        }
+
+        g_jy60_last_angle_ms =
+            g_system_ms;
+
+        g_jy60_angle_frame_count++;
+    }
+}
+
+static void JY60_InputByte(uint8_t byte)
+{
+    if (g_jy60_frame_index == 0U) {
+        if (byte == 0x55U) {
+            g_jy60_frame[0] = byte;
+            g_jy60_frame_index = 1U;
+        }
+
+        return;
+    }
+
+    if ((g_jy60_frame_index == 1U) &&
+        (byte == 0x55U)) {
+
+        g_jy60_frame[0] = 0x55U;
+        g_jy60_frame_index = 1U;
+        return;
+    }
+
+    g_jy60_frame[g_jy60_frame_index] = byte;
+    g_jy60_frame_index++;
+
+    if (g_jy60_frame_index >= 11U) {
+        JY60_ParseCompleteFrame();
+        g_jy60_frame_index = 0U;
+    }
+}
+
+static void JY60_ProcessUART(void)
+{
+    uint8_t byte;
+
+    while (DL_UART_Main_receiveDataCheck(
+        JY60_UART_INST,
+        &byte)) {
+
+        JY60_InputByte(byte);
+    }
+}
+
+static void JY60_UpdateOnlineState(void)
+{
+    uint32_t now;
+
+    now = g_system_ms;
+
+    if ((g_jy60_angle_frame_count > 0U) &&
+        ((uint32_t)(
+            now - g_jy60_last_angle_ms) <=
+         JY60_OFFLINE_TIMEOUT_MS)) {
+
+        g_jy60_online = 1U;
+    } else {
+        g_jy60_online = 0U;
+    }
+
+    if ((g_jy60_gyro_frame_count > 0U) &&
+        ((uint32_t)(
+            now - g_jy60_last_gyro_ms) <=
+         JY60_OFFLINE_TIMEOUT_MS)) {
+
+        g_jy60_gyro_online = 1U;
+    } else {
+        g_jy60_gyro_online = 0U;
+    }
+}
+
+static void JY60_CaptureTargetHeading(void)
+{
+    g_target_yaw_deg_x100 =
+        g_jy60_yaw_filtered_x100;
+
+    g_heading_error_x100 = 0;
+
+    g_heading_p_x100 = 0;
+    g_heading_d_x100 = 0;
+
+    g_heading_raw_correction_x100 = 0;
+    g_heading_correction_x100 = 0;
+
+    g_heading_deadband_active = 1U;
+    g_heading_target_valid = 1U;
+
+    g_last_used_angle_frame =
+        g_jy60_angle_frame_count;
+
+    g_last_used_gyro_frame =
+        g_jy60_gyro_frame_count;
+}
+
+/*==================================================
+ * JY60快速航向控制
+ *==================================================*/
+
+static void HeadingController_Update10ms(void)
+{
+    int32_t error;
+    int32_t gyroRate;
+    int32_t absoluteError;
+
+    int32_t kp;
+    int32_t rawCorrection;
+
+    uint32_t hasNewData;
+
+    __disable_irq();
+    g_heading_control_due = 0U;
+    __enable_irq();
+
+    JY60_UpdateOnlineState();
+
+    if (g_capture_heading_command != 0U) {
+        if (g_jy60_online != 0U) {
+            JY60_CaptureTargetHeading();
+        }
+
+        g_capture_heading_command = 0U;
+    }
+
+    /*
+     * 手动修正测试优先级最高。
+     */
+    if (g_manual_heading_correction_x100 != 0) {
+        g_heading_raw_correction_x100 =
+            ClampInt32(
+                g_manual_heading_correction_x100,
+                -HEADING_MAX_CORRECTION_X100,
+                HEADING_MAX_CORRECTION_X100
+            );
+
+        g_heading_correction_x100 =
+            MoveToward(
+                g_heading_correction_x100,
+                g_heading_raw_correction_x100,
+                HEADING_CORRECTION_STEP_X100
+            );
+
+        g_heading_update_count++;
+        return;
+    }
+
+    if ((g_jy60_online == 0U) ||
+        (g_heading_target_valid == 0U)) {
+
+        g_heading_error_x100 = 0;
+        g_heading_p_x100 = 0;
+        g_heading_d_x100 = 0;
+
+        g_heading_raw_correction_x100 = 0;
+
+        g_heading_correction_x100 =
+            MoveToward(
+                g_heading_correction_x100,
+                0,
+                HEADING_CORRECTION_STEP_X100
+            );
+
+        return;
+    }
+
+    /*
+     * 只有JY60出现新数据时才重新计算PD。
+     *
+     * 没有新数据时，仍然让输出快速靠近
+     * 上一次计算出的目标值。
+     */
+    hasNewData = 0U;
+
+    if (g_jy60_angle_frame_count !=
+        g_last_used_angle_frame) {
+
+        g_last_used_angle_frame =
+            g_jy60_angle_frame_count;
+
+        hasNewData = 1U;
+    }
+
+    if (g_jy60_gyro_frame_count !=
+        g_last_used_gyro_frame) {
+
+        g_last_used_gyro_frame =
+            g_jy60_gyro_frame_count;
+
+        hasNewData = 1U;
+    }
+
+    if (hasNewData != 0U) {
+        error =
+            g_jy60_yaw_filtered_x100 -
+            g_target_yaw_deg_x100;
+
+        error =
+            WrapAngleErrorX100(error);
+
+        gyroRate =
+            g_jy60_gyro_filtered_x100;
+
+        if (g_jy60_yaw_reverse != 0U) {
+            error = -error;
+        }
+
+        if (g_jy60_gyro_reverse != 0U) {
+            gyroRate = -gyroRate;
+        }
+
+        absoluteError =
+            AbsInt32(error);
+
+        /*
+         * 死区迟滞。
+         */
+        if (g_heading_deadband_active != 0U) {
+            if (absoluteError >=
+                HEADING_DEADBAND_EXIT_X100) {
+
+                g_heading_deadband_active = 0U;
+            }
+        } else {
+            if (absoluteError <=
+                HEADING_DEADBAND_ENTER_X100) {
+
+                g_heading_deadband_active = 1U;
+            }
+        }
+
+        if (g_heading_deadband_active != 0U) {
+            error = 0;
+        }
+
+        if ((g_jy60_gyro_online == 0U) ||
+            (AbsInt32(gyroRate) <=
+             GYRO_DEADBAND_X100)) {
+
+            gyroRate = 0;
+        }
+
+        g_heading_error_x100 = error;
+
+        if (AbsInt32(error) <=
+            HEADING_NEAR_ZONE_X100) {
+
+            kp = HEADING_KP_NEAR_X100;
+        } else {
+            kp = HEADING_KP_FAR_X100;
+        }
+
+        g_heading_p_x100 =
+            (kp * error) / 100L;
+
+        g_heading_d_x100 =
+            (HEADING_KD_X100 *
+             gyroRate) / 100L;
+
+        rawCorrection =
+            g_heading_p_x100 +
+            g_heading_d_x100;
+
+        if (g_heading_output_reverse != 0U) {
+            rawCorrection =
+                -rawCorrection;
+        }
+
+        rawCorrection =
+            ClampInt32(
+                rawCorrection,
+                -HEADING_MAX_CORRECTION_X100,
+                HEADING_MAX_CORRECTION_X100
+            );
+
+        /*
+         * 偏差已经离开死区，但计算结果不足1%时，
+         * 强制给至少1%修正。
+         */
+        if ((error != 0) &&
+            (AbsInt32(rawCorrection) <
+             HEADING_MIN_ACTIVE_X100)) {
+
+            if (rawCorrection >= 0) {
+                rawCorrection =
+                    HEADING_MIN_ACTIVE_X100;
+            } else {
+                rawCorrection =
+                    -HEADING_MIN_ACTIVE_X100;
+            }
+        }
+
+        g_heading_raw_correction_x100 =
+            rawCorrection;
+
+        g_heading_update_count++;
+    }
+
+    /*
+     * 每10ms快速靠近最新的目标修正量。
+     */
+    g_heading_correction_x100 =
+        MoveToward(
+            g_heading_correction_x100,
+            g_heading_raw_correction_x100,
+            HEADING_CORRECTION_STEP_X100
+        );
+}
+
+/*==================================================
+ * 设置左右PWM
+ *==================================================*/
+
+static void Motor_ApplyCorrection(
+    int32_t basePWM,
+    int32_t correctionX100,
+    uint32_t startupMode)
+{
+    int32_t correctionPWM;
+    int32_t leftTarget;
+    int32_t rightTarget;
+
+    correctionX100 =
+        ClampInt32(
+            correctionX100,
+            -TOTAL_CORRECTION_LIMIT_X100,
+            TOTAL_CORRECTION_LIMIT_X100
+        );
+
+    g_total_correction_x100 =
+        correctionX100;
+
+    correctionPWM =
+        CorrectionX100ToPWM(
+            correctionX100
+        );
+
+    /*
+     * 正修正：
+     * 左轮加速，右轮减速，
+     * 小车向右修正。
+     */
+    leftTarget =
+        basePWM + correctionPWM;
+
+    rightTarget =
+        basePWM - correctionPWM;
+
+    if (startupMode != 0U) {
+        leftTarget =
+            ClampInt32(
+                leftTarget,
+                0,
+                MOTOR_MAX_PWM
+            );
+
+        rightTarget =
+            ClampInt32(
+                rightTarget,
+                0,
+                MOTOR_MAX_PWM
+            );
+    } else {
+        leftTarget =
+            ClampInt32(
+                leftTarget,
+                MOTOR_MIN_PWM,
+                MOTOR_MAX_PWM
+            );
+
+        rightTarget =
+            ClampInt32(
+                rightTarget,
+                MOTOR_MIN_PWM,
+                MOTOR_MAX_PWM
+            );
+    }
+
+    g_left_target_pwm = leftTarget;
+    g_right_target_pwm = rightTarget;
+
+    g_left_pwm =
+        MoveToward(
+            g_left_pwm,
+            g_left_target_pwm,
+            PWM_CHANGE_LIMIT
+        );
+
+    g_right_pwm =
+        MoveToward(
+            g_right_pwm,
+            g_right_target_pwm,
+            PWM_CHANGE_LIMIT
+        );
+
+    Motor_UpdateDriverPWM();
+}
+
+/*==================================================
+ * 启动
+ *==================================================*/
+
+static void StartMotorRamp(void)
+{
+    Straight_PID_Reset();
+
+    g_current_base_pwm = 0;
+
+    g_left_pwm = 0;
+    g_right_pwm = 0;
+
+    g_pid_stable_cycle_count = 0U;
+
+    g_motor_output_enabled = 1U;
+    g_run_state = 2U;
+}
+
+/*==================================================
+ * 编码器20ms控制
+ *==================================================*/
+
+static void EncoderController_Update20ms(void)
+{
+    Encoder_UpdateSpeed20ms();
+
+    JY60_UpdateOnlineState();
+
+    if (g_pid_reset_command != 0U) {
+        Straight_PID_Reset();
+        g_pid_reset_command = 0U;
+    }
+
+    /*
+     * 等待JY60稳定。
+     */
+    if (g_run_state == 1U) {
+        Motor_Stop();
+
+        if ((g_jy60_online != 0U) &&
+            (g_jy60_angle_frame_count >=
+             JY60_REQUIRED_ANGLE_FRAMES)) {
+
+            if (g_jy60_stable_start_ms == 0U) {
+                g_jy60_stable_start_ms =
+                    g_system_ms;
+            }
+
+            if ((uint32_t)(
+                    g_system_ms -
+                    g_jy60_stable_start_ms) >=
+                JY60_STABLE_TIME_MS) {
+
+                JY60_CaptureTargetHeading();
+                StartMotorRamp();
+                return;
+            }
+        } else {
+            g_jy60_stable_start_ms = 0U;
+        }
+
+        /*
+         * JY60没有数据时，
+         * 仍允许纯编码器启动。
+         */
+        if ((uint32_t)(
+                g_system_ms -
+                g_jy60_wait_start_ms) >=
+            JY60_START_TIMEOUT_MS) {
+
+            StartMotorRamp();
+            return;
+        }
+
+        return;
+    }
+
+    /*
+     * JY60后续恢复时记录当前朝向。
+     */
+    if ((g_run_state >= 2U) &&
+        (g_jy60_online != 0U) &&
+        (g_heading_target_valid == 0U) &&
+        (g_jy60_angle_frame_count >=
+         JY60_REQUIRED_ANGLE_FRAMES)) {
+
+        JY60_CaptureTargetHeading();
+    }
+
+    /*
+     * 缓启动。
+     */
+    if (g_run_state == 2U) {
+        if (g_current_base_pwm <
+            MOTOR_BASE_PWM) {
+
+            g_current_base_pwm +=
+                STARTUP_PWM_STEP;
+
+            if (g_current_base_pwm >
+                MOTOR_BASE_PWM) {
+
+                g_current_base_pwm =
+                    MOTOR_BASE_PWM;
+            }
+        }
+
+        g_pid_correction_x100 =
+            MoveToward(
+                g_pid_correction_x100,
+                0,
+                PID_CORRECTION_STEP_X100
+            );
+
+        if (g_current_base_pwm >=
+            MOTOR_BASE_PWM) {
+
+            g_pid_stable_cycle_count = 0U;
+            Straight_PID_Reset();
+
+            g_run_state = 3U;
+        }
+
+        return;
+    }
+
+    /*
+     * 等待轮速稳定。
+     */
+    if (g_run_state == 3U) {
+        g_pid_stable_cycle_count++;
+
+        if (g_pid_stable_cycle_count >=
+            PID_START_STABLE_CYCLES) {
+
+            Straight_PID_Reset();
+
+            if ((g_jy60_online != 0U) &&
+                (g_heading_target_valid != 0U)) {
+
+                g_run_state = 4U;
+            } else {
+                g_run_state = 5U;
+            }
+        }
+
+        return;
+    }
+
+    /*
+     * 正常编码器PID。
+     */
+    Straight_PID_Update();
+
+    if ((g_jy60_online != 0U) &&
+        (g_heading_target_valid != 0U)) {
+
+        g_run_state = 4U;
+    } else {
+        g_run_state = 5U;
+    }
+}
+
+/*==================================================
+ * 刷新最终PWM
+ *==================================================*/
+
+static void Control_ApplyCurrentOutput(void)
+{
+    int32_t basePWM;
+    int32_t totalCorrection;
+    uint32_t startupMode;
+
+    if (g_motor_output_enabled == 0U) {
+        DriverA_Disable();
+        DriverB_Disable();
+        return;
+    }
+
+    if (g_run_state == 2U) {
+        basePWM = g_current_base_pwm;
+        startupMode = 1U;
+    } else {
+        basePWM = MOTOR_BASE_PWM;
+        startupMode = 0U;
+    }
+
+    totalCorrection =
+        g_pid_correction_x100;
+
+    /*
+     * JY60只直接叠加PWM修正，
+     * 不再修改编码器PID目标差速。
+     */
+    if (((g_jy60_online != 0U) &&
+         (g_heading_target_valid != 0U)) ||
+        (g_manual_heading_correction_x100 != 0)) {
+
+        totalCorrection +=
+            g_heading_correction_x100;
+    }
+
+    Motor_ApplyCorrection(
+        basePWM,
+        totalCorrection,
+        startupMode
+    );
+}
+
+/*==================================================
+ * SysTick
+ *==================================================*/
+
+void SysTick_Handler(void)
+{
+    uint32_t gpioValue;
+    uint32_t leftCurrentState;
+    uint32_t rightCurrentState;
+    uint32_t tableIndex;
+    int32_t step;
+
+    g_systick_heartbeat++;
+
+    g_ms_divider++;
+
+    if (g_ms_divider >=
+        SYSTICK_TICKS_PER_MS) {
+
+        g_ms_divider = 0U;
+        g_system_ms++;
+    }
+
+    gpioValue =
+        DL_GPIO_readPins(
+            GPIOA,
+            LEFT_ENCODER_A_PIN |
+            LEFT_ENCODER_B_PIN |
+            RIGHT_ENCODER_A_PIN |
+            RIGHT_ENCODER_B_PIN
+        );
+
+    leftCurrentState =
+        Encoder_ReadLeftState(gpioValue);
+
+    rightCurrentState =
+        Encoder_ReadRightState(gpioValue);
+
+    if (leftCurrentState !=
+        g_left_previous_state) {
+
+        tableIndex =
+            (g_left_previous_state << 2U) |
+            leftCurrentState;
+
+        step =
+            g_quadrature_table[tableIndex];
+
+        if (step != 0) {
+            g_left_period_count++;
+            g_left_encoder_total++;
+        } else {
+            g_left_invalid_count++;
+        }
+
+        g_left_previous_state =
+            leftCurrentState;
+    }
+
+    if (rightCurrentState !=
+        g_right_previous_state) {
+
+        tableIndex =
+            (g_right_previous_state << 2U) |
+            rightCurrentState;
+
+        step =
+            g_quadrature_table[tableIndex];
+
+        if (step != 0) {
+            g_right_period_count++;
+            g_right_encoder_total++;
+        } else {
+            g_right_invalid_count++;
+        }
+
+        g_right_previous_state =
+            rightCurrentState;
+    }
+
+    /*
+     * 软件PWM。
+     */
+    g_pwm_phase++;
+
+    if (g_pwm_phase >= PWM_PERIOD_COUNT) {
+        g_pwm_phase = 0U;
+    }
+
+    if (g_motor_output_enabled == 0U) {
+        DriverA_Disable();
+        DriverB_Disable();
+    } else {
+        if (g_pwm_phase <
+            (uint32_t)g_driver_a_pwm) {
+
+            DriverA_Enable();
+        } else {
+            DriverA_Disable();
+        }
+
+        if (g_pwm_phase <
+            (uint32_t)g_driver_b_pwm) {
+
+            DriverB_Enable();
+        } else {
+            DriverB_Disable();
+        }
+    }
+
+    /*
+     * JY60每10ms。
+     */
+    g_heading_control_tick++;
+
+    if (g_heading_control_tick >=
+        HEADING_CONTROL_INTERVAL_TICKS) {
+
+        g_heading_control_tick = 0U;
+        g_heading_control_due = 1U;
+    }
+
+    /*
+     * 编码器PID每20ms。
+     */
+    g_encoder_control_tick++;
+
+    if (g_encoder_control_tick >=
+        ENCODER_CONTROL_INTERVAL_TICKS) {
+
+        g_encoder_control_tick = 0U;
+        g_encoder_control_due = 1U;
+    }
+}
+
+/*==================================================
+ * 主函数
+ *==================================================*/
+
+int main(void)
+{
+    uint32_t systickResult;
+    uint32_t controlUpdated;
+
+    SYSCFG_DL_init();
+
+    Motor_GPIO_Init();
+    Motor_SetForwardDirection();
+    Encoder_Initialize();
+
+    Motor_Stop();
+    Straight_PID_Reset();
+
+    g_run_state = 0U;
+
+    systickResult =
+        SysTick_Config(
+            CPUCLK_FREQ /
+            SYSTICK_FREQUENCY_HZ
+        );
+
+    if (systickResult != 0U) {
+        g_run_state = 900U;
+
+        Motor_Stop();
+
+        while (1) {
+            __WFI();
+        }
+    }
+
+    g_jy60_wait_start_ms =
+        g_system_ms;
+
+    g_jy60_stable_start_ms = 0U;
+
+    g_run_state = 1U;
+
+    while (1) {
+        JY60_ProcessUART();
+
+        controlUpdated = 0U;
+
+        if (g_heading_control_due != 0U) {
+            HeadingController_Update10ms();
+            controlUpdated = 1U;
+        }
+
+        if (g_encoder_control_due != 0U) {
+            EncoderController_Update20ms();
+            controlUpdated = 1U;
+        }
+
+        if (controlUpdated != 0U) {
+            Control_ApplyCurrentOutput();
+        }
+
+        __WFI();
+    }
+}
