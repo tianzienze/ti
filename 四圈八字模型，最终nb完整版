@@ -1,0 +1,3121 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+#include <stdbool.h>
+
+/*
+ * MSPM0G3507 完整赛道程序
+ *
+ * 任务顺序：
+ *   D -> B：JY60 原地转向 + 编码器速度 PI 两段速度直线
+ *   B -> C：八路灰度循迹右侧圆弧
+ *   C -> A：JY60 原地转向 + 编码器速度 PI 两段速度直线
+ *   A -> D：八路灰度循迹左侧圆弧
+ *   每圈回到 D 后，使用 JY60 转回上电时保存的初始方向
+ *   连续运行 4 圈，第 4 圈结束后永久停车
+ *
+ * 初始摆放要求：
+ *   小车位于 D 点，车头朝向 C 点。
+ *
+ * 重要：本程序完全按照当前 SysConfig 引脚编写，不修改任何引脚。
+ *
+ * 电机：
+ *   左 IN1=PB8，IN2=PB9，ENA=PA31
+ *   右 IN3=PB2，IN4=PB3，ENB=PB16
+ *
+ * 编码器：
+ *   左 A=PA26，B=PA27
+ *   右 A=PA24，B=PA25
+ *
+ * 八路灰度：
+ *   S1=PA23，S2=PB23，S3=PB21，S4=PA22
+ *   S5=PB19，S6=PB17，S7=PA17，S8=PA15
+ *   S1 为小车最左侧，S8 为小车最右侧
+ *   黑线低电平有效，白色高电平
+ *
+ * JY60 / UART0：
+ *   JY60 TX -> PA11（MCU RX）
+ *   JY60 RX -> PA10（MCU TX）
+ *   9600，8N1
+ *
+ * 状态灯：PA2
+ */
+
+/* =========================================================
+ * 系统时钟和周期
+ * ========================================================= */
+
+#if defined(CPUCLK_FREQ)
+#define CPU_CLOCK_HZ                  ((uint32_t)CPUCLK_FREQ)
+#else
+#define CPU_CLOCK_HZ                  32000000UL
+#endif
+
+#define SYSTICK_FREQUENCY_HZ          10000UL
+#define PWM_PERIOD_COUNT              100U
+#define HEADING_CONTROL_MS            20U
+#define SPEED_CONTROL_MS              100U
+#define LINE_CONTROL_MS               5U
+
+/* =========================================================
+ * 当前 SysConfig 引脚，禁止修改
+ * ========================================================= */
+
+#define LEFT_IN1_PIN                  DL_GPIO_PIN_8
+#define LEFT_IN2_PIN                  DL_GPIO_PIN_9
+#define LEFT_ENA_PIN                  DL_GPIO_PIN_31
+
+#define RIGHT_IN3_PIN                 DL_GPIO_PIN_2
+#define RIGHT_IN4_PIN                 DL_GPIO_PIN_3
+#define RIGHT_ENB_PIN                 DL_GPIO_PIN_16
+
+#define LEFT_ENCODER_A_PIN            DL_GPIO_PIN_26
+#define LEFT_ENCODER_B_PIN            DL_GPIO_PIN_27
+#define RIGHT_ENCODER_A_PIN           DL_GPIO_PIN_24
+#define RIGHT_ENCODER_B_PIN           DL_GPIO_PIN_25
+
+#define LINE_S1_PIN                   DL_GPIO_PIN_23
+#define LINE_S2_PIN                   DL_GPIO_PIN_23
+#define LINE_S3_PIN                   DL_GPIO_PIN_21
+#define LINE_S4_PIN                   DL_GPIO_PIN_22
+#define LINE_S5_PIN                   DL_GPIO_PIN_19
+#define LINE_S6_PIN                   DL_GPIO_PIN_17
+#define LINE_S7_PIN                   DL_GPIO_PIN_17
+#define LINE_S8_PIN                   DL_GPIO_PIN_15
+
+#define LINE_GPIOA_MASK               (LINE_S1_PIN | LINE_S4_PIN | \
+                                       LINE_S7_PIN | LINE_S8_PIN)
+
+#define LINE_GPIOB_MASK               (LINE_S2_PIN | LINE_S3_PIN | \
+                                       LINE_S5_PIN | LINE_S6_PIN)
+
+#define STATUS_LED_PIN                DL_GPIO_PIN_2
+#define JY60_UART_INST                UART_0_INST
+
+/* =========================================================
+ * 方向设置
+ * ========================================================= */
+
+#define LEFT_MOTOR_REVERSE            0
+#define RIGHT_MOTOR_REVERSE           0
+
+#define LEFT_ENCODER_REVERSE          1
+#define RIGHT_ENCODER_REVERSE         0
+
+#define JY60_YAW_REVERSE              0
+#define HEADING_CORRECTION_REVERSE    0
+
+/* =========================================================
+ * 编码器和车轮
+ * ========================================================= */
+
+#define LEFT_ENCODER_COUNTS_PER_REV   734L
+#define RIGHT_ENCODER_COUNTS_PER_REV  740L
+#define WHEEL_DIAMETER_MM             65L
+
+/* =========================================================
+ * 路线参数
+ *
+ * 保留所给路线代码中的实车调节值：
+ * D->B：+35.66°，1281 mm
+ * C->A：-48.99°，1281 mm
+ * ========================================================= */
+
+#define DB_TURN_ANGLE_X100            3566L
+#define DB_DISTANCE_MM                1281L
+#define DB_STOP_MARGIN_MM             200L
+
+#define CA_TURN_ANGLE_X100            (-5099L)
+#define CA_DISTANCE_MM                1281L
+#define CA_STOP_MARGIN_MM             250L
+
+#define ROUTE_STRAIGHT_RPM_X100       9000L
+#define ROUTE_HALF_RPM_X100           4500L
+#define ROUTE_FULL_SPEED_TIME_MS       2500U
+
+/*
+ * 直线阶段速度逻辑：
+ *   前2.5秒：90 RPM
+ *   2.5秒后：45 RPM（原速度的一半）
+ */
+
+#define TURN_FAST_PWM                 22U
+#define TURN_MEDIUM_PWM               17U
+#define TURN_SLOW_PWM                 12U
+
+#define TURN_MEDIUM_ZONE_X100         1000L
+#define TURN_SLOW_ZONE_X100           300L
+#define TURN_TOLERANCE_X100           150L
+#define TURN_RATE_LIMIT_X100          500L
+#define TURN_STABLE_CYCLES            10U
+#define TURN_TIMEOUT_MS               4000U
+#define TURN_SETTLE_MS                300U
+
+/*
+ * 每圈结束后回到初始方向时使用独立参数。
+ * 不影响 D->B、C->A 两次普通转向。
+ *
+ * 回正目标 = 上电初始航向 + 2.00°。
+ * 回正最长允许 8 秒，并使用更小的误差和角速度阈值。
+ */
+#define RETURN_HEADING_OFFSET_X100    400L
+#define RETURN_TURN_TIMEOUT_MS        8000U
+#define RETURN_TURN_TOLERANCE_X100    60L
+#define RETURN_TURN_RATE_LIMIT_X100   200L
+#define RETURN_TURN_STABLE_CYCLES     20U
+#define RETURN_TURN_MEDIUM_ZONE_X100  600L
+#define RETURN_TURN_SLOW_ZONE_X100    180L
+#define RETURN_TURN_FAST_PWM          18U
+#define RETURN_TURN_MEDIUM_PWM        14U
+#define RETURN_TURN_SLOW_PWM          12U
+#define RETURN_HEADING_SETTLE_MS      600U
+
+/*
+ * 到达斜线终点后，低速向前寻找圆弧黑线。
+ */
+#define LINE_SEEK_PWM                 11U
+#define LINE_SEEK_DELAY_MS            100U
+#define LINE_SEEK_TIMEOUT_MS          4000U
+#define BETWEEN_STAGE_PAUSE_MS        300U
+
+/*
+ * 连续运行圈数：
+ *   每圈 A->D 循迹结束后，先转回上电保存的初始航向；
+ *   前3圈继续下一圈，第4圈结束后永久停车。
+ */
+#define TOTAL_LAPS                    4U
+#define LAP_END_PAUSE_MS              300U
+
+/* =========================================================
+ * 路线直线速度 PI
+ * ========================================================= */
+
+#define LEFT_PWM_FEEDFORWARD          16L
+#define RIGHT_PWM_FEEDFORWARD         16L
+
+#define SPEED_KP_X100                 12L
+#define SPEED_KI_X100                 1L
+
+#define SPEED_INTEGRAL_LIMIT          400L
+#define SPEED_ERROR_DEADBAND          2L
+
+#define MOTOR_PI_MIN_PWM              14L
+#define MOTOR_PI_MAX_PWM              22L
+
+#define MOTOR_ROUTE_MIN_PWM           7L
+#define MOTOR_ROUTE_MAX_PWM           23L
+
+/* 航向 PD */
+#define HEADING_ERROR_DEADBAND_X100   5L
+#define HEADING_RATE_DEADBAND_X100    30L
+
+#define HEADING_COUNT_KP_X100         500L
+#define HEADING_COUNT_KD_X100         10L
+
+#define HEADING_PWM_KP_X100           70L
+#define HEADING_PWM_KD_X100           18L
+
+#define HEADING_COUNT_LIMIT           60L
+#define HEADING_PWM_LIMIT             8L
+
+/* =========================================================
+ * 八路循迹参数
+ *
+ * 低速、大差速：
+ * 直线 11/11
+ * 小弯 14/6
+ * 中弯 17/2
+ * 急弯 20/0
+ * ========================================================= */
+
+#define TRACK_STRAIGHT_LEFT_PWM       14
+#define TRACK_STRAIGHT_RIGHT_PWM      14
+
+#define TRACK_SLIGHT_OUTER_PWM        17
+#define TRACK_SLIGHT_INNER_PWM        7
+
+#define TRACK_MEDIUM_OUTER_PWM        19
+#define TRACK_MEDIUM_INNER_PWM        5
+
+#define TRACK_HARD_OUTER_PWM          20
+#define TRACK_HARD_INNER_PWM          0
+
+#define TRACK_CENTER_LIMIT            120
+#define TRACK_SLIGHT_LIMIT            300
+#define TRACK_MEDIUM_LIMIT            500
+
+/*
+ * 黑线已经实测为低电平。
+ */
+#define BLACK_IS_HIGH                 0
+
+/* =========================================================
+ * JY60
+ * ========================================================= */
+
+#define JY60_FRAME_HEADER             0x55U
+#define JY60_FRAME_GYRO               0x52U
+#define JY60_FRAME_ANGLE              0x53U
+#define JY60_FRAME_LENGTH             11U
+
+#define JY60_TIMEOUT_MS               300U
+#define START_DELAY_MS                1000U
+#define START_MIN_ANGLE_FRAMES        10U
+
+/* =========================================================
+ * 总任务状态
+ * ========================================================= */
+
+typedef enum
+{
+    MISSION_WAIT_JY60 = 0,
+
+    MISSION_DB_TURN = 10,
+    MISSION_DB_SETTLE = 11,
+    MISSION_DB_STRAIGHT = 12,
+
+    MISSION_BC_SEEK_LINE = 20,
+    MISSION_BC_TRACK = 21,
+    MISSION_C_PAUSE = 22,
+
+    MISSION_CA_TURN = 30,
+    MISSION_CA_SETTLE = 31,
+    MISSION_CA_STRAIGHT = 32,
+
+    MISSION_AD_SEEK_LINE = 40,
+    MISSION_AD_TRACK = 41,
+
+    MISSION_LAP_END_PAUSE = 42,
+    MISSION_RETURN_HEADING_TURN = 43,
+    MISSION_RETURN_HEADING_SETTLE = 44,
+
+    MISSION_FINISHED = 50,
+    MISSION_ERROR = 99
+
+} MissionState;
+
+/* =========================================================
+ * Watch 调试变量
+ * ========================================================= */
+
+volatile uint32_t g_run_state = MISSION_WAIT_JY60;
+
+volatile uint8_t g_test_enable = 1U;
+volatile uint8_t g_restart_mission = 0U;
+
+/*
+ * 圈数与初始方向：
+ *   g_current_lap：当前准备或正在运行的圈数，范围1~4
+ *   g_completed_laps：已经完整跑完的圈数
+ *   g_initial_yaw_deg_x100：上电后保存的小车初始朝向
+ */
+volatile uint8_t g_current_lap = 1U;
+volatile uint8_t g_completed_laps = 0U;
+
+volatile int32_t g_initial_yaw_deg_x100 = 0;
+volatile uint8_t g_initial_yaw_saved = 0U;
+
+volatile uint32_t g_system_ms = 0U;
+volatile uint32_t g_systick_count = 0U;
+volatile uint32_t g_main_heartbeat = 0U;
+
+volatile uint8_t g_motor_enabled = 0U;
+
+volatile uint8_t g_left_pwm = 0U;
+volatile uint8_t g_right_pwm = 0U;
+
+volatile uint8_t g_left_pi_pwm = 0U;
+volatile uint8_t g_right_pi_pwm = 0U;
+
+/* 编码器 */
+volatile int32_t g_left_encoder_count = 0;
+volatile int32_t g_right_encoder_count = 0;
+
+volatile uint32_t g_left_encoder_edges = 0U;
+volatile uint32_t g_right_encoder_edges = 0U;
+
+volatile uint8_t g_left_a_level = 0U;
+volatile uint8_t g_left_b_level = 0U;
+
+volatile uint8_t g_right_a_level = 0U;
+volatile uint8_t g_right_b_level = 0U;
+
+volatile int32_t g_left_delta_100ms = 0;
+volatile int32_t g_right_delta_100ms = 0;
+
+volatile int32_t g_left_rpm_x100 = 0;
+volatile int32_t g_right_rpm_x100 = 0;
+
+/* 速度 PI */
+volatile int32_t g_left_speed_error = 0;
+volatile int32_t g_right_speed_error = 0;
+
+volatile int32_t g_left_speed_integral = 0;
+volatile int32_t g_right_speed_integral = 0;
+
+volatile int32_t g_left_target_count = 0;
+volatile int32_t g_right_target_count = 0;
+
+/* JY60 */
+volatile int16_t g_jy60_raw_yaw = 0;
+volatile int16_t g_jy60_raw_gyro_z = 0;
+
+volatile int32_t g_jy60_yaw_deg_x100 = 0;
+volatile int32_t g_jy60_gyro_z_x100 = 0;
+volatile int32_t g_jy60_gyro_z_filtered_x100 = 0;
+
+volatile uint8_t g_jy60_online = 0U;
+
+volatile uint32_t g_jy60_rx_bytes = 0U;
+volatile uint32_t g_jy60_valid_angle_frames = 0U;
+volatile uint32_t g_jy60_valid_gyro_frames = 0U;
+volatile uint32_t g_jy60_checksum_errors = 0U;
+volatile uint32_t g_jy60_last_angle_ms = 0U;
+
+/* 路线 */
+volatile int32_t g_route_relative_turn_x100 =
+    DB_TURN_ANGLE_X100;
+
+volatile int32_t g_route_target_yaw_x100 = 0;
+volatile int32_t g_route_turn_error_x100 = 0;
+
+volatile uint8_t g_route_turn_pwm = 0U;
+volatile uint8_t g_route_turn_stable_count = 0U;
+
+volatile uint32_t g_state_start_ms = 0U;
+
+volatile int32_t g_route_target_distance_mm =
+    DB_DISTANCE_MM;
+
+volatile int32_t g_route_stop_margin_mm =
+    DB_STOP_MARGIN_MM;
+
+volatile int32_t g_route_start_left_count = 0;
+volatile int32_t g_route_start_right_count = 0;
+
+volatile int32_t g_route_left_distance_mm = 0;
+volatile int32_t g_route_right_distance_mm = 0;
+
+volatile int32_t g_route_distance_mm = 0;
+volatile int32_t g_route_remaining_mm =
+    DB_DISTANCE_MM;
+
+volatile int32_t g_target_rpm_x100 =
+    ROUTE_STRAIGHT_RPM_X100;
+
+/* 当前直线阶段已经运行的时间 */
+volatile uint32_t g_route_straight_elapsed_ms = 0U;
+
+/* 航向修正 */
+volatile int32_t g_heading_error_x100 = 0;
+volatile int32_t g_heading_count_correction = 0;
+volatile int32_t g_heading_pwm_correction = 0;
+
+/* 八路循迹 */
+volatile uint8_t g_line_raw_mask = 0U;
+volatile uint8_t g_line_active_mask = 0U;
+volatile uint8_t g_line_active_count = 0U;
+
+volatile int32_t g_line_error = 0;
+
+volatile uint8_t g_line_armed = 0U;
+volatile uint8_t g_line_lost_flag = 0U;
+
+volatile uint32_t g_line_stop_count = 0U;
+volatile uint32_t g_line_seek_elapsed_ms = 0U;
+
+/* =========================================================
+ * 内部变量
+ * ========================================================= */
+
+static volatile uint8_t s_pwm_phase = 0U;
+static volatile uint8_t s_100us_count = 0U;
+
+static volatile uint16_t s_heading_ms_count = 0U;
+static volatile uint16_t s_speed_ms_count = 0U;
+static volatile uint16_t s_line_ms_count = 0U;
+
+static volatile uint8_t s_heading_due = 0U;
+static volatile uint8_t s_speed_due = 0U;
+static volatile uint8_t s_line_due = 0U;
+
+static uint8_t s_previous_left_a = 0U;
+static uint8_t s_previous_right_a = 0U;
+
+static int32_t s_previous_speed_left_count = 0;
+static int32_t s_previous_speed_right_count = 0;
+
+static uint8_t s_jy60_frame[JY60_FRAME_LENGTH];
+static uint8_t s_jy60_frame_index = 0U;
+
+static uint8_t s_gyro_filter_initialized = 0U;
+
+/* =========================================================
+ * 工具函数
+ * ========================================================= */
+
+static int32_t ClampInt32(
+    int32_t value,
+    int32_t minimum,
+    int32_t maximum)
+{
+    if (value < minimum)
+    {
+        return minimum;
+    }
+
+    if (value > maximum)
+    {
+        return maximum;
+    }
+
+    return value;
+}
+
+static int32_t AbsInt32(int32_t value)
+{
+    if (value < 0)
+    {
+        return -value;
+    }
+
+    return value;
+}
+
+static int32_t NormalizeAngleX100(int32_t angle)
+{
+    while (angle > 18000L)
+    {
+        angle -= 36000L;
+    }
+
+    while (angle < -18000L)
+    {
+        angle += 36000L;
+    }
+
+    return angle;
+}
+
+static uint8_t ReadGPIOLevel(
+    GPIO_Regs *port,
+    uint32_t pin)
+{
+    if ((DL_GPIO_readPins(port, pin) & pin) != 0U)
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+static uint8_t CountBits8(uint8_t value)
+{
+    uint8_t count = 0U;
+
+    while (value != 0U)
+    {
+        count += (uint8_t)(value & 1U);
+        value >>= 1U;
+    }
+
+    return count;
+}
+
+/* =========================================================
+ * 电机方向控制
+ * ========================================================= */
+
+static void LeftMotorForward(void)
+{
+#if LEFT_MOTOR_REVERSE
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        LEFT_IN1_PIN
+    );
+
+    DL_GPIO_setPins(
+        GPIOB,
+        LEFT_IN2_PIN
+    );
+
+#else
+
+    DL_GPIO_setPins(
+        GPIOB,
+        LEFT_IN1_PIN
+    );
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        LEFT_IN2_PIN
+    );
+
+#endif
+}
+
+static void LeftMotorBackward(void)
+{
+#if LEFT_MOTOR_REVERSE
+
+    DL_GPIO_setPins(
+        GPIOB,
+        LEFT_IN1_PIN
+    );
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        LEFT_IN2_PIN
+    );
+
+#else
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        LEFT_IN1_PIN
+    );
+
+    DL_GPIO_setPins(
+        GPIOB,
+        LEFT_IN2_PIN
+    );
+
+#endif
+}
+
+static void RightMotorForward(void)
+{
+#if RIGHT_MOTOR_REVERSE
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        RIGHT_IN3_PIN
+    );
+
+    DL_GPIO_setPins(
+        GPIOB,
+        RIGHT_IN4_PIN
+    );
+
+#else
+
+    DL_GPIO_setPins(
+        GPIOB,
+        RIGHT_IN3_PIN
+    );
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        RIGHT_IN4_PIN
+    );
+
+#endif
+}
+
+static void RightMotorBackward(void)
+{
+#if RIGHT_MOTOR_REVERSE
+
+    DL_GPIO_setPins(
+        GPIOB,
+        RIGHT_IN3_PIN
+    );
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        RIGHT_IN4_PIN
+    );
+
+#else
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        RIGHT_IN3_PIN
+    );
+
+    DL_GPIO_setPins(
+        GPIOB,
+        RIGHT_IN4_PIN
+    );
+
+#endif
+}
+
+static void MotorDirectionStop(void)
+{
+    DL_GPIO_clearPins(
+        GPIOB,
+        LEFT_IN1_PIN |
+        LEFT_IN2_PIN |
+        RIGHT_IN3_PIN |
+        RIGHT_IN4_PIN
+    );
+}
+
+static void ImmediateMotorDisable(void)
+{
+    g_motor_enabled = 0U;
+
+    g_left_pwm = 0U;
+    g_right_pwm = 0U;
+
+    g_left_pi_pwm = 0U;
+    g_right_pi_pwm = 0U;
+
+    DL_GPIO_clearPins(
+        GPIOA,
+        LEFT_ENA_PIN
+    );
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        RIGHT_ENB_PIN
+    );
+}
+
+static void CarStop(void)
+{
+    ImmediateMotorDisable();
+    MotorDirectionStop();
+}
+
+static void SetMotorPWM(
+    uint8_t leftPWM,
+    uint8_t rightPWM)
+{
+    if (leftPWM > 100U)
+    {
+        leftPWM = 100U;
+    }
+
+    if (rightPWM > 100U)
+    {
+        rightPWM = 100U;
+    }
+
+    g_left_pwm = leftPWM;
+    g_right_pwm = rightPWM;
+
+    if ((leftPWM != 0U) ||
+        (rightPWM != 0U))
+    {
+        g_motor_enabled = 1U;
+    }
+    else
+    {
+        g_motor_enabled = 0U;
+    }
+}
+
+static void SetForwardPWM(
+    uint8_t leftPWM,
+    uint8_t rightPWM)
+{
+    LeftMotorForward();
+    RightMotorForward();
+
+    SetMotorPWM(
+        leftPWM,
+        rightPWM
+    );
+}
+
+/* =========================================================
+ * 编码器轮询
+ *
+ * 10kHz读取A相双边沿，不依赖SysConfig中断配置。
+ * ========================================================= */
+
+static void EncoderPoll100us(void)
+{
+    uint8_t leftA;
+    uint8_t leftB;
+
+    uint8_t rightA;
+    uint8_t rightB;
+
+    int32_t delta;
+
+    leftA = ReadGPIOLevel(
+        GPIOA,
+        LEFT_ENCODER_A_PIN
+    );
+
+    leftB = ReadGPIOLevel(
+        GPIOA,
+        LEFT_ENCODER_B_PIN
+    );
+
+    rightA = ReadGPIOLevel(
+        GPIOA,
+        RIGHT_ENCODER_A_PIN
+    );
+
+    rightB = ReadGPIOLevel(
+        GPIOA,
+        RIGHT_ENCODER_B_PIN
+    );
+
+    g_left_a_level = leftA;
+    g_left_b_level = leftB;
+
+    g_right_a_level = rightA;
+    g_right_b_level = rightB;
+
+    if (leftA != s_previous_left_a)
+    {
+        if (leftA != leftB)
+        {
+            delta = 1L;
+        }
+        else
+        {
+            delta = -1L;
+        }
+
+#if LEFT_ENCODER_REVERSE
+
+        delta = -delta;
+
+#endif
+
+        g_left_encoder_count += delta;
+        g_left_encoder_edges++;
+
+        s_previous_left_a = leftA;
+    }
+
+    if (rightA != s_previous_right_a)
+    {
+        if (rightA != rightB)
+        {
+            delta = 1L;
+        }
+        else
+        {
+            delta = -1L;
+        }
+
+#if RIGHT_ENCODER_REVERSE
+
+        delta = -delta;
+
+#endif
+
+        g_right_encoder_count += delta;
+        g_right_encoder_edges++;
+
+        s_previous_right_a = rightA;
+    }
+}
+
+/* =========================================================
+ * 八路灰度传感器
+ * ========================================================= */
+
+static uint8_t ReadLineRawMask(void)
+{
+    uint32_t levelA;
+    uint32_t levelB;
+
+    uint8_t rawMask = 0U;
+
+    levelA = DL_GPIO_readPins(
+        GPIOA,
+        LINE_GPIOA_MASK
+    );
+
+    levelB = DL_GPIO_readPins(
+        GPIOB,
+        LINE_GPIOB_MASK
+    );
+
+    /*
+     * bit0 = S1，最左侧
+     */
+    if ((levelA & LINE_S1_PIN) != 0U)
+    {
+        rawMask |= (1U << 0);
+    }
+
+    /*
+     * bit1 = S2
+     */
+    if ((levelB & LINE_S2_PIN) != 0U)
+    {
+        rawMask |= (1U << 1);
+    }
+
+    /*
+     * bit2 = S3
+     */
+    if ((levelB & LINE_S3_PIN) != 0U)
+    {
+        rawMask |= (1U << 2);
+    }
+
+    /*
+     * bit3 = S4
+     */
+    if ((levelA & LINE_S4_PIN) != 0U)
+    {
+        rawMask |= (1U << 3);
+    }
+
+    /*
+     * bit4 = S5
+     */
+    if ((levelB & LINE_S5_PIN) != 0U)
+    {
+        rawMask |= (1U << 4);
+    }
+
+    /*
+     * bit5 = S6
+     */
+    if ((levelB & LINE_S6_PIN) != 0U)
+    {
+        rawMask |= (1U << 5);
+    }
+
+    /*
+     * bit6 = S7
+     */
+    if ((levelA & LINE_S7_PIN) != 0U)
+    {
+        rawMask |= (1U << 6);
+    }
+
+    /*
+     * bit7 = S8，最右侧
+     */
+    if ((levelA & LINE_S8_PIN) != 0U)
+    {
+        rawMask |= (1U << 7);
+    }
+
+    return rawMask;
+}
+
+static void UpdateLineSensors(void)
+{
+    uint8_t rawMask;
+    uint8_t activeMask;
+
+    rawMask = ReadLineRawMask();
+
+    g_line_raw_mask = rawMask;
+
+#if BLACK_IS_HIGH
+
+    activeMask = rawMask;
+
+#else
+
+    /*
+     * 黑线为低电平：
+     *
+     * 全部白色：
+     * rawMask = 255
+     * activeMask = 0
+     */
+    activeMask =
+        (uint8_t)(~rawMask);
+
+#endif
+
+    g_line_active_mask = activeMask;
+
+    g_line_active_count =
+        CountBits8(activeMask);
+}
+
+static int32_t CalculateLineError(
+    uint8_t activeMask)
+{
+    /*
+     * S1为最左侧，S8为最右侧。
+     */
+    static const int32_t weights[8] =
+    {
+        -700,
+        -500,
+        -300,
+        -100,
+         100,
+         300,
+         500,
+         700
+    };
+
+    int32_t sum = 0;
+    uint32_t count = 0U;
+    uint32_t index;
+
+    for (index = 0U;
+         index < 8U;
+         index++)
+    {
+        if ((activeMask &
+             (1U << index)) != 0U)
+        {
+            sum += weights[index];
+            count++;
+        }
+    }
+
+    if (count == 0U)
+    {
+        return 0;
+    }
+
+    return sum / (int32_t)count;
+}
+
+static bool IsLineTrackingState(void)
+{
+    if ((g_run_state == MISSION_BC_TRACK) ||
+        (g_run_state == MISSION_AD_TRACK))
+    {
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * 八路循迹过程中只要八路全白，
+ * 在SysTick中立即关闭ENA、ENB。
+ */
+static void CheckImmediateLineLossInISR(void)
+{
+    if (IsLineTrackingState() &&
+        (g_line_armed != 0U) &&
+        (g_line_lost_flag == 0U) &&
+        (g_line_active_mask == 0U))
+    {
+        g_line_lost_flag = 1U;
+        g_line_stop_count++;
+
+        ImmediateMotorDisable();
+    }
+}
+
+/* =========================================================
+ * JY60数据处理
+ * ========================================================= */
+
+static void JY60ProcessFrame(
+    const uint8_t *frame)
+{
+    uint8_t checksum = 0U;
+    uint8_t index;
+
+    int16_t rawValue;
+    int32_t converted;
+
+    for (index = 0U;
+         index < 10U;
+         index++)
+    {
+        checksum =
+            (uint8_t)(
+                checksum +
+                frame[index]
+            );
+    }
+
+    if (checksum != frame[10])
+    {
+        g_jy60_checksum_errors++;
+        return;
+    }
+
+    /*
+     * 0x52：角速度
+     */
+    if (frame[1] ==
+        JY60_FRAME_GYRO)
+    {
+        rawValue =
+            (int16_t)(
+                ((uint16_t)frame[7] << 8U) |
+                frame[6]
+            );
+
+#if JY60_YAW_REVERSE
+
+        rawValue =
+            (int16_t)(-rawValue);
+
+#endif
+
+        g_jy60_raw_gyro_z =
+            rawValue;
+
+        converted =
+            (int32_t)(
+                ((int64_t)rawValue *
+                 200000L) /
+                32768L
+            );
+
+        g_jy60_gyro_z_x100 =
+            converted;
+
+        if (s_gyro_filter_initialized == 0U)
+        {
+            g_jy60_gyro_z_filtered_x100 =
+                converted;
+
+            s_gyro_filter_initialized = 1U;
+        }
+        else
+        {
+            g_jy60_gyro_z_filtered_x100 =
+                (
+                    g_jy60_gyro_z_filtered_x100 +
+                    converted
+                ) /
+                2L;
+        }
+
+        g_jy60_valid_gyro_frames++;
+    }
+
+    /*
+     * 0x53：航向角
+     */
+    else if (frame[1] ==
+             JY60_FRAME_ANGLE)
+    {
+        rawValue =
+            (int16_t)(
+                ((uint16_t)frame[7] << 8U) |
+                frame[6]
+            );
+
+#if JY60_YAW_REVERSE
+
+        rawValue =
+            (int16_t)(-rawValue);
+
+#endif
+
+        g_jy60_raw_yaw =
+            rawValue;
+
+        g_jy60_yaw_deg_x100 =
+            NormalizeAngleX100(
+                (int32_t)(
+                    ((int64_t)rawValue *
+                     18000L) /
+                    32768L
+                )
+            );
+
+        g_jy60_last_angle_ms =
+            g_system_ms;
+
+        g_jy60_online = 1U;
+
+        g_jy60_valid_angle_frames++;
+    }
+}
+
+static void JY60ParseByte(uint8_t data)
+{
+    if (s_jy60_frame_index == 0U)
+    {
+        if (data ==
+            JY60_FRAME_HEADER)
+        {
+            s_jy60_frame[0] =
+                data;
+
+            s_jy60_frame_index =
+                1U;
+        }
+
+        return;
+    }
+
+    if (s_jy60_frame_index == 1U)
+    {
+        if ((data < 0x50U) ||
+            (data > 0x59U))
+        {
+            if (data ==
+                JY60_FRAME_HEADER)
+            {
+                s_jy60_frame[0] =
+                    data;
+
+                s_jy60_frame_index =
+                    1U;
+            }
+            else
+            {
+                s_jy60_frame_index =
+                    0U;
+            }
+
+            return;
+        }
+    }
+
+    s_jy60_frame[
+        s_jy60_frame_index
+    ] = data;
+
+    s_jy60_frame_index++;
+
+    if (s_jy60_frame_index >=
+        JY60_FRAME_LENGTH)
+    {
+        JY60ProcessFrame(
+            s_jy60_frame
+        );
+
+        s_jy60_frame_index =
+            0U;
+    }
+}
+
+static void JY60Poll(void)
+{
+    uint8_t data;
+
+    while (
+        DL_UART_Main_isRXFIFOEmpty(
+            JY60_UART_INST
+        ) == false
+    )
+    {
+        data =
+            (uint8_t)
+            DL_UART_Main_receiveData(
+                JY60_UART_INST
+            );
+
+        g_jy60_rx_bytes++;
+
+        JY60ParseByte(data);
+    }
+
+    if (g_jy60_valid_angle_frames ==
+        0U)
+    {
+        g_jy60_online = 0U;
+    }
+    else if (
+        (uint32_t)(
+            g_system_ms -
+            g_jy60_last_angle_ms
+        ) >
+        JY60_TIMEOUT_MS
+    )
+    {
+        g_jy60_online = 0U;
+    }
+}
+
+/* =========================================================
+ * 速度PI
+ * ========================================================= */
+
+static void ResetSpeedController(void)
+{
+    g_left_speed_integral = 0;
+    g_right_speed_integral = 0;
+
+    g_left_speed_error = 0;
+    g_right_speed_error = 0;
+
+    g_left_pi_pwm = 0U;
+    g_right_pi_pwm = 0U;
+
+    g_heading_count_correction = 0;
+    g_heading_pwm_correction = 0;
+}
+
+static int32_t CalculateTargetCount(
+    int32_t rpmX100,
+    int32_t countsPerRev)
+{
+    int64_t result;
+
+    result =
+        (int64_t)rpmX100 *
+        countsPerRev;
+
+    result += 30000L;
+    result /= 60000L;
+
+    return (int32_t)result;
+}
+
+static uint8_t SpeedPIUpdate(
+    int32_t target,
+    int32_t actual,
+    int32_t feedforward,
+    volatile int32_t *integral,
+    volatile int32_t *errorWatch)
+{
+    int32_t error;
+    int32_t candidateIntegral;
+
+    int32_t outputX100;
+    int32_t pwm;
+
+    if (target <= 0)
+    {
+        *integral = 0;
+        *errorWatch = 0;
+
+        return 0U;
+    }
+
+    error =
+        target -
+        actual;
+
+    if (AbsInt32(error) <=
+        SPEED_ERROR_DEADBAND)
+    {
+        error = 0;
+    }
+
+    candidateIntegral =
+        ((*integral) * 7L) /
+        8L;
+
+    candidateIntegral +=
+        error;
+
+    candidateIntegral =
+        ClampInt32(
+            candidateIntegral,
+            -SPEED_INTEGRAL_LIMIT,
+            SPEED_INTEGRAL_LIMIT
+        );
+
+    outputX100 =
+        feedforward * 100L +
+        SPEED_KP_X100 * error +
+        SPEED_KI_X100 *
+        candidateIntegral;
+
+    if (outputX100 >= 0)
+    {
+        pwm =
+            (outputX100 + 50L) /
+            100L;
+    }
+    else
+    {
+        pwm =
+            (outputX100 - 50L) /
+            100L;
+    }
+
+    pwm =
+        ClampInt32(
+            pwm,
+            MOTOR_PI_MIN_PWM,
+            MOTOR_PI_MAX_PWM
+        );
+
+    *integral =
+        candidateIntegral;
+
+    *errorWatch =
+        error;
+
+    return (uint8_t)pwm;
+}
+
+/* =========================================================
+ * JY60航向PD
+ * ========================================================= */
+
+static void HeadingControlUpdate(void)
+{
+    int32_t error;
+    int32_t yawRate;
+
+    int64_t numerator;
+
+    if (g_jy60_online == 0U)
+    {
+        g_heading_error_x100 = 0;
+
+        g_heading_count_correction = 0;
+        g_heading_pwm_correction = 0;
+
+        return;
+    }
+
+    /*
+     * 当前角度 - 目标角度。
+     */
+    error =
+        NormalizeAngleX100(
+            g_jy60_yaw_deg_x100 -
+            g_route_target_yaw_x100
+        );
+
+    if (AbsInt32(error) <=
+        HEADING_ERROR_DEADBAND_X100)
+    {
+        error = 0;
+    }
+
+    yawRate =
+        g_jy60_gyro_z_filtered_x100;
+
+    if (AbsInt32(yawRate) <=
+        HEADING_RATE_DEADBAND_X100)
+    {
+        yawRate = 0;
+    }
+
+    g_heading_error_x100 =
+        error;
+
+    numerator =
+        (int64_t)
+        HEADING_COUNT_KP_X100 *
+        error +
+
+        (int64_t)
+        HEADING_COUNT_KD_X100 *
+        yawRate;
+
+    g_heading_count_correction =
+        ClampInt32(
+            (int32_t)(
+                numerator /
+                10000L
+            ),
+            -HEADING_COUNT_LIMIT,
+            HEADING_COUNT_LIMIT
+        );
+
+    numerator =
+        (int64_t)
+        HEADING_PWM_KP_X100 *
+        error +
+
+        (int64_t)
+        HEADING_PWM_KD_X100 *
+        yawRate;
+
+    g_heading_pwm_correction =
+        ClampInt32(
+            (int32_t)(
+                numerator /
+                10000L
+            ),
+            -HEADING_PWM_LIMIT,
+            HEADING_PWM_LIMIT
+        );
+
+#if HEADING_CORRECTION_REVERSE
+
+    g_heading_count_correction =
+        -g_heading_count_correction;
+
+    g_heading_pwm_correction =
+        -g_heading_pwm_correction;
+
+#endif
+}
+
+static void ApplyRoutePWM(void)
+{
+    int32_t leftPWM;
+    int32_t rightPWM;
+
+    leftPWM =
+        (int32_t)g_left_pi_pwm +
+        g_heading_pwm_correction;
+
+    rightPWM =
+        (int32_t)g_right_pi_pwm -
+        g_heading_pwm_correction;
+
+    leftPWM =
+        ClampInt32(
+            leftPWM,
+            MOTOR_ROUTE_MIN_PWM,
+            MOTOR_ROUTE_MAX_PWM
+        );
+
+    rightPWM =
+        ClampInt32(
+            rightPWM,
+            MOTOR_ROUTE_MIN_PWM,
+            MOTOR_ROUTE_MAX_PWM
+        );
+
+    SetForwardPWM(
+        (uint8_t)leftPWM,
+        (uint8_t)rightPWM
+    );
+}
+
+static void RouteSpeedControlUpdate(void)
+{
+    int32_t currentLeft;
+    int32_t currentRight;
+
+    int32_t actualLeft;
+    int32_t actualRight;
+
+    int32_t baseLeftTarget;
+    int32_t baseRightTarget;
+
+    int32_t leftMinimum;
+    int32_t rightMinimum;
+
+    __disable_irq();
+
+    currentLeft =
+        g_left_encoder_count;
+
+    currentRight =
+        g_right_encoder_count;
+
+    __enable_irq();
+
+    g_left_delta_100ms =
+        currentLeft -
+        s_previous_speed_left_count;
+
+    g_right_delta_100ms =
+        currentRight -
+        s_previous_speed_right_count;
+
+    s_previous_speed_left_count =
+        currentLeft;
+
+    s_previous_speed_right_count =
+        currentRight;
+
+    actualLeft =
+        AbsInt32(
+            g_left_delta_100ms
+        );
+
+    actualRight =
+        AbsInt32(
+            g_right_delta_100ms
+        );
+
+    baseLeftTarget =
+        CalculateTargetCount(
+            g_target_rpm_x100,
+            LEFT_ENCODER_COUNTS_PER_REV
+        );
+
+    baseRightTarget =
+        CalculateTargetCount(
+            g_target_rpm_x100,
+            RIGHT_ENCODER_COUNTS_PER_REV
+        );
+
+    leftMinimum =
+        baseLeftTarget *
+        30L /
+        100L;
+
+    rightMinimum =
+        baseRightTarget *
+        30L /
+        100L;
+
+    g_left_target_count =
+        ClampInt32(
+            baseLeftTarget +
+            g_heading_count_correction,
+            leftMinimum,
+            baseLeftTarget +
+            HEADING_COUNT_LIMIT
+        );
+
+    g_right_target_count =
+        ClampInt32(
+            baseRightTarget -
+            g_heading_count_correction,
+            rightMinimum,
+            baseRightTarget +
+            HEADING_COUNT_LIMIT
+        );
+
+    g_left_pi_pwm =
+        SpeedPIUpdate(
+            g_left_target_count,
+            actualLeft,
+            LEFT_PWM_FEEDFORWARD,
+            &g_left_speed_integral,
+            &g_left_speed_error
+        );
+
+    g_right_pi_pwm =
+        SpeedPIUpdate(
+            g_right_target_count,
+            actualRight,
+            RIGHT_PWM_FEEDFORWARD,
+            &g_right_speed_integral,
+            &g_right_speed_error
+        );
+
+    g_left_rpm_x100 =
+        (int32_t)(
+            (
+                (int64_t)
+                actualLeft *
+                60000L
+            ) /
+            LEFT_ENCODER_COUNTS_PER_REV
+        );
+
+    g_right_rpm_x100 =
+        (int32_t)(
+            (
+                (int64_t)
+                actualRight *
+                60000L
+            ) /
+            RIGHT_ENCODER_COUNTS_PER_REV
+        );
+
+    ApplyRoutePWM();
+}
+
+/* =========================================================
+ * 编码器距离
+ * ========================================================= */
+
+static int32_t EncoderCountToDistanceMM(
+    int32_t count,
+    int32_t countsPerRev)
+{
+    int64_t distance;
+
+    count =
+        AbsInt32(count);
+
+    distance =
+        (int64_t)count *
+        WHEEL_DIAMETER_MM *
+        314159L;
+
+    distance /=
+        (
+            (int64_t)
+            countsPerRev *
+            100000L
+        );
+
+    return (int32_t)distance;
+}
+
+static void UpdateRouteDistance(void)
+{
+    int32_t leftCount;
+    int32_t rightCount;
+
+    __disable_irq();
+
+    leftCount =
+        g_left_encoder_count -
+        g_route_start_left_count;
+
+    rightCount =
+        g_right_encoder_count -
+        g_route_start_right_count;
+
+    __enable_irq();
+
+    g_route_left_distance_mm =
+        EncoderCountToDistanceMM(
+            leftCount,
+            LEFT_ENCODER_COUNTS_PER_REV
+        );
+
+    g_route_right_distance_mm =
+        EncoderCountToDistanceMM(
+            rightCount,
+            RIGHT_ENCODER_COUNTS_PER_REV
+        );
+
+    g_route_distance_mm =
+        (
+            g_route_left_distance_mm +
+            g_route_right_distance_mm
+        ) /
+        2L;
+
+    g_route_remaining_mm =
+        g_route_target_distance_mm -
+        g_route_distance_mm;
+
+    if (g_route_remaining_mm < 0)
+    {
+        g_route_remaining_mm = 0;
+    }
+}
+
+static bool RouteReachedTarget(void)
+{
+    if (
+        g_route_distance_mm >=
+        (
+            g_route_target_distance_mm -
+            g_route_stop_margin_mm
+        )
+    )
+    {
+        return true;
+    }
+
+    return false;
+}
+
+/* =========================================================
+ * 启动路线转向
+ * ========================================================= */
+
+/*
+ * 根据当前转向状态，进入对应的转向后稳定状态。
+ */
+static void FinishRouteTurn(void)
+{
+    CarStop();
+
+    g_route_turn_pwm = 0U;
+    g_route_turn_stable_count = 0U;
+
+    g_state_start_ms =
+        g_system_ms;
+
+    if (g_run_state ==
+        MISSION_DB_TURN)
+    {
+        g_run_state =
+            MISSION_DB_SETTLE;
+    }
+    else if (
+        g_run_state ==
+        MISSION_CA_TURN
+    )
+    {
+        g_run_state =
+            MISSION_CA_SETTLE;
+    }
+    else if (
+        g_run_state ==
+        MISSION_RETURN_HEADING_TURN
+    )
+    {
+        g_run_state =
+            MISSION_RETURN_HEADING_SETTLE;
+    }
+    else
+    {
+        g_run_state =
+            MISSION_ERROR;
+    }
+}
+
+/*
+ * 以绝对航向角为目标启动转向。
+ *
+ * 这样下一圈的 D->B 不再以“上一圈结束时的当前角度”
+ * 继续累加，而是始终以最初保存的方向为基准，
+ * 可以减小多圈运行时的方向累计误差。
+ */
+static void StartRouteTurnToAbsoluteYaw(
+    int32_t targetYawX100,
+    int32_t distanceMM,
+    int32_t stopMarginMM,
+    MissionState turnState)
+{
+    CarStop();
+    ResetSpeedController();
+
+    g_route_target_distance_mm =
+        distanceMM;
+
+    g_route_stop_margin_mm =
+        stopMarginMM;
+
+    g_route_target_yaw_x100 =
+        NormalizeAngleX100(
+            targetYawX100
+        );
+
+    g_route_relative_turn_x100 =
+        NormalizeAngleX100(
+            g_route_target_yaw_x100 -
+            g_jy60_yaw_deg_x100
+        );
+
+    g_route_turn_error_x100 =
+        g_route_relative_turn_x100;
+
+    g_route_turn_stable_count = 0U;
+    g_route_turn_pwm = 0U;
+
+    g_state_start_ms =
+        g_system_ms;
+
+    g_run_state =
+        (uint32_t)turnState;
+}
+
+static void StartRouteTurn(
+    int32_t relativeTurnX100,
+    int32_t distanceMM,
+    int32_t stopMarginMM,
+    MissionState turnState)
+{
+    StartRouteTurnToAbsoluteYaw(
+        NormalizeAngleX100(
+            g_jy60_yaw_deg_x100 +
+            relativeTurnX100
+        ),
+        distanceMM,
+        stopMarginMM,
+        turnState
+    );
+}
+
+static void RouteTurnUpdate(void)
+{
+    int32_t error;
+    int32_t yawRate;
+    int32_t absoluteError;
+
+    uint8_t pwm;
+    uint8_t isReturnHeading;
+
+    uint32_t timeoutMs;
+    int32_t toleranceX100;
+    int32_t rateLimitX100;
+    uint8_t stableCycles;
+
+    int32_t mediumZoneX100;
+    int32_t slowZoneX100;
+
+    uint8_t fastPWM;
+    uint8_t mediumPWM;
+    uint8_t slowPWM;
+
+    isReturnHeading =
+        (g_run_state ==
+         MISSION_RETURN_HEADING_TURN) ?
+        1U : 0U;
+
+    /*
+     * 普通转向和每圈结束回正使用不同参数。
+     * 回正允许更长时间，同时使用更严格的稳定条件。
+     */
+    if (isReturnHeading != 0U)
+    {
+        timeoutMs =
+            RETURN_TURN_TIMEOUT_MS;
+
+        toleranceX100 =
+            RETURN_TURN_TOLERANCE_X100;
+
+        rateLimitX100 =
+            RETURN_TURN_RATE_LIMIT_X100;
+
+        stableCycles =
+            RETURN_TURN_STABLE_CYCLES;
+
+        mediumZoneX100 =
+            RETURN_TURN_MEDIUM_ZONE_X100;
+
+        slowZoneX100 =
+            RETURN_TURN_SLOW_ZONE_X100;
+
+        fastPWM =
+            RETURN_TURN_FAST_PWM;
+
+        mediumPWM =
+            RETURN_TURN_MEDIUM_PWM;
+
+        slowPWM =
+            RETURN_TURN_SLOW_PWM;
+    }
+    else
+    {
+        timeoutMs =
+            TURN_TIMEOUT_MS;
+
+        toleranceX100 =
+            TURN_TOLERANCE_X100;
+
+        rateLimitX100 =
+            TURN_RATE_LIMIT_X100;
+
+        stableCycles =
+            TURN_STABLE_CYCLES;
+
+        mediumZoneX100 =
+            TURN_MEDIUM_ZONE_X100;
+
+        slowZoneX100 =
+            TURN_SLOW_ZONE_X100;
+
+        fastPWM =
+            TURN_FAST_PWM;
+
+        mediumPWM =
+            TURN_MEDIUM_PWM;
+
+        slowPWM =
+            TURN_SLOW_PWM;
+    }
+
+    /*
+     * 普通转向最多4秒；每圈结束回正最多8秒。
+     * 超时后仍进入后续状态，防止任务永久卡住。
+     */
+    if (
+        (uint32_t)(
+            g_system_ms -
+            g_state_start_ms
+        ) >=
+        timeoutMs
+    )
+    {
+        FinishRouteTurn();
+        return;
+    }
+
+    /*
+     * JY60暂时离线时停车等待，计时仍继续。
+     */
+    if (g_jy60_online == 0U)
+    {
+        CarStop();
+        g_route_turn_pwm = 0U;
+        return;
+    }
+
+    error =
+        NormalizeAngleX100(
+            g_route_target_yaw_x100 -
+            g_jy60_yaw_deg_x100
+        );
+
+    yawRate =
+        g_jy60_gyro_z_filtered_x100;
+
+    absoluteError =
+        AbsInt32(error);
+
+    g_route_turn_error_x100 =
+        error;
+
+    /*
+     * 回到初始方向时：
+     * 一旦进入允许误差范围，立即停车观察，不再继续推着电机转。
+     * 连续稳定20次（20ms一次，共约400ms）才判定回正完成。
+     */
+    if (isReturnHeading != 0U)
+    {
+        if (
+            (absoluteError <=
+             toleranceX100) &&
+
+            (AbsInt32(yawRate) <=
+             rateLimitX100)
+        )
+        {
+            CarStop();
+            g_route_turn_pwm = 0U;
+
+            if (g_route_turn_stable_count <
+                255U)
+            {
+                g_route_turn_stable_count++;
+            }
+
+            if (
+                g_route_turn_stable_count >=
+                stableCycles
+            )
+            {
+                FinishRouteTurn();
+            }
+
+            return;
+        }
+
+        g_route_turn_stable_count = 0U;
+    }
+    else
+    {
+        if (
+            (absoluteError <=
+             toleranceX100) &&
+
+            (AbsInt32(yawRate) <=
+             rateLimitX100)
+        )
+        {
+            if (g_route_turn_stable_count <
+                255U)
+            {
+                g_route_turn_stable_count++;
+            }
+        }
+        else
+        {
+            g_route_turn_stable_count = 0U;
+        }
+
+        if (
+            g_route_turn_stable_count >=
+            stableCycles
+        )
+        {
+            FinishRouteTurn();
+            return;
+        }
+    }
+
+    if (absoluteError >
+        mediumZoneX100)
+    {
+        pwm = fastPWM;
+    }
+    else if (
+        absoluteError >
+        slowZoneX100
+    )
+    {
+        pwm = mediumPWM;
+    }
+    else
+    {
+        pwm = slowPWM;
+    }
+
+    g_route_turn_pwm =
+        pwm;
+
+    if (error > 0)
+    {
+        /*
+         * 左轮后退、右轮前进：原地向左转。
+         */
+        LeftMotorBackward();
+        RightMotorForward();
+    }
+    else
+    {
+        /*
+         * 左轮前进、右轮后退：原地向右转。
+         */
+        LeftMotorForward();
+        RightMotorBackward();
+    }
+
+    SetMotorPWM(
+        pwm,
+        pwm
+    );
+}
+
+/* =========================================================
+ * 启动路线直线阶段
+ * ========================================================= */
+
+static void StartRouteStraight(
+    MissionState straightState)
+{
+    int32_t currentLeft;
+    int32_t currentRight;
+
+    __disable_irq();
+
+    currentLeft =
+        g_left_encoder_count;
+
+    currentRight =
+        g_right_encoder_count;
+
+    __enable_irq();
+
+    g_route_start_left_count =
+        currentLeft;
+
+    g_route_start_right_count =
+        currentRight;
+
+    s_previous_speed_left_count =
+        currentLeft;
+
+    s_previous_speed_right_count =
+        currentRight;
+
+    g_route_left_distance_mm = 0;
+    g_route_right_distance_mm = 0;
+    g_route_distance_mm = 0;
+
+    g_route_remaining_mm =
+        g_route_target_distance_mm;
+
+    g_target_rpm_x100 =
+        ROUTE_STRAIGHT_RPM_X100;
+
+    g_route_straight_elapsed_ms = 0U;
+
+    ResetSpeedController();
+
+    g_left_pi_pwm =
+        (uint8_t)
+        LEFT_PWM_FEEDFORWARD;
+
+    g_right_pi_pwm =
+        (uint8_t)
+        RIGHT_PWM_FEEDFORWARD;
+
+    LeftMotorForward();
+    RightMotorForward();
+
+    SetMotorPWM(
+        g_left_pi_pwm,
+        g_right_pi_pwm
+    );
+
+    g_state_start_ms =
+        g_system_ms;
+
+    g_run_state =
+        (uint32_t)straightState;
+}
+
+/* =========================================================
+ * 圆弧黑线搜索和循迹状态
+ * ========================================================= */
+
+static void EnterLineSeek(
+    MissionState seekState)
+{
+    CarStop();
+
+    g_line_armed = 0U;
+    g_line_lost_flag = 0U;
+    g_line_error = 0;
+
+    g_state_start_ms =
+        g_system_ms;
+
+    g_line_seek_elapsed_ms = 0U;
+
+    g_run_state =
+        (uint32_t)seekState;
+}
+
+static void StartLineTracking(
+    MissionState trackState)
+{
+    g_line_armed = 1U;
+    g_line_lost_flag = 0U;
+    g_line_error = 0;
+
+    LeftMotorForward();
+    RightMotorForward();
+
+    g_run_state =
+        (uint32_t)trackState;
+}
+
+static void HandleLineTrackFinished(void)
+{
+    CarStop();
+
+    g_line_armed = 0U;
+    g_line_lost_flag = 0U;
+
+    g_state_start_ms =
+        g_system_ms;
+
+    /*
+     * 第一次圆弧 B->C 完成。
+     */
+    if (g_run_state ==
+        MISSION_BC_TRACK)
+    {
+        g_run_state =
+            MISSION_C_PAUSE;
+    }
+
+    /*
+     * 第二次圆弧 A->D 完成：
+     * 说明当前一圈已经完整结束。
+     *
+     * 包括第4圈在内，每一圈结束后都先转回最初方向。
+     * 第1~3圈回正后开始下一圈；
+     * 第4圈回正后永久停车。
+     */
+    else
+    {
+        if (g_completed_laps <
+            TOTAL_LAPS)
+        {
+            g_completed_laps++;
+        }
+
+        if (g_completed_laps <
+            TOTAL_LAPS)
+        {
+            g_current_lap =
+                g_completed_laps + 1U;
+        }
+        else
+        {
+            g_current_lap =
+                TOTAL_LAPS;
+        }
+
+        g_run_state =
+            MISSION_LAP_END_PAUSE;
+    }
+}
+
+/* =========================================================
+ * 八路循迹
+ * ========================================================= */
+
+static void LineTrackingUpdate(void)
+{
+    int32_t error;
+    int32_t absoluteError;
+
+    int32_t leftPWM;
+    int32_t rightPWM;
+
+    /*
+     * SysTick中已经检测到全白。
+     */
+    if (g_line_lost_flag != 0U)
+    {
+        HandleLineTrackFinished();
+        return;
+    }
+
+    /*
+     * 主循环再次保护。
+     */
+    if (g_line_active_mask == 0U)
+    {
+        g_line_lost_flag = 1U;
+
+        ImmediateMotorDisable();
+
+        HandleLineTrackFinished();
+
+        return;
+    }
+
+    error =
+        CalculateLineError(
+            g_line_active_mask
+        );
+
+    absoluteError =
+        AbsInt32(error);
+
+    g_line_error =
+        error;
+
+    /*
+     * 中心：
+     * 两轮低速直行。
+     */
+    if (absoluteError <=
+        TRACK_CENTER_LIMIT)
+    {
+        leftPWM =
+            TRACK_STRAIGHT_LEFT_PWM;
+
+        rightPWM =
+            TRACK_STRAIGHT_RIGHT_PWM;
+    }
+
+    /*
+     * 小弯。
+     */
+    else if (
+        absoluteError <=
+        TRACK_SLIGHT_LIMIT
+    )
+    {
+        if (error < 0)
+        {
+            /*
+             * 黑线在左侧：
+             * 左轮慢，右轮快。
+             */
+            leftPWM =
+                TRACK_SLIGHT_INNER_PWM;
+
+            rightPWM =
+                TRACK_SLIGHT_OUTER_PWM;
+        }
+        else
+        {
+            leftPWM =
+                TRACK_SLIGHT_OUTER_PWM;
+
+            rightPWM =
+                TRACK_SLIGHT_INNER_PWM;
+        }
+    }
+
+    /*
+     * 中弯。
+     */
+    else if (
+        absoluteError <=
+        TRACK_MEDIUM_LIMIT
+    )
+    {
+        if (error < 0)
+        {
+            leftPWM =
+                TRACK_MEDIUM_INNER_PWM;
+
+            rightPWM =
+                TRACK_MEDIUM_OUTER_PWM;
+        }
+        else
+        {
+            leftPWM =
+                TRACK_MEDIUM_OUTER_PWM;
+
+            rightPWM =
+                TRACK_MEDIUM_INNER_PWM;
+        }
+    }
+
+    /*
+     * 急弯：
+     * 内轮停止，外轮20%。
+     */
+    else
+    {
+        if (error < 0)
+        {
+            leftPWM =
+                TRACK_HARD_INNER_PWM;
+
+            rightPWM =
+                TRACK_HARD_OUTER_PWM;
+        }
+        else
+        {
+            leftPWM =
+                TRACK_HARD_OUTER_PWM;
+
+            rightPWM =
+                TRACK_HARD_INNER_PWM;
+        }
+    }
+
+    SetForwardPWM(
+        (uint8_t)leftPWM,
+        (uint8_t)rightPWM
+    );
+}
+
+static void LineSeekUpdate(void)
+{
+    g_line_seek_elapsed_ms =
+        g_system_ms -
+        g_state_start_ms;
+
+    /*
+     * 已经找到黑线。
+     */
+    if (g_line_active_mask != 0U)
+    {
+        if (g_run_state ==
+            MISSION_BC_SEEK_LINE)
+        {
+            StartLineTracking(
+                MISSION_BC_TRACK
+            );
+        }
+        else
+        {
+            StartLineTracking(
+                MISSION_AD_TRACK
+            );
+        }
+
+        LineTrackingUpdate();
+
+        return;
+    }
+
+    /*
+     * 超过4秒仍找不到黑线。
+     */
+    if (g_line_seek_elapsed_ms >=
+        LINE_SEEK_TIMEOUT_MS)
+    {
+        CarStop();
+
+        g_run_state =
+            MISSION_ERROR;
+
+        return;
+    }
+
+    /*
+     * 路线直线结束后先停100ms，
+     * 然后低速向前寻找圆弧黑线。
+     */
+    if (g_line_seek_elapsed_ms >=
+        LINE_SEEK_DELAY_MS)
+    {
+        SetForwardPWM(
+            LINE_SEEK_PWM,
+            LINE_SEEK_PWM
+        );
+    }
+    else
+    {
+        CarStop();
+    }
+}
+
+/* =========================================================
+ * SysTick
+ *
+ * 1. 软件PWM
+ * 2. 编码器轮询
+ * 3. 八路传感器读取
+ * 4. 八路全白立即停车
+ * 5. 1ms时间基准
+ * ========================================================= */
+
+void SysTick_Handler(void)
+{
+    g_systick_count++;
+
+    /*
+     * 每100us读取编码器。
+     */
+    EncoderPoll100us();
+
+    /*
+     * 每100us读取八路传感器。
+     */
+    UpdateLineSensors();
+
+    /*
+     * 循迹时八路全白立即停车。
+     */
+    CheckImmediateLineLossInISR();
+
+    /*
+     * 软件PWM。
+     */
+    s_pwm_phase++;
+
+    if (s_pwm_phase >=
+        PWM_PERIOD_COUNT)
+    {
+        s_pwm_phase = 0U;
+    }
+
+    if (g_motor_enabled == 0U)
+    {
+        DL_GPIO_clearPins(
+            GPIOA,
+            LEFT_ENA_PIN
+        );
+
+        DL_GPIO_clearPins(
+            GPIOB,
+            RIGHT_ENB_PIN
+        );
+    }
+    else
+    {
+        if (s_pwm_phase <
+            g_left_pwm)
+        {
+            DL_GPIO_setPins(
+                GPIOA,
+                LEFT_ENA_PIN
+            );
+        }
+        else
+        {
+            DL_GPIO_clearPins(
+                GPIOA,
+                LEFT_ENA_PIN
+            );
+        }
+
+        if (s_pwm_phase <
+            g_right_pwm)
+        {
+            DL_GPIO_setPins(
+                GPIOB,
+                RIGHT_ENB_PIN
+            );
+        }
+        else
+        {
+            DL_GPIO_clearPins(
+                GPIOB,
+                RIGHT_ENB_PIN
+            );
+        }
+    }
+
+    /*
+     * 100us -> 1ms。
+     */
+    s_100us_count++;
+
+    if (s_100us_count >= 10U)
+    {
+        s_100us_count = 0U;
+
+        g_system_ms++;
+
+        s_heading_ms_count++;
+        s_speed_ms_count++;
+        s_line_ms_count++;
+
+        /*
+         * 每20ms运行转向或航向控制。
+         */
+        if (s_heading_ms_count >=
+            HEADING_CONTROL_MS)
+        {
+            s_heading_ms_count = 0U;
+            s_heading_due = 1U;
+        }
+
+        /*
+         * 每100ms运行编码器速度PI。
+         */
+        if (s_speed_ms_count >=
+            SPEED_CONTROL_MS)
+        {
+            s_speed_ms_count = 0U;
+            s_speed_due = 1U;
+        }
+
+        /*
+         * 每5ms更新一次循迹差速。
+         */
+        if (s_line_ms_count >=
+            LINE_CONTROL_MS)
+        {
+            s_line_ms_count = 0U;
+            s_line_due = 1U;
+        }
+    }
+}
+
+/* =========================================================
+ * 任务复位
+ * ========================================================= */
+
+static void ResetMission(void)
+{
+    CarStop();
+    ResetSpeedController();
+
+    __disable_irq();
+
+    g_left_encoder_count = 0;
+    g_right_encoder_count = 0;
+
+    g_left_encoder_edges = 0U;
+    g_right_encoder_edges = 0U;
+
+    __enable_irq();
+
+    g_line_armed = 0U;
+    g_line_lost_flag = 0U;
+    g_line_stop_count = 0U;
+
+    g_current_lap = 1U;
+    g_completed_laps = 0U;
+
+    g_initial_yaw_deg_x100 = 0;
+    g_initial_yaw_saved = 0U;
+
+    g_route_relative_turn_x100 =
+        DB_TURN_ANGLE_X100;
+
+    g_route_target_distance_mm =
+        DB_DISTANCE_MM;
+
+    g_route_stop_margin_mm =
+        DB_STOP_MARGIN_MM;
+
+    g_route_distance_mm = 0;
+    g_route_straight_elapsed_ms = 0U;
+
+    g_route_remaining_mm =
+        DB_DISTANCE_MM;
+
+    g_route_turn_stable_count = 0U;
+    g_route_turn_pwm = 0U;
+
+    g_state_start_ms =
+        g_system_ms;
+
+    DL_GPIO_clearPins(
+        GPIOA,
+        STATUS_LED_PIN
+    );
+
+    g_run_state =
+        MISSION_WAIT_JY60;
+}
+
+/* =========================================================
+ * 主函数
+ * ========================================================= */
+
+int main(void)
+{
+    uint32_t systickResult;
+
+    /*
+     * 初始化当前SysConfig。
+     */
+    SYSCFG_DL_init();
+
+    /*
+     * 只强化当前配置中的输出方向，
+     * 不修改任何引脚复用。
+     */
+    DL_GPIO_clearPins(
+        GPIOA,
+        LEFT_ENA_PIN |
+        STATUS_LED_PIN
+    );
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        LEFT_IN1_PIN |
+        LEFT_IN2_PIN |
+        RIGHT_IN3_PIN |
+        RIGHT_IN4_PIN |
+        RIGHT_ENB_PIN
+    );
+
+    DL_GPIO_enableOutput(
+        GPIOA,
+        LEFT_ENA_PIN |
+        STATUS_LED_PIN
+    );
+
+    DL_GPIO_enableOutput(
+        GPIOB,
+        LEFT_IN1_PIN |
+        LEFT_IN2_PIN |
+        RIGHT_IN3_PIN |
+        RIGHT_IN4_PIN |
+        RIGHT_ENB_PIN
+    );
+
+    CarStop();
+
+    /*
+     * 记录编码器A相初始电平。
+     */
+    s_previous_left_a =
+        ReadGPIOLevel(
+            GPIOA,
+            LEFT_ENCODER_A_PIN
+        );
+
+    s_previous_right_a =
+        ReadGPIOLevel(
+            GPIOA,
+            RIGHT_ENCODER_A_PIN
+        );
+
+    /*
+     * 10kHz SysTick。
+     */
+    systickResult =
+        SysTick_Config(
+            CPU_CLOCK_HZ /
+            SYSTICK_FREQUENCY_HZ
+        );
+
+    if (systickResult != 0U)
+    {
+        g_run_state =
+            MISSION_ERROR;
+
+        CarStop();
+
+        DL_GPIO_setPins(
+            GPIOA,
+            STATUS_LED_PIN
+        );
+
+        while (1)
+        {
+            __WFI();
+        }
+    }
+
+    __enable_irq();
+
+    ResetMission();
+
+    while (1)
+    {
+        g_main_heartbeat++;
+
+        /*
+         * 持续读取JY60。
+         */
+        JY60Poll();
+
+        /*
+         * Watch中将g_restart_mission改为1，
+         * 可以重新开始整个任务。
+         */
+        if (g_restart_mission != 0U)
+        {
+            g_restart_mission = 0U;
+
+            ResetMission();
+        }
+
+        /*
+         * Watch中将g_test_enable改为0，
+         * 可以随时停车。
+         */
+        if (g_test_enable == 0U)
+        {
+            CarStop();
+
+            __WFI();
+
+            continue;
+        }
+
+        /*
+         * 20ms任务。
+         */
+        if (s_heading_due != 0U)
+        {
+            __disable_irq();
+
+            s_heading_due = 0U;
+
+            __enable_irq();
+
+            if (
+                (g_run_state ==
+                 MISSION_DB_TURN) ||
+
+                (g_run_state ==
+                 MISSION_CA_TURN) ||
+
+                (g_run_state ==
+                 MISSION_RETURN_HEADING_TURN)
+            )
+            {
+                RouteTurnUpdate();
+            }
+            else if (
+                (g_run_state ==
+                 MISSION_DB_STRAIGHT) ||
+
+                (g_run_state ==
+                 MISSION_CA_STRAIGHT)
+            )
+            {
+                HeadingControlUpdate();
+
+                ApplyRoutePWM();
+            }
+        }
+
+        /*
+         * 100ms任务。
+         */
+        if (s_speed_due != 0U)
+        {
+            __disable_irq();
+
+            s_speed_due = 0U;
+
+            __enable_irq();
+
+            if (
+                (g_run_state ==
+                 MISSION_DB_STRAIGHT) ||
+
+                (g_run_state ==
+                 MISSION_CA_STRAIGHT)
+            )
+            {
+                UpdateRouteDistance();
+
+                if (RouteReachedTarget())
+                {
+                    if (
+                        g_run_state ==
+                        MISSION_DB_STRAIGHT
+                    )
+                    {
+                        EnterLineSeek(
+                            MISSION_BC_SEEK_LINE
+                        );
+                    }
+                    else
+                    {
+                        EnterLineSeek(
+                            MISSION_AD_SEEK_LINE
+                        );
+                    }
+                }
+                else
+                {
+                    /*
+                     * 偏转结束进入直线后：
+                     *   前2.5秒保持当前90 RPM；
+                     *   2.5秒之后切换为45 RPM。
+                     * D->B和C->A两段直线都使用此逻辑。
+                     */
+                    g_route_straight_elapsed_ms =
+                        g_system_ms -
+                        g_state_start_ms;
+
+                    if (
+                        g_route_straight_elapsed_ms <
+                        ROUTE_FULL_SPEED_TIME_MS
+                    )
+                    {
+                        g_target_rpm_x100 =
+                            ROUTE_STRAIGHT_RPM_X100;
+                    }
+                    else
+                    {
+                        g_target_rpm_x100 =
+                            ROUTE_HALF_RPM_X100;
+                    }
+
+                    RouteSpeedControlUpdate();
+                }
+            }
+        }
+
+        /*
+         * 5ms循迹任务。
+         */
+        if (s_line_due != 0U)
+        {
+            __disable_irq();
+
+            s_line_due = 0U;
+
+            __enable_irq();
+
+            if (
+                (g_run_state ==
+                 MISSION_BC_SEEK_LINE) ||
+
+                (g_run_state ==
+                 MISSION_AD_SEEK_LINE)
+            )
+            {
+                LineSeekUpdate();
+            }
+            else if (
+                (g_run_state ==
+                 MISSION_BC_TRACK) ||
+
+                (g_run_state ==
+                 MISSION_AD_TRACK)
+            )
+            {
+                LineTrackingUpdate();
+            }
+        }
+
+        switch (
+            (MissionState)
+            g_run_state
+        )
+        {
+            /*
+             * 上电后等待JY60稳定。
+             */
+            case MISSION_WAIT_JY60:
+
+                CarStop();
+
+                if (
+                    (g_system_ms >=
+                     START_DELAY_MS) &&
+
+                    (g_jy60_online != 0U) &&
+
+                    (
+                        g_jy60_valid_angle_frames >=
+                        START_MIN_ANGLE_FRAMES
+                    )
+                )
+                {
+                    /*
+                     * 只在整个四圈任务开始时保存一次初始方向。
+                     */
+                    if (g_initial_yaw_saved == 0U)
+                    {
+                        g_initial_yaw_deg_x100 =
+                            g_jy60_yaw_deg_x100;
+
+                        g_initial_yaw_saved = 1U;
+                    }
+
+                    /*
+                     * 第一圈 D->B 目标角度也使用固定初始方向，
+                     * 避免后续圈数采用相对角度造成累计漂移。
+                     */
+                    StartRouteTurnToAbsoluteYaw(
+                        NormalizeAngleX100(
+                            g_initial_yaw_deg_x100 +
+                            DB_TURN_ANGLE_X100
+                        ),
+                        DB_DISTANCE_MM,
+                        DB_STOP_MARGIN_MM,
+                        MISSION_DB_TURN
+                    );
+                }
+
+                break;
+
+            /*
+             * D->B转向完成后等待稳定。
+             */
+            case MISSION_DB_SETTLE:
+
+                if (
+                    (uint32_t)(
+                        g_system_ms -
+                        g_state_start_ms
+                    ) >=
+                    TURN_SETTLE_MS
+                )
+                {
+                    StartRouteStraight(
+                        MISSION_DB_STRAIGHT
+                    );
+                }
+
+                break;
+
+            /*
+             * B->C循迹结束后，
+             * 停300ms，再开始C->A。
+             */
+            case MISSION_C_PAUSE:
+
+                CarStop();
+
+                if (
+                    (uint32_t)(
+                        g_system_ms -
+                        g_state_start_ms
+                    ) >=
+                    BETWEEN_STAGE_PAUSE_MS
+                )
+                {
+                    /*
+                     * 不再因为JY60短暂离线而永久卡在这里。
+                     * RouteTurnUpdate内部会等待数据；最多4秒后仍会继续。
+                     */
+                    StartRouteTurn(
+                        CA_TURN_ANGLE_X100,
+                        CA_DISTANCE_MM,
+                        CA_STOP_MARGIN_MM,
+                        MISSION_CA_TURN
+                    );
+                }
+
+                break;
+
+            /*
+             * C->A转向完成后等待稳定。
+             */
+            case MISSION_CA_SETTLE:
+
+                if (
+                    (uint32_t)(
+                        g_system_ms -
+                        g_state_start_ms
+                    ) >=
+                    TURN_SETTLE_MS
+                )
+                {
+                    StartRouteStraight(
+                        MISSION_CA_STRAIGHT
+                    );
+                }
+
+                break;
+
+            /*
+             * 当前圈 A->D 已经完成。
+             * 先停车300ms，再转回上电保存的初始方向。
+             */
+            case MISSION_LAP_END_PAUSE:
+
+                CarStop();
+
+                if (
+                    (uint32_t)(
+                        g_system_ms -
+                        g_state_start_ms
+                    ) >=
+                    LAP_END_PAUSE_MS
+                )
+                {
+                    if (g_initial_yaw_saved != 0U)
+                    {
+                        /*
+                         * 回正目标为“上电初始方向+2.00°”。
+                         * 回正最多调节8秒；JY60暂时离线时停车等待，
+                         * 8秒到达后仍会继续，避免永久卡住。
+                         */
+                        StartRouteTurnToAbsoluteYaw(
+                            NormalizeAngleX100(
+                                g_initial_yaw_deg_x100 +
+                                RETURN_HEADING_OFFSET_X100
+                            ),
+                            DB_DISTANCE_MM,
+                            DB_STOP_MARGIN_MM,
+                            MISSION_RETURN_HEADING_TURN
+                        );
+                    }
+                    else
+                    {
+                        g_run_state = MISSION_ERROR;
+                    }
+                }
+
+                break;
+
+            /*
+             * 已经转回最开始方向。
+             *
+             * 第1~3圈：
+             *   停稳600ms后，以“修正初始方向+DB偏转角”
+             *   作为下一圈 D->B 的绝对目标角度。
+             *
+             * 第4圈：
+             *   停稳600ms后永久停车。
+             */
+            case MISSION_RETURN_HEADING_SETTLE:
+
+                CarStop();
+
+                if (
+                    (uint32_t)(
+                        g_system_ms -
+                        g_state_start_ms
+                    ) >=
+                    RETURN_HEADING_SETTLE_MS
+                )
+                {
+                    if (g_completed_laps >=
+                        TOTAL_LAPS)
+                    {
+                        g_run_state =
+                            MISSION_FINISHED;
+
+                        DL_GPIO_setPins(
+                            GPIOA,
+                            STATUS_LED_PIN
+                        );
+                    }
+                    else if (g_initial_yaw_saved != 0U)
+                    {
+                        /*
+                         * 回正等待完成后直接启动下一圈。
+                         * 不再因JY60瞬时掉线而无限停车。
+                         */
+                        StartRouteTurnToAbsoluteYaw(
+                            NormalizeAngleX100(
+                                g_initial_yaw_deg_x100 +
+                                RETURN_HEADING_OFFSET_X100 +
+                                DB_TURN_ANGLE_X100
+                            ),
+                            DB_DISTANCE_MM,
+                            DB_STOP_MARGIN_MM,
+                            MISSION_DB_TURN
+                        );
+                    }
+                    else
+                    {
+                        g_run_state = MISSION_ERROR;
+                    }
+                }
+
+                break;
+
+            /*
+             * 第4圈 A->D 循迹结束，永久停车。
+             */
+            case MISSION_FINISHED:
+
+                CarStop();
+
+                DL_GPIO_setPins(
+                    GPIOA,
+                    STATUS_LED_PIN
+                );
+
+                break;
+
+            /*
+             * 异常状态，永久停车。
+             */
+            case MISSION_ERROR:
+
+                CarStop();
+
+                DL_GPIO_setPins(
+                    GPIOA,
+                    STATUS_LED_PIN
+                );
+
+                break;
+
+            default:
+
+                break;
+        }
+
+        __WFI();
+    }
+}
