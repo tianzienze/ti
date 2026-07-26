@@ -1,0 +1,1103 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ * MSPM0G3507：最简八路循迹程序
+ *
+ * 只有一个流程：
+ *
+ * 上电
+ *   -> 立即读取八路传感器
+ *   -> 只要还有任意一路检测到黑线，就继续循迹
+ *   -> 一旦八路全部检测不到黑线，立即主动刹车
+ *   -> 永久停止，不再重新启动
+ *
+ * ==================================================
+ * 黑白线电平固定规定
+ * ==================================================
+ *
+ * 低电平 = 黑线
+ * 高电平 = 白色
+ *
+ * 所以：
+ *
+ * 任意一路低电平
+ *   -> g_line_count >= 1
+ *   -> 继续循迹
+ *
+ * 八路全部高电平
+ *   -> g_line_count == 0
+ *   -> 立即停车
+ *
+ * 没有：
+ * - 自动识别高低电平
+ * - 极性校准
+ * - 丢线延时
+ * - 丢线确认次数
+ * - 重新搜索黑线
+ * - 第二次丢线判断
+ *
+ * 上电前必须把至少一个传感器放在黑线上。
+ *
+ * ==================================================
+ * 当前引脚
+ * ==================================================
+ *
+ * 电机驱动A：
+ * PB8  -> IN1
+ * PB9  -> IN2
+ * PA31 -> ENA
+ *
+ * 电机驱动B：
+ * PB2  -> IN3
+ * PB3  -> IN4
+ * PB16 -> ENB
+ *
+ * 八路循迹：
+ * S1 -> PA23
+ * S2 -> PB23
+ * S3 -> PB21
+ * S4 -> PA22
+ * S5 -> PB13
+ * S6 -> PB19
+ * S7 -> PA17
+ * S8 -> PA15
+ */
+
+/*==================================================
+ * 系统参数
+ *==================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                         32000000UL
+#endif
+
+/*
+ * SysTick = 20kHz。
+ * 软件PWM频率：
+ * 20000 / 100 = 200Hz。
+ */
+#define SYSTICK_FREQUENCY_HZ                20000U
+#define PWM_PERIOD_COUNT                    100U
+
+/*==================================================
+ * 电机通道设置
+ *==================================================*/
+
+#define MOTOR_CHANNELS_SWAPPED              0
+
+#define DRIVER_A_FORWARD_REVERSE            0
+#define DRIVER_B_FORWARD_REVERSE            0
+
+/*==================================================
+ * 电机引脚
+ *==================================================*/
+
+#define DRIVER_A_IN1_PORT                   GPIOB
+#define DRIVER_A_IN1_PIN                    DL_GPIO_PIN_8
+
+#define DRIVER_A_IN2_PORT                   GPIOB
+#define DRIVER_A_IN2_PIN                    DL_GPIO_PIN_9
+
+#define DRIVER_A_EN_PORT                    GPIOA
+#define DRIVER_A_EN_PIN                     DL_GPIO_PIN_31
+
+#define DRIVER_B_IN3_PORT                   GPIOB
+#define DRIVER_B_IN3_PIN                    DL_GPIO_PIN_2
+
+#define DRIVER_B_IN4_PORT                   GPIOB
+#define DRIVER_B_IN4_PIN                    DL_GPIO_PIN_3
+
+#define DRIVER_B_EN_PORT                    GPIOB
+#define DRIVER_B_EN_PIN                     DL_GPIO_PIN_16
+
+/*==================================================
+ * 八路传感器引脚
+ *==================================================*/
+
+#define LINE_S1_PORT                        GPIOA
+#define LINE_S1_PIN                         DL_GPIO_PIN_23
+
+#define LINE_S2_PORT                        GPIOB
+#define LINE_S2_PIN                         DL_GPIO_PIN_23
+
+#define LINE_S3_PORT                        GPIOB
+#define LINE_S3_PIN                         DL_GPIO_PIN_21
+
+#define LINE_S4_PORT                        GPIOA
+#define LINE_S4_PIN                         DL_GPIO_PIN_22
+
+#define LINE_S5_PORT                        GPIOB
+#define LINE_S5_PIN                         DL_GPIO_PIN_13
+
+#define LINE_S6_PORT                        GPIOB
+#define LINE_S6_PIN                         DL_GPIO_PIN_19
+
+#define LINE_S7_PORT                        GPIOA
+#define LINE_S7_PIN                         DL_GPIO_PIN_17
+
+#define LINE_S8_PORT                        GPIOA
+#define LINE_S8_PIN                         DL_GPIO_PIN_15
+
+/*==================================================
+ * 循迹方向
+ *==================================================*/
+
+/*
+ * 传感器物理安装顺序反向。
+ */
+#define LINE_SENSOR_REVERSE                 1
+
+/*
+ * 当前沿用你最近能够正常循迹的方向设置。
+ *
+ * 若小车修正方向仍然相反，
+ * 只把1改成0。
+ */
+#define LINE_STEERING_REVERSE               1
+
+/*==================================================
+ * 循迹速度
+ *==================================================*/
+
+/*
+ * 正常循迹基础PWM。
+ */
+#define TRACK_BASE_PWM                      18
+
+/*
+ * 左右轮允许的PWM范围。
+ */
+#define TRACK_MIN_PWM                       0
+#define TRACK_MAX_PWM                       28
+
+/*
+ * 每次输出最多变化5%。
+ */
+#define TRACK_PWM_STEP                      5
+
+/*==================================================
+ * 简单比例控制
+ *==================================================*/
+
+/*
+ * 误差最大约700。
+ *
+ * correction = error * 3 / 100
+ *
+ * 最大误差时修正约21% PWM。
+ */
+#define TRACK_KP_NUM                        3L
+#define TRACK_KP_DEN                        100L
+
+#define TRACK_MAX_CORRECTION                22
+
+#define TRACK_CENTER_DEADBAND               30
+
+/*==================================================
+ * 运行状态
+ *==================================================*/
+
+#define STATE_TRACKING                      1U
+#define STATE_STOPPED_NO_LINE               2U
+#define STATE_ERROR_SYSTICK                 900U
+
+volatile uint32_t g_run_state =
+    0U;
+
+/*==================================================
+ * 传感器调试变量
+ *==================================================*/
+
+/*
+ * 位为1 = 对应传感器为低电平黑线。
+ *
+ * bit0 -> S1
+ * bit1 -> S2
+ * ...
+ * bit7 -> S8
+ */
+volatile uint8_t g_line_pattern =
+    0U;
+
+/*
+ * 当前检测到黑线的传感器数量。
+ */
+volatile uint32_t g_line_count =
+    0U;
+
+/*
+ * 当前循迹位置误差。
+ */
+volatile int32_t g_line_error =
+    0;
+
+/*
+ * 最终左右轮差速修正。
+ */
+volatile int32_t g_line_correction =
+    0;
+
+/*
+ * 一旦八路全部高电平后置1。
+ */
+volatile uint32_t g_no_black_line_detected =
+    0U;
+
+/*
+ * 一旦置1，永远不能再启动电机。
+ */
+volatile uint32_t g_stop_latched =
+    0U;
+
+/*==================================================
+ * PWM调试变量
+ *==================================================*/
+
+volatile int32_t g_left_target_pwm =
+    0;
+
+volatile int32_t g_right_target_pwm =
+    0;
+
+volatile int32_t g_left_pwm =
+    0;
+
+volatile int32_t g_right_pwm =
+    0;
+
+volatile int32_t g_driver_a_pwm =
+    0;
+
+volatile int32_t g_driver_b_pwm =
+    0;
+
+volatile uint32_t g_motor_enabled =
+    0U;
+
+volatile uint32_t g_brake_enabled =
+    0U;
+
+volatile uint32_t g_systick_heartbeat =
+    0U;
+
+/*==================================================
+ * 内部变量
+ *==================================================*/
+
+static volatile uint32_t s_pwm_phase =
+    0U;
+
+static uint32_t s_left_forward =
+    1U;
+
+static uint32_t s_right_forward =
+    1U;
+
+static uint32_t s_direction_valid =
+    0U;
+
+/*==================================================
+ * 循迹权重
+ *==================================================*/
+
+static const int16_t s_line_weights[8] = {
+    -700,
+    -500,
+    -300,
+    -100,
+     100,
+     300,
+     500,
+     700
+};
+
+/*==================================================
+ * 工具函数
+ *==================================================*/
+
+static int32_t ClampInt32(
+    int32_t value,
+    int32_t minimum,
+    int32_t maximum)
+{
+    if (value < minimum) {
+        return minimum;
+    }
+
+    if (value > maximum) {
+        return maximum;
+    }
+
+    return value;
+}
+
+static int32_t AbsInt32(
+    int32_t value)
+{
+    if (value < 0) {
+        return -value;
+    }
+
+    return value;
+}
+
+static int32_t MoveToward(
+    int32_t current,
+    int32_t target,
+    int32_t step)
+{
+    if (current < target) {
+        current += step;
+
+        if (current > target) {
+            current = target;
+        }
+    } else if (current > target) {
+        current -= step;
+
+        if (current < target) {
+            current = target;
+        }
+    }
+
+    return current;
+}
+
+/*==================================================
+ * 电机使能
+ *==================================================*/
+
+static void DriverA_Enable(void)
+{
+    DL_GPIO_setPins(
+        DRIVER_A_EN_PORT,
+        DRIVER_A_EN_PIN
+    );
+}
+
+static void DriverA_Disable(void)
+{
+    DL_GPIO_clearPins(
+        DRIVER_A_EN_PORT,
+        DRIVER_A_EN_PIN
+    );
+}
+
+static void DriverB_Enable(void)
+{
+    DL_GPIO_setPins(
+        DRIVER_B_EN_PORT,
+        DRIVER_B_EN_PIN
+    );
+}
+
+static void DriverB_Disable(void)
+{
+    DL_GPIO_clearPins(
+        DRIVER_B_EN_PORT,
+        DRIVER_B_EN_PIN
+    );
+}
+
+/*==================================================
+ * 电机GPIO初始化
+ *==================================================*/
+
+static void Motor_GPIO_Init(void)
+{
+    DL_GPIO_clearPins(
+        GPIOA,
+        DRIVER_A_EN_PIN
+    );
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        DRIVER_A_IN1_PIN |
+        DRIVER_A_IN2_PIN |
+        DRIVER_B_IN3_PIN |
+        DRIVER_B_IN4_PIN |
+        DRIVER_B_EN_PIN
+    );
+
+    DL_GPIO_enableOutput(
+        GPIOA,
+        DRIVER_A_EN_PIN
+    );
+
+    DL_GPIO_enableOutput(
+        GPIOB,
+        DRIVER_A_IN1_PIN |
+        DRIVER_A_IN2_PIN |
+        DRIVER_B_IN3_PIN |
+        DRIVER_B_IN4_PIN |
+        DRIVER_B_EN_PIN
+    );
+}
+
+/*==================================================
+ * 驱动A方向
+ *==================================================*/
+
+static void DriverA_SetDirection(
+    uint32_t forward)
+{
+#if DRIVER_A_FORWARD_REVERSE == 1
+
+    forward =
+        (forward == 0U) ?
+        1U : 0U;
+
+#endif
+
+    if (forward != 0U) {
+        DL_GPIO_clearPins(
+            DRIVER_A_IN2_PORT,
+            DRIVER_A_IN2_PIN
+        );
+
+        DL_GPIO_setPins(
+            DRIVER_A_IN1_PORT,
+            DRIVER_A_IN1_PIN
+        );
+    } else {
+        DL_GPIO_clearPins(
+            DRIVER_A_IN1_PORT,
+            DRIVER_A_IN1_PIN
+        );
+
+        DL_GPIO_setPins(
+            DRIVER_A_IN2_PORT,
+            DRIVER_A_IN2_PIN
+        );
+    }
+}
+
+/*==================================================
+ * 驱动B方向
+ *==================================================*/
+
+static void DriverB_SetDirection(
+    uint32_t forward)
+{
+#if DRIVER_B_FORWARD_REVERSE == 1
+
+    forward =
+        (forward == 0U) ?
+        1U : 0U;
+
+#endif
+
+    if (forward != 0U) {
+        DL_GPIO_clearPins(
+            DRIVER_B_IN4_PORT,
+            DRIVER_B_IN4_PIN
+        );
+
+        DL_GPIO_setPins(
+            DRIVER_B_IN3_PORT,
+            DRIVER_B_IN3_PIN
+        );
+    } else {
+        DL_GPIO_clearPins(
+            DRIVER_B_IN3_PORT,
+            DRIVER_B_IN3_PIN
+        );
+
+        DL_GPIO_setPins(
+            DRIVER_B_IN4_PORT,
+            DRIVER_B_IN4_PIN
+        );
+    }
+}
+
+/*==================================================
+ * 设置左右轮方向
+ *==================================================*/
+
+static void Motor_SetPhysicalDirection(
+    uint32_t leftForward,
+    uint32_t rightForward)
+{
+    if ((s_direction_valid != 0U) &&
+        (leftForward == s_left_forward) &&
+        (rightForward == s_right_forward)) {
+
+        return;
+    }
+
+    DriverA_Disable();
+    DriverB_Disable();
+
+    g_left_pwm =
+        0;
+
+    g_right_pwm =
+        0;
+
+#if MOTOR_CHANNELS_SWAPPED == 1
+
+    DriverA_SetDirection(
+        rightForward
+    );
+
+    DriverB_SetDirection(
+        leftForward
+    );
+
+#else
+
+    DriverA_SetDirection(
+        leftForward
+    );
+
+    DriverB_SetDirection(
+        rightForward
+    );
+
+#endif
+
+    s_left_forward =
+        leftForward;
+
+    s_right_forward =
+        rightForward;
+
+    s_direction_valid =
+        1U;
+}
+
+/*==================================================
+ * PWM通道映射
+ *==================================================*/
+
+static void Motor_MapPWM(void)
+{
+#if MOTOR_CHANNELS_SWAPPED == 1
+
+    g_driver_a_pwm =
+        g_right_pwm;
+
+    g_driver_b_pwm =
+        g_left_pwm;
+
+#else
+
+    g_driver_a_pwm =
+        g_left_pwm;
+
+    g_driver_b_pwm =
+        g_right_pwm;
+
+#endif
+
+    g_driver_a_pwm =
+        ClampInt32(
+            g_driver_a_pwm,
+            0,
+            100
+        );
+
+    g_driver_b_pwm =
+        ClampInt32(
+            g_driver_b_pwm,
+            0,
+            100
+        );
+}
+
+/*==================================================
+ * 普通停车
+ *==================================================*/
+
+static void Motor_Stop(void)
+{
+    g_motor_enabled =
+        0U;
+
+    g_brake_enabled =
+        0U;
+
+    g_left_target_pwm =
+        0;
+
+    g_right_target_pwm =
+        0;
+
+    g_left_pwm =
+        0;
+
+    g_right_pwm =
+        0;
+
+    g_driver_a_pwm =
+        0;
+
+    g_driver_b_pwm =
+        0;
+
+    DriverA_Disable();
+    DriverB_Disable();
+}
+
+/*==================================================
+ * 主动刹车
+ *
+ * 两个方向输入同时为高，
+ * 两个使能端保持高。
+ *==================================================*/
+
+static void Motor_Brake(void)
+{
+    g_motor_enabled =
+        0U;
+
+    g_brake_enabled =
+        1U;
+
+    g_left_target_pwm =
+        0;
+
+    g_right_target_pwm =
+        0;
+
+    g_left_pwm =
+        0;
+
+    g_right_pwm =
+        0;
+
+    g_driver_a_pwm =
+        0;
+
+    g_driver_b_pwm =
+        0;
+
+    DL_GPIO_setPins(
+        GPIOB,
+        DRIVER_A_IN1_PIN |
+        DRIVER_A_IN2_PIN |
+        DRIVER_B_IN3_PIN |
+        DRIVER_B_IN4_PIN
+    );
+
+    DriverA_Enable();
+    DriverB_Enable();
+}
+
+/*==================================================
+ * 设置左右轮PWM
+ *==================================================*/
+
+static void Motor_SetSignedPWM(
+    int32_t leftSignedPWM,
+    int32_t rightSignedPWM)
+{
+    uint32_t leftForward;
+    uint32_t rightForward;
+
+    /*
+     * 已经丢线后绝不允许重新启动。
+     */
+    if (g_stop_latched != 0U) {
+        Motor_Brake();
+        return;
+    }
+
+    g_brake_enabled =
+        0U;
+
+    leftForward =
+        (leftSignedPWM >= 0) ?
+        1U : 0U;
+
+    rightForward =
+        (rightSignedPWM >= 0) ?
+        1U : 0U;
+
+    Motor_SetPhysicalDirection(
+        leftForward,
+        rightForward
+    );
+
+    g_left_target_pwm =
+        ClampInt32(
+            AbsInt32(leftSignedPWM),
+            0,
+            100
+        );
+
+    g_right_target_pwm =
+        ClampInt32(
+            AbsInt32(rightSignedPWM),
+            0,
+            100
+        );
+
+    g_left_pwm =
+        MoveToward(
+            g_left_pwm,
+            g_left_target_pwm,
+            TRACK_PWM_STEP
+        );
+
+    g_right_pwm =
+        MoveToward(
+            g_right_pwm,
+            g_right_target_pwm,
+            TRACK_PWM_STEP
+        );
+
+    g_motor_enabled =
+        1U;
+
+    Motor_MapPWM();
+}
+
+/*==================================================
+ * 读取单路传感器
+ *
+ * 低电平 = 黑线。
+ *==================================================*/
+
+static uint32_t Line_ReadBlack(
+    GPIO_Regs *port,
+    uint32_t pin)
+{
+    uint32_t high;
+
+    high =
+        (
+            DL_GPIO_readPins(
+                port,
+                pin
+            ) &
+            pin
+        ) ?
+        1U : 0U;
+
+    return
+        (high == 0U) ?
+        1U : 0U;
+}
+
+/*==================================================
+ * 读取八路传感器
+ *==================================================*/
+
+static void LineSensor_Read(void)
+{
+    uint32_t sensor[8];
+    uint32_t i;
+    uint32_t logicalIndex;
+    uint32_t count;
+    int32_t weightedSum;
+    uint8_t pattern;
+
+    sensor[0] =
+        Line_ReadBlack(
+            LINE_S1_PORT,
+            LINE_S1_PIN
+        );
+
+    sensor[1] =
+        Line_ReadBlack(
+            LINE_S2_PORT,
+            LINE_S2_PIN
+        );
+
+    sensor[2] =
+        Line_ReadBlack(
+            LINE_S3_PORT,
+            LINE_S3_PIN
+        );
+
+    sensor[3] =
+        Line_ReadBlack(
+            LINE_S4_PORT,
+            LINE_S4_PIN
+        );
+
+    sensor[4] =
+        Line_ReadBlack(
+            LINE_S5_PORT,
+            LINE_S5_PIN
+        );
+
+    sensor[5] =
+        Line_ReadBlack(
+            LINE_S6_PORT,
+            LINE_S6_PIN
+        );
+
+    sensor[6] =
+        Line_ReadBlack(
+            LINE_S7_PORT,
+            LINE_S7_PIN
+        );
+
+    sensor[7] =
+        Line_ReadBlack(
+            LINE_S8_PORT,
+            LINE_S8_PIN
+        );
+
+    count =
+        0U;
+
+    weightedSum =
+        0;
+
+    pattern =
+        0U;
+
+    for (i = 0U; i < 8U; i++) {
+        if (sensor[i] != 0U) {
+            pattern |=
+                (uint8_t)(
+                    1U << i
+                );
+
+#if LINE_SENSOR_REVERSE == 0
+
+            logicalIndex =
+                i;
+
+#else
+
+            logicalIndex =
+                7U - i;
+
+#endif
+
+            weightedSum +=
+                s_line_weights[
+                    logicalIndex
+                ];
+
+            count++;
+        }
+    }
+
+    g_line_pattern =
+        pattern;
+
+    g_line_count =
+        count;
+
+    if (count > 0U) {
+        g_line_error =
+            weightedSum /
+            (int32_t)count;
+    }
+}
+
+/*==================================================
+ * 最简单循迹控制
+ *==================================================*/
+
+static void LineTracking_Update(void)
+{
+    int32_t correction;
+    int32_t leftPWM;
+    int32_t rightPWM;
+
+    /*
+     * 第一件事就是读取传感器。
+     */
+    LineSensor_Read();
+
+    /*
+     * 没有检测到任何低电平黑线：
+     * 立即锁存并主动刹车。
+     */
+    if (g_line_count == 0U) {
+        g_no_black_line_detected =
+            1U;
+
+        g_stop_latched =
+            1U;
+
+        g_run_state =
+            STATE_STOPPED_NO_LINE;
+
+        Motor_Brake();
+
+        return;
+    }
+
+    /*
+     * 至少一路低电平，继续循迹。
+     */
+    correction =
+        (
+            g_line_error *
+            TRACK_KP_NUM
+        ) /
+        TRACK_KP_DEN;
+
+    if (AbsInt32(
+            g_line_error) <=
+        TRACK_CENTER_DEADBAND) {
+
+        correction =
+            0;
+    }
+
+#if LINE_STEERING_REVERSE == 1
+
+    correction =
+        -correction;
+
+#endif
+
+    correction =
+        ClampInt32(
+            correction,
+            -TRACK_MAX_CORRECTION,
+            TRACK_MAX_CORRECTION
+        );
+
+    g_line_correction =
+        correction;
+
+    leftPWM =
+        ClampInt32(
+            TRACK_BASE_PWM +
+            correction,
+            TRACK_MIN_PWM,
+            TRACK_MAX_PWM
+        );
+
+    rightPWM =
+        ClampInt32(
+            TRACK_BASE_PWM -
+            correction,
+            TRACK_MIN_PWM,
+            TRACK_MAX_PWM
+        );
+
+    Motor_SetSignedPWM(
+        leftPWM,
+        rightPWM
+    );
+}
+
+/*==================================================
+ * SysTick中断
+ *==================================================*/
+
+void SysTick_Handler(void)
+{
+    g_systick_heartbeat++;
+
+    /*
+     * 主动刹车优先级最高。
+     */
+    if (g_brake_enabled != 0U) {
+        DriverA_Enable();
+        DriverB_Enable();
+        return;
+    }
+
+    s_pwm_phase++;
+
+    if (s_pwm_phase >=
+        PWM_PERIOD_COUNT) {
+
+        s_pwm_phase =
+            0U;
+    }
+
+    if (g_motor_enabled == 0U) {
+        DriverA_Disable();
+        DriverB_Disable();
+    } else {
+        if (s_pwm_phase <
+            (uint32_t)
+            g_driver_a_pwm) {
+
+            DriverA_Enable();
+        } else {
+            DriverA_Disable();
+        }
+
+        if (s_pwm_phase <
+            (uint32_t)
+            g_driver_b_pwm) {
+
+            DriverB_Enable();
+        } else {
+            DriverB_Disable();
+        }
+    }
+}
+
+/*==================================================
+ * 主函数
+ *==================================================*/
+
+int main(void)
+{
+    uint32_t systickResult;
+
+    SYSCFG_DL_init();
+
+    Motor_GPIO_Init();
+
+    Motor_Stop();
+
+    g_run_state =
+        STATE_TRACKING;
+
+    g_line_pattern =
+        0U;
+
+    g_line_count =
+        0U;
+
+    g_line_error =
+        0;
+
+    g_line_correction =
+        0;
+
+    g_no_black_line_detected =
+        0U;
+
+    g_stop_latched =
+        0U;
+
+    systickResult =
+        SysTick_Config(
+            CPUCLK_FREQ /
+            SYSTICK_FREQUENCY_HZ
+        );
+
+    if (systickResult != 0U) {
+        g_run_state =
+            STATE_ERROR_SYSTICK;
+
+        Motor_Stop();
+
+        while (1) {
+            __WFI();
+        }
+    }
+
+    /*
+     * 不使用延时，不使用状态切换。
+     *
+     * 主循环尽可能快地持续读取八路传感器。
+     */
+    while (1) {
+        if (g_stop_latched == 0U) {
+            LineTracking_Update();
+        } else {
+            /*
+             * 丢线后永久保持主动刹车。
+             */
+            Motor_Brake();
+        }
+    }
+}
