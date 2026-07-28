@@ -1,0 +1,980 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ * MSPM0G3507 + JY60：180度原地掉头独立测试程序
+ *
+ * 功能：
+ *   1. 上电等待JY60航向数据稳定；
+ *   2. 左轮正转、右轮反转，原地右转；
+ *   3. 接近180度时逐级降速；
+ *   4. 如果转过头，两个轮子同时反向，低速修正；
+ *   5. 达到180度附近后永久停车；
+ *   6. 无论角度是否完成，掉头满10秒后永久停车。
+ *
+ * 当前引脚：
+ *   左电机：PB8 -> IN1，PB9 -> IN2，PA31 -> ENA
+ *   右电机：PB2 -> IN3，PB3 -> IN4，PB16 -> ENB
+ *
+ *   JY60 TX -> PA18（MCU RX）
+ *   JY60 RX -> PA8 （MCU TX，可不接）
+ *   UART：9600，8N1
+ *
+ * 原地右转方向：
+ *   左轮正转：PB8=1，PB9=0
+ *   右轮反转：PB2=0，PB3=1
+ *
+ * 注意：
+ *   本代码只用于测试原地掉头，不包含直行和编码器控制。
+ */
+
+/*==================================================
+ * 系统参数
+ *==================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                         32000000UL
+#endif
+
+#define SYSTICK_FREQUENCY_HZ                20000U
+#define SYSTICK_TICKS_PER_MS                20U
+#define PWM_PERIOD_COUNT                    100U   /* 200Hz软件PWM */
+#define TURN_CONTROL_INTERVAL_TICKS         200U   /* 10ms控制周期 */
+
+/*==================================================
+ * UART实例
+ *==================================================*/
+
+#ifndef UART_0_INST
+#error "UART_0_INST未定义，请检查PA18/PA8对应的SysConfig UART实例名称"
+#endif
+
+#define JY60_UART_INST                      UART_0_INST
+
+/*==================================================
+ * 电机方向与通道映射
+ *==================================================*/
+
+/*
+ * 0：驱动A(PB8/PB9/PA31)是物理左轮；驱动B是物理右轮。
+ * 1：驱动A是物理右轮；驱动B是物理左轮。
+ *
+ * 按你目前一直使用的接线，先保持0。
+ */
+#define MOTOR_CHANNELS_SWAPPED              0
+
+/* 单个驱动方向相反时，把对应值从0改成1。 */
+#define DRIVER_A_FORWARD_REVERSE            0
+#define DRIVER_B_FORWARD_REVERSE            0
+
+#define TURN_RIGHT                          1
+#define TURN_LEFT                          (-1)
+
+/* 180度左右转最终朝向相同；当前测试原地右转。 */
+#define TURN_PHYSICAL_DIRECTION             TURN_RIGHT
+
+/*==================================================
+ * JY60参数
+ *==================================================*/
+
+#define JY60_OFFLINE_TIMEOUT_MS             300U
+#define JY60_REQUIRED_ANGLE_FRAMES          8U
+#define JY60_STABLE_TIME_MS                 300U
+
+/*==================================================
+ * 180度掉头参数
+ *==================================================*/
+
+#define TURN_TARGET_X100                    18000L
+#define TURN_SIGN_DETECT_X100               150L
+
+/* 最大掉头时间：10秒。到时无条件结束调整。 */
+#define TURN_MAX_DURATION_MS                10000U
+
+/* 换向修正前先断电停车，避免带电瞬间反接。 */
+#define TURN_DIRECTION_CHANGE_SETTLE_MS     150U
+
+/*
+ * 起转短暂提高到32%，保证正反两个轮子都能启动。
+ * 如果仍有一侧完全不动，可临时提高到38测试反转通道。
+ */
+#define TURN_START_KICK_MS                  220U
+#define TURN_START_LEFT_PWM                 26
+#define TURN_START_RIGHT_PWM                26
+
+/* 正常掉头速度，已经设置得比较慢。 */
+#define TURN_FAR_LEFT_PWM                   20
+#define TURN_FAR_RIGHT_PWM                  21
+
+#define TURN_MEDIUM_LEFT_PWM                17
+#define TURN_MEDIUM_RIGHT_PWM               18
+
+#define TURN_NEAR_LEFT_PWM                  17
+#define TURN_NEAR_RIGHT_PWM                 17
+
+#define TURN_FINAL_LEFT_PWM                 17
+#define TURN_FINAL_RIGHT_PWM                17
+
+/*
+ * 超过180度后的反向回调速度。
+ * 不能继续使用12%，否则电机可能有声音但轮子带不动。
+ * 这里只影响“转过头往回调”，不影响正常接近180度的慢速。
+ */
+#define TURN_CORRECT_LEFT_PWM               19
+#define TURN_CORRECT_RIGHT_PWM              19
+
+/* JY60短暂掉线时继续原地转，直到数据恢复或10秒到。 */
+#define TURN_FALLBACK_LEFT_PWM              23
+#define TURN_FALLBACK_RIGHT_PWM             23
+
+#define TURN_MEDIUM_ZONE_X100               6000L
+#define TURN_NEAR_ZONE_X100                 2500L
+#define TURN_FINAL_ZONE_X100                800L
+
+/*
+ * 最终目标允许误差改为±1度。
+ *
+ * 以前连续5次只相当于约50ms，车刚进入范围就永久结束，
+ * 随后机械惯性可能继续把车带出180度，但程序已经不会再修正。
+ *
+ * 现在必须连续50次，也就是约500ms都保持在±1度范围内才结束。
+ * 在这500ms内只要偏离目标范围，稳定计数立即清零，并重新调整。
+ */
+#define TURN_TOLERANCE_X100                 100L
+#define TURN_STABLE_CYCLES                  50U
+
+/*==================================================
+ * 电机引脚
+ *==================================================*/
+
+#define DRIVER_A_IN1_PORT                   GPIOB
+#define DRIVER_A_IN1_PIN                    DL_GPIO_PIN_8
+#define DRIVER_A_IN2_PORT                   GPIOB
+#define DRIVER_A_IN2_PIN                    DL_GPIO_PIN_9
+#define DRIVER_A_EN_PORT                    GPIOA
+#define DRIVER_A_EN_PIN                     DL_GPIO_PIN_31
+
+#define DRIVER_B_IN3_PORT                   GPIOB
+#define DRIVER_B_IN3_PIN                    DL_GPIO_PIN_2
+#define DRIVER_B_IN4_PORT                   GPIOB
+#define DRIVER_B_IN4_PIN                    DL_GPIO_PIN_3
+#define DRIVER_B_EN_PORT                    GPIOB
+#define DRIVER_B_EN_PIN                     DL_GPIO_PIN_16
+
+/*==================================================
+ * 状态定义
+ *==================================================*/
+
+#define STATE_WAIT_JY60                     0U
+#define STATE_JY60_SETTLE                   1U
+#define STATE_TURN_180                      2U
+#define STATE_FINISHED                      3U
+#define STATE_ERROR_SYSTICK                 900U
+
+volatile uint32_t g_run_state = STATE_WAIT_JY60;
+
+/*==================================================
+ * 系统变量
+ *==================================================*/
+
+volatile uint32_t g_system_ms = 0U;
+volatile uint32_t g_systick_heartbeat = 0U;
+volatile uint32_t g_state_start_ms = 0U;
+
+/*==================================================
+ * JY60调试变量
+ *==================================================*/
+
+volatile int32_t g_jy60_yaw_deg_x100 = 0;
+volatile int32_t g_jy60_yaw_filtered_x100 = 0;
+volatile int32_t g_jy60_yaw_unwrapped_x100 = 0;
+
+volatile uint32_t g_jy60_online = 0U;
+volatile uint32_t g_jy60_angle_frame_count = 0U;
+volatile uint32_t g_jy60_checksum_errors = 0U;
+volatile uint32_t g_jy60_rx_byte_count = 0U;
+volatile uint32_t g_jy60_last_angle_ms = 0U;
+
+/*==================================================
+ * 掉头调试变量
+ *==================================================*/
+
+volatile int32_t g_turn_start_yaw_x100 = 0;
+volatile int32_t g_turn_target_yaw_x100 = 0;
+volatile int32_t g_turn_yaw_sign = 0;
+volatile int32_t g_turn_delta_x100 = 0;
+volatile int32_t g_turn_progress_x100 = 0;
+volatile int32_t g_turn_remaining_x100 = TURN_TARGET_X100;
+
+volatile int32_t g_turn_command_direction = TURN_PHYSICAL_DIRECTION;
+volatile int32_t g_turn_left_command_pwm = 0;
+volatile int32_t g_turn_right_command_pwm = 0;
+
+volatile uint32_t g_turn_stable_count = 0U;
+volatile uint32_t g_turn_forced_finish = 0U;
+volatile uint32_t g_turn_overshoot_correcting = 0U;
+volatile uint32_t g_turn_direction_change_count = 0U;
+
+/*==================================================
+ * 电机调试变量
+ *==================================================*/
+
+/* 正值=物理前进，负值=物理后退。 */
+volatile int32_t g_left_signed_pwm = 0;
+volatile int32_t g_right_signed_pwm = 0;
+
+volatile int32_t g_driver_a_pwm = 0;
+volatile int32_t g_driver_b_pwm = 0;
+
+volatile uint32_t g_left_forward = 1U;
+volatile uint32_t g_right_forward = 1U;
+volatile uint32_t g_motor_output_enabled = 0U;
+
+/*==================================================
+ * 中断内部变量
+ *==================================================*/
+
+static volatile uint32_t s_pwm_phase = 0U;
+static volatile uint32_t s_ms_divider = 0U;
+static volatile uint32_t s_turn_control_tick = 0U;
+static volatile uint32_t s_turn_control_due = 0U;
+
+/*==================================================
+ * JY60内部变量
+ *==================================================*/
+
+static uint8_t s_jy60_frame[11];
+static uint32_t s_jy60_frame_index = 0U;
+static int32_t s_previous_raw_yaw_x100 = 0;
+static uint32_t s_previous_raw_yaw_valid = 0U;
+static uint32_t s_jy60_settle_start_ms = 0U;
+
+/* 换向停车内部状态。 */
+static int32_t s_last_turn_direction = 0;
+static int32_t s_pending_turn_direction = 0;
+static uint32_t s_direction_change_waiting = 0U;
+static uint32_t s_direction_change_start_ms = 0U;
+
+/*==================================================
+ * 工具函数
+ *==================================================*/
+
+static int32_t ClampInt32(
+    int32_t value,
+    int32_t minimum,
+    int32_t maximum)
+{
+    if (value < minimum) {
+        return minimum;
+    }
+
+    if (value > maximum) {
+        return maximum;
+    }
+
+    return value;
+}
+
+static int32_t AbsInt32(int32_t value)
+{
+    return (value < 0) ? -value : value;
+}
+
+static int32_t WrapAngleErrorX100(int32_t error)
+{
+    while (error > 18000L) {
+        error -= 36000L;
+    }
+
+    while (error < -18000L) {
+        error += 36000L;
+    }
+
+    return error;
+}
+
+static uint32_t TimeElapsedMs(uint32_t now, uint32_t start)
+{
+    return (uint32_t)(now - start);
+}
+
+/*==================================================
+ * 电机GPIO和PWM
+ *==================================================*/
+
+static void DriverA_Enable(void)
+{
+    DL_GPIO_setPins(DRIVER_A_EN_PORT, DRIVER_A_EN_PIN);
+}
+
+static void DriverA_Disable(void)
+{
+    DL_GPIO_clearPins(DRIVER_A_EN_PORT, DRIVER_A_EN_PIN);
+}
+
+static void DriverB_Enable(void)
+{
+    DL_GPIO_setPins(DRIVER_B_EN_PORT, DRIVER_B_EN_PIN);
+}
+
+static void DriverB_Disable(void)
+{
+    DL_GPIO_clearPins(DRIVER_B_EN_PORT, DRIVER_B_EN_PIN);
+}
+
+static void Motor_GPIO_Init(void)
+{
+    DL_GPIO_clearPins(GPIOA, DRIVER_A_EN_PIN);
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        DRIVER_A_IN1_PIN |
+        DRIVER_A_IN2_PIN |
+        DRIVER_B_IN3_PIN |
+        DRIVER_B_IN4_PIN |
+        DRIVER_B_EN_PIN
+    );
+
+    DL_GPIO_enableOutput(GPIOA, DRIVER_A_EN_PIN);
+
+    DL_GPIO_enableOutput(
+        GPIOB,
+        DRIVER_A_IN1_PIN |
+        DRIVER_A_IN2_PIN |
+        DRIVER_B_IN3_PIN |
+        DRIVER_B_IN4_PIN |
+        DRIVER_B_EN_PIN
+    );
+}
+
+static void DriverA_SetDirection(uint32_t forward)
+{
+#if DRIVER_A_FORWARD_REVERSE == 1
+    forward = (forward == 0U) ? 1U : 0U;
+#endif
+
+    if (forward != 0U) {
+        DL_GPIO_clearPins(DRIVER_A_IN2_PORT, DRIVER_A_IN2_PIN);
+        DL_GPIO_setPins(DRIVER_A_IN1_PORT, DRIVER_A_IN1_PIN);
+    } else {
+        DL_GPIO_clearPins(DRIVER_A_IN1_PORT, DRIVER_A_IN1_PIN);
+        DL_GPIO_setPins(DRIVER_A_IN2_PORT, DRIVER_A_IN2_PIN);
+    }
+}
+
+static void DriverB_SetDirection(uint32_t forward)
+{
+#if DRIVER_B_FORWARD_REVERSE == 1
+    forward = (forward == 0U) ? 1U : 0U;
+#endif
+
+    if (forward != 0U) {
+        DL_GPIO_clearPins(DRIVER_B_IN4_PORT, DRIVER_B_IN4_PIN);
+        DL_GPIO_setPins(DRIVER_B_IN3_PORT, DRIVER_B_IN3_PIN);
+    } else {
+        DL_GPIO_clearPins(DRIVER_B_IN3_PORT, DRIVER_B_IN3_PIN);
+        DL_GPIO_setPins(DRIVER_B_IN4_PORT, DRIVER_B_IN4_PIN);
+    }
+}
+
+static void Motor_Stop(void)
+{
+    g_motor_output_enabled = 0U;
+
+    g_left_signed_pwm = 0;
+    g_right_signed_pwm = 0;
+    g_driver_a_pwm = 0;
+    g_driver_b_pwm = 0;
+
+    DriverA_Disable();
+    DriverB_Disable();
+}
+
+/*
+ * 立即设置物理左右轮的有符号PWM。
+ * leftSignedPWM/rightSignedPWM：
+ *   正值=前进，负值=后退。
+ */
+static void Motor_SetPhysicalSignedPWM(
+    int32_t leftSignedPWM,
+    int32_t rightSignedPWM)
+{
+    uint32_t leftForward;
+    uint32_t rightForward;
+    uint32_t driverAForward;
+    uint32_t driverBForward;
+    int32_t leftMagnitude;
+    int32_t rightMagnitude;
+
+    leftSignedPWM = ClampInt32(leftSignedPWM, -100, 100);
+    rightSignedPWM = ClampInt32(rightSignedPWM, -100, 100);
+
+    leftForward = (leftSignedPWM >= 0) ? 1U : 0U;
+    rightForward = (rightSignedPWM >= 0) ? 1U : 0U;
+
+    leftMagnitude = AbsInt32(leftSignedPWM);
+    rightMagnitude = AbsInt32(rightSignedPWM);
+
+    /* 先关闭两个使能，再同时切换两个方向。 */
+    DriverA_Disable();
+    DriverB_Disable();
+
+#if MOTOR_CHANNELS_SWAPPED == 0
+    driverAForward = leftForward;
+    driverBForward = rightForward;
+
+    g_driver_a_pwm = leftMagnitude;
+    g_driver_b_pwm = rightMagnitude;
+#else
+    driverAForward = rightForward;
+    driverBForward = leftForward;
+
+    g_driver_a_pwm = rightMagnitude;
+    g_driver_b_pwm = leftMagnitude;
+#endif
+
+    DriverA_SetDirection(driverAForward);
+    DriverB_SetDirection(driverBForward);
+
+    g_left_signed_pwm = leftSignedPWM;
+    g_right_signed_pwm = rightSignedPWM;
+    g_left_forward = leftForward;
+    g_right_forward = rightForward;
+
+    g_driver_a_pwm = ClampInt32(g_driver_a_pwm, 0, 100);
+    g_driver_b_pwm = ClampInt32(g_driver_b_pwm, 0, 100);
+
+    g_motor_output_enabled = 1U;
+}
+
+/*
+ * 原地转向命令：
+ * 右转：左轮正转，右轮反转。
+ * 左转：左轮反转，右轮正转。
+ */
+static void Turn_ApplyCommand(
+    int32_t direction,
+    int32_t leftPWM,
+    int32_t rightPWM)
+{
+    leftPWM = ClampInt32(leftPWM, 0, 100);
+    rightPWM = ClampInt32(rightPWM, 0, 100);
+
+    g_turn_command_direction = direction;
+    g_turn_left_command_pwm = leftPWM;
+    g_turn_right_command_pwm = rightPWM;
+
+    if (direction == TURN_RIGHT) {
+        Motor_SetPhysicalSignedPWM(
+            leftPWM,
+            -rightPWM
+        );
+    } else {
+        Motor_SetPhysicalSignedPWM(
+            -leftPWM,
+            rightPWM
+        );
+    }
+}
+
+/*==================================================
+ * JY60解析
+ *==================================================*/
+
+static void JY60_ParseCompleteFrame(void)
+{
+    uint32_t i;
+    uint8_t checksum;
+    int16_t rawValue;
+    int32_t newYaw;
+    int32_t difference;
+
+    checksum = 0U;
+
+    for (i = 0U; i < 10U; i++) {
+        checksum = (uint8_t)(checksum + s_jy60_frame[i]);
+    }
+
+    if (checksum != s_jy60_frame[10]) {
+        g_jy60_checksum_errors++;
+        return;
+    }
+
+    /* 0x53为角度帧，Yaw位于字节6、7。 */
+    if (s_jy60_frame[1] != 0x53U) {
+        return;
+    }
+
+    rawValue = (int16_t)(
+        ((uint16_t)s_jy60_frame[7] << 8U) |
+        s_jy60_frame[6]
+    );
+
+    newYaw = (int32_t)(
+        ((int64_t)rawValue * 18000LL) /
+        32768LL
+    );
+
+    g_jy60_yaw_deg_x100 = newYaw;
+
+    if (s_previous_raw_yaw_valid == 0U) {
+        s_previous_raw_yaw_x100 = newYaw;
+        s_previous_raw_yaw_valid = 1U;
+
+        g_jy60_yaw_filtered_x100 = newYaw;
+        g_jy60_yaw_unwrapped_x100 = newYaw;
+    } else {
+        /* 连续航向，正确处理+180/-180跳变。 */
+        difference = WrapAngleErrorX100(
+            newYaw - s_previous_raw_yaw_x100
+        );
+
+        s_previous_raw_yaw_x100 = newYaw;
+        g_jy60_yaw_unwrapped_x100 += difference;
+
+        difference = WrapAngleErrorX100(
+            newYaw - g_jy60_yaw_filtered_x100
+        );
+
+        g_jy60_yaw_filtered_x100 += difference / 2L;
+
+        if (g_jy60_yaw_filtered_x100 > 18000L) {
+            g_jy60_yaw_filtered_x100 -= 36000L;
+        }
+
+        if (g_jy60_yaw_filtered_x100 < -18000L) {
+            g_jy60_yaw_filtered_x100 += 36000L;
+        }
+    }
+
+    g_jy60_last_angle_ms = g_system_ms;
+    g_jy60_angle_frame_count++;
+}
+
+static void JY60_InputByte(uint8_t byte)
+{
+    if (s_jy60_frame_index == 0U) {
+        if (byte == 0x55U) {
+            s_jy60_frame[0] = byte;
+            s_jy60_frame_index = 1U;
+        }
+        return;
+    }
+
+    if ((s_jy60_frame_index == 1U) &&
+        (byte == 0x55U)) {
+        s_jy60_frame[0] = 0x55U;
+        s_jy60_frame_index = 1U;
+        return;
+    }
+
+    s_jy60_frame[s_jy60_frame_index] = byte;
+    s_jy60_frame_index++;
+
+    if (s_jy60_frame_index >= 11U) {
+        JY60_ParseCompleteFrame();
+        s_jy60_frame_index = 0U;
+    }
+}
+
+static void JY60_ProcessUART(void)
+{
+    uint8_t byte;
+
+    while (DL_UART_Main_receiveDataCheck(
+        JY60_UART_INST,
+        &byte)) {
+        g_jy60_rx_byte_count++;
+        JY60_InputByte(byte);
+    }
+}
+
+static void JY60_UpdateOnlineState(void)
+{
+    if ((g_jy60_angle_frame_count > 0U) &&
+        (TimeElapsedMs(
+            g_system_ms,
+            g_jy60_last_angle_ms) <=
+         JY60_OFFLINE_TIMEOUT_MS)) {
+        g_jy60_online = 1U;
+    } else {
+        g_jy60_online = 0U;
+    }
+}
+
+/*==================================================
+ * 180度掉头控制
+ *==================================================*/
+
+static void Turn180_Start(void)
+{
+    g_turn_start_yaw_x100 =
+        g_jy60_yaw_unwrapped_x100;
+
+    g_turn_target_yaw_x100 =
+        g_turn_start_yaw_x100;
+
+    g_turn_yaw_sign = 0;
+    g_turn_delta_x100 = 0;
+    g_turn_progress_x100 = 0;
+    g_turn_remaining_x100 = TURN_TARGET_X100;
+
+    g_turn_stable_count = 0U;
+    g_turn_forced_finish = 0U;
+    g_turn_overshoot_correcting = 0U;
+    g_turn_direction_change_count = 0U;
+
+    s_last_turn_direction = TURN_PHYSICAL_DIRECTION;
+    s_pending_turn_direction = TURN_PHYSICAL_DIRECTION;
+    s_direction_change_waiting = 0U;
+
+    g_run_state = STATE_TURN_180;
+    g_state_start_ms = g_system_ms;
+
+    /* 立即明确输出一正一反。 */
+    Turn_ApplyCommand(
+        TURN_PHYSICAL_DIRECTION,
+        TURN_START_LEFT_PWM,
+        TURN_START_RIGHT_PWM
+    );
+}
+
+static void Turn_SelectPWM(
+    int32_t absoluteRemaining,
+    int32_t *leftPWM,
+    int32_t *rightPWM)
+{
+    if (absoluteRemaining > TURN_MEDIUM_ZONE_X100) {
+        *leftPWM = TURN_FAR_LEFT_PWM;
+        *rightPWM = TURN_FAR_RIGHT_PWM;
+    } else if (absoluteRemaining > TURN_NEAR_ZONE_X100) {
+        *leftPWM = TURN_MEDIUM_LEFT_PWM;
+        *rightPWM = TURN_MEDIUM_RIGHT_PWM;
+    } else if (absoluteRemaining > TURN_FINAL_ZONE_X100) {
+        *leftPWM = TURN_NEAR_LEFT_PWM;
+        *rightPWM = TURN_NEAR_RIGHT_PWM;
+    } else {
+        *leftPWM = TURN_FINAL_LEFT_PWM;
+        *rightPWM = TURN_FINAL_RIGHT_PWM;
+    }
+}
+
+static void Turn_RequestDirection(
+    int32_t desiredDirection,
+    int32_t leftPWM,
+    int32_t rightPWM)
+{
+    /* 第一次方向已经在Turn180_Start中输出。 */
+    if (desiredDirection == s_last_turn_direction) {
+        s_direction_change_waiting = 0U;
+        Turn_ApplyCommand(
+            desiredDirection,
+            leftPWM,
+            rightPWM
+        );
+        return;
+    }
+
+    /* 需要反向修正时，先同时关闭两个轮子150ms。 */
+    if ((s_direction_change_waiting == 0U) ||
+        (s_pending_turn_direction != desiredDirection)) {
+        Motor_Stop();
+
+        s_pending_turn_direction = desiredDirection;
+        s_direction_change_waiting = 1U;
+        s_direction_change_start_ms = g_system_ms;
+        g_turn_direction_change_count++;
+        return;
+    }
+
+    if (TimeElapsedMs(
+            g_system_ms,
+            s_direction_change_start_ms) <
+        TURN_DIRECTION_CHANGE_SETTLE_MS) {
+        Motor_Stop();
+        return;
+    }
+
+    s_last_turn_direction = desiredDirection;
+    s_direction_change_waiting = 0U;
+
+    Turn_ApplyCommand(
+        desiredDirection,
+        leftPWM,
+        rightPWM
+    );
+}
+
+static void Turn180_Update10ms(void)
+{
+    uint32_t elapsed;
+    int32_t currentYaw;
+    int32_t signedRemaining;
+    int32_t absoluteRemaining;
+    int32_t desiredDirection;
+    int32_t leftPWM;
+    int32_t rightPWM;
+
+    elapsed = TimeElapsedMs(
+        g_system_ms,
+        g_state_start_ms
+    );
+
+    JY60_UpdateOnlineState();
+
+    /* 10秒硬性上限：无论任何情况都结束。 */
+    if (elapsed >= TURN_MAX_DURATION_MS) {
+        Motor_Stop();
+        g_turn_forced_finish = 1U;
+        g_run_state = STATE_FINISHED;
+        return;
+    }
+
+    /* 起转短暂高PWM，两个轮子一正一反。 */
+    if (elapsed < TURN_START_KICK_MS) {
+        Turn_ApplyCommand(
+            TURN_PHYSICAL_DIRECTION,
+            TURN_START_LEFT_PWM,
+            TURN_START_RIGHT_PWM
+        );
+        return;
+    }
+
+    /* JY60暂时离线时继续固定方向原地转，不会卡住。 */
+    if (g_jy60_online == 0U) {
+        Turn_RequestDirection(
+            TURN_PHYSICAL_DIRECTION,
+            TURN_FALLBACK_LEFT_PWM,
+            TURN_FALLBACK_RIGHT_PWM
+        );
+        return;
+    }
+
+    currentYaw = g_jy60_yaw_unwrapped_x100;
+
+    g_turn_delta_x100 =
+        currentYaw - g_turn_start_yaw_x100;
+
+    /* 自动识别固定物理右转对应的Yaw正负方向。 */
+    if (g_turn_yaw_sign == 0) {
+        if (AbsInt32(g_turn_delta_x100) >=
+            TURN_SIGN_DETECT_X100) {
+
+            g_turn_yaw_sign =
+                (g_turn_delta_x100 >= 0) ? 1 : -1;
+
+            g_turn_target_yaw_x100 =
+                g_turn_start_yaw_x100 +
+                g_turn_yaw_sign *
+                TURN_TARGET_X100;
+        } else {
+            Turn_RequestDirection(
+                TURN_PHYSICAL_DIRECTION,
+                TURN_FAR_LEFT_PWM,
+                TURN_FAR_RIGHT_PWM
+            );
+            return;
+        }
+    }
+
+    g_turn_progress_x100 =
+        g_turn_delta_x100 *
+        g_turn_yaw_sign;
+
+    signedRemaining =
+        (g_turn_target_yaw_x100 - currentYaw) *
+        g_turn_yaw_sign;
+
+    g_turn_remaining_x100 = signedRemaining;
+    absoluteRemaining = AbsInt32(signedRemaining);
+
+    /*
+     * 到达180度±1度后先停车确认。
+     *
+     * 这里不会立即进入STATE_FINISHED。
+     * 必须持续保持约500ms；如果停车后因为惯性又偏出±1度，
+     * 下一次控制会清零g_turn_stable_count，并继续正向或反向调整。
+     */
+    if (absoluteRemaining <= TURN_TOLERANCE_X100) {
+        Motor_Stop();
+
+        if (g_turn_stable_count < TURN_STABLE_CYCLES) {
+            g_turn_stable_count++;
+        }
+
+        if (g_turn_stable_count >= TURN_STABLE_CYCLES) {
+            g_turn_forced_finish = 0U;
+            g_run_state = STATE_FINISHED;
+        }
+        return;
+    }
+
+    g_turn_stable_count = 0U;
+
+    Turn_SelectPWM(
+        absoluteRemaining,
+        &leftPWM,
+        &rightPWM
+    );
+
+    if (signedRemaining > 0) {
+        /* 未到目标，继续原方向。 */
+        desiredDirection = TURN_PHYSICAL_DIRECTION;
+        g_turn_overshoot_correcting = 0U;
+    } else {
+        /*
+         * 已经转过头：两个轮子同时反向修正。
+         * 回调需要克服静摩擦，因此使用单独的较高PWM，
+         * 不再使用正常接近目标时的12%慢速。
+         */
+        desiredDirection = -TURN_PHYSICAL_DIRECTION;
+        leftPWM = TURN_CORRECT_LEFT_PWM;
+        rightPWM = TURN_CORRECT_RIGHT_PWM;
+        g_turn_overshoot_correcting = 1U;
+    }
+
+    Turn_RequestDirection(
+        desiredDirection,
+        leftPWM,
+        rightPWM
+    );
+}
+
+/*==================================================
+ * 主状态机
+ *==================================================*/
+
+static void Control_Update10ms(void)
+{
+    JY60_UpdateOnlineState();
+
+    switch (g_run_state) {
+        case STATE_WAIT_JY60:
+            Motor_Stop();
+
+            if ((g_jy60_online != 0U) &&
+                (g_jy60_angle_frame_count >=
+                 JY60_REQUIRED_ANGLE_FRAMES)) {
+                g_run_state = STATE_JY60_SETTLE;
+                s_jy60_settle_start_ms = g_system_ms;
+            }
+            break;
+
+        case STATE_JY60_SETTLE:
+            Motor_Stop();
+
+            if (g_jy60_online == 0U) {
+                g_run_state = STATE_WAIT_JY60;
+                break;
+            }
+
+            if (TimeElapsedMs(
+                    g_system_ms,
+                    s_jy60_settle_start_ms) >=
+                JY60_STABLE_TIME_MS) {
+                Turn180_Start();
+            }
+            break;
+
+        case STATE_TURN_180:
+            Turn180_Update10ms();
+            break;
+
+        case STATE_FINISHED:
+        default:
+            Motor_Stop();
+            break;
+    }
+}
+
+/*==================================================
+ * SysTick
+ *==================================================*/
+
+void SysTick_Handler(void)
+{
+    g_systick_heartbeat++;
+
+    s_ms_divider++;
+
+    if (s_ms_divider >= SYSTICK_TICKS_PER_MS) {
+        s_ms_divider = 0U;
+        g_system_ms++;
+    }
+
+    /* 200Hz软件PWM。 */
+    s_pwm_phase++;
+
+    if (s_pwm_phase >= PWM_PERIOD_COUNT) {
+        s_pwm_phase = 0U;
+    }
+
+    if (g_motor_output_enabled == 0U) {
+        DriverA_Disable();
+        DriverB_Disable();
+    } else {
+        if (s_pwm_phase < (uint32_t)g_driver_a_pwm) {
+            DriverA_Enable();
+        } else {
+            DriverA_Disable();
+        }
+
+        if (s_pwm_phase < (uint32_t)g_driver_b_pwm) {
+            DriverB_Enable();
+        } else {
+            DriverB_Disable();
+        }
+    }
+
+    s_turn_control_tick++;
+
+    if (s_turn_control_tick >=
+        TURN_CONTROL_INTERVAL_TICKS) {
+        s_turn_control_tick = 0U;
+        s_turn_control_due = 1U;
+    }
+}
+
+/*==================================================
+ * 主函数
+ *==================================================*/
+
+int main(void)
+{
+    uint32_t systickResult;
+
+    SYSCFG_DL_init();
+
+    Motor_GPIO_Init();
+    Motor_Stop();
+
+    systickResult = SysTick_Config(
+        CPUCLK_FREQ /
+        SYSTICK_FREQUENCY_HZ
+    );
+
+    if (systickResult != 0U) {
+        g_run_state = STATE_ERROR_SYSTICK;
+        Motor_Stop();
+
+        while (1) {
+            __WFI();
+        }
+    }
+
+    g_run_state = STATE_WAIT_JY60;
+
+    while (1) {
+        JY60_ProcessUART();
+
+        if (s_turn_control_due != 0U) {
+            __disable_irq();
+            s_turn_control_due = 0U;
+            __enable_irq();
+
+            Control_Update10ms();
+        }
+
+        __WFI();
+    }
+}
