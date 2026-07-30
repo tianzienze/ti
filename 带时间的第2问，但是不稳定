@@ -1,0 +1,1912 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ * ==================================================
+ * MSPM0G3507 八路循迹 + OLED计时 + 四路黑线停车
+ * ==================================================
+ *
+ * 电机：
+ *   左轮 IN1 = PB2
+ *   左轮 IN2 = PA7
+ *   左轮 ENA = PB8
+ *
+ *   右轮 IN3 = PB9
+ *   右轮 IN4 = PB14
+ *   右轮 ENB = PB7
+ *
+ * 八路循迹：
+ *   X1 = PA21
+ *   X2 = PB19
+ *   X3 = PA18
+ *   X4 = PA17
+ *   X5 = PA16
+ *   X6 = PA15
+ *   X7 = PA14
+ *   X8 = PA13
+ *
+ * OLED：
+ *   SDA = PA0
+ *   SCL = PA1
+ *   SSD1306 128×64
+ *   地址 = 0x3C
+ *
+ * 状态灯：
+ *   PA5
+ *
+ * 新增功能：
+ *   1. 左右轮PWM分别调节。
+ *   2. 直线、中弯、大弯分别设置速度。
+ *   3. 至少4路同时检测到黑线立即停车。
+ *   4. 停车状态锁存，必须复位才能重新启动。
+ *   5. OLED从小车开始运动时计时，停车后保留最终时间。
+ */
+
+/*==================================================
+ * 系统时间参数
+ *==================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                    (32000000UL)
+#endif
+
+#define SYSTICK_FREQUENCY_HZ           (10000U)
+
+/*
+ * SysTick = 10kHz
+ * 软件PWM周期 = 100
+ * 软件PWM频率 = 100Hz
+ */
+#define PWM_PERIOD_COUNT               (100U)
+
+/*
+ * 每50次SysTick进行一次循迹计算：
+ * 50 × 0.1ms = 5ms
+ */
+#define CONTROL_INTERVAL_TICKS         (50U)
+
+/*==================================================
+ * 左右轮独立速度参数
+ *
+ * PWM范围：0～100
+ *==================================================*/
+
+/*
+ * 直线时左右轮基础速度。
+ *
+ * 小车直线向左偏：
+ *   减小右轮速度，或者增大左轮速度。
+ *
+ * 小车直线向右偏：
+ *   减小左轮速度，或者增大右轮速度。
+ */
+#define LEFT_STRAIGHT_PWM              (18)
+#define RIGHT_STRAIGHT_PWM             (18)
+
+/*
+ * 中等弯道时左右轮基础速度。
+ *
+ * 弯道容易冲出去时可以改成16或17。
+ */
+#define LEFT_MEDIUM_CURVE_PWM          (18)
+#define RIGHT_MEDIUM_CURVE_PWM         (18)
+
+/*
+ * 大弯道、急弯时左右轮基础速度。
+ *
+ * 急弯速度过快时可以改成14～16。
+ */
+#define LEFT_LARGE_CURVE_PWM           (18)
+#define RIGHT_LARGE_CURVE_PWM          (18)
+
+/*
+ * 左右轮最小PWM。
+ *
+ * 转弯时内轮不会低于该数值。
+ */
+#define LEFT_MOTOR_MIN_PWM             (4)
+#define RIGHT_MOTOR_MIN_PWM            (4)
+
+/*
+ * 左右轮最大PWM。
+ */
+#define LEFT_MOTOR_MAX_PWM             (25)
+#define RIGHT_MOTOR_MAX_PWM            (25)
+
+/*
+ * 每次5ms控制计算时，
+ * 左右轮PWM最多变化多少。
+ */
+#define LEFT_PWM_CHANGE_LIMIT          (4)
+#define RIGHT_PWM_CHANGE_LIMIT         (4)
+
+/*
+ * 左右轮转向修正倍率。
+ *
+ * 实际倍率 = NUM / DEN
+ *
+ * 100 / 100 = 1.00倍
+ * 90 / 100  = 0.90倍
+ * 110 / 100 = 1.10倍
+ */
+#define LEFT_CORRECTION_NUM            (100L)
+#define LEFT_CORRECTION_DEN            (100L)
+
+#define RIGHT_CORRECTION_NUM           (100L)
+#define RIGHT_CORRECTION_DEN           (100L)
+
+/*
+ * 左右轮最大转向修正量。
+ */
+#define LEFT_MAX_CORRECTION            (15)
+#define RIGHT_MAX_CORRECTION           (15)
+
+/*==================================================
+ * 传感器与方向参数
+ *==================================================*/
+
+/*
+ * 1：黑线输出高电平
+ * 0：黑线输出低电平
+ */
+#define BLACK_IS_HIGH                  (1)
+
+/*
+ * 八路传感器左右安装反向。
+ */
+#define LINE_SENSOR_REVERSE            (1)
+
+/*
+ * 如果小车循迹修正方向相反，
+ * 改成1。
+ */
+#define STEERING_REVERSE               (0)
+
+/*
+ * 电机前进方向。
+ *
+ * 某一个轮子转反时，
+ * 将对应值改成1。
+ */
+#define LEFT_FORWARD_REVERSE           (0)
+#define RIGHT_FORWARD_REVERSE          (0)
+
+/*==================================================
+ * PD循迹参数
+ *==================================================*/
+
+#define LINE_KP_NUM                    (2L)
+#define LINE_KP_DEN                    (60L)
+
+#define LINE_KD_NUM                    (3L)
+#define LINE_KD_DEN                    (60L)
+
+#define LINE_CENTER_DEADBAND           (35)
+
+/*
+ * 中等弯道和大弯道的误差阈值。
+ */
+#define MEDIUM_CURVE_ERROR             (280)
+#define LARGE_CURVE_ERROR              (480)
+
+/*
+ * 中等弯道、大弯道额外修正量。
+ */
+#define MEDIUM_CURVE_BOOST             (2)
+#define LARGE_CURVE_BOOST              (4)
+
+/*
+ * 丢线保持最后速度：
+ *
+ * 20 × 5ms = 100ms
+ *
+ * 100ms后停车。
+ */
+#define LINE_LOST_HOLD_CYCLES          (20U)
+
+/*==================================================
+ * 终点黑线停车参数
+ *==================================================*/
+
+/*
+ * 八路传感器中至少有多少路同时检测到黑线，
+ * 就立即停车。
+ */
+#define STOP_BLACK_SENSOR_COUNT        (4U)
+
+/*
+ * 1：启用多路黑线停车
+ * 0：关闭多路黑线停车
+ */
+#define STOP_LINE_ENABLE               (1U)
+
+/*==================================================
+ * 电机引脚
+ *==================================================*/
+
+#define LEFT_IN1_PORT                  GPIOB
+#define LEFT_IN1_PIN                   DL_GPIO_PIN_2
+
+#define LEFT_IN2_PORT                  GPIOA
+#define LEFT_IN2_PIN                   DL_GPIO_PIN_7
+
+#define LEFT_EN_PORT                   GPIOB
+#define LEFT_EN_PIN                    DL_GPIO_PIN_8
+
+#define RIGHT_IN3_PORT                 GPIOB
+#define RIGHT_IN3_PIN                  DL_GPIO_PIN_9
+
+#define RIGHT_IN4_PORT                 GPIOB
+#define RIGHT_IN4_PIN                  DL_GPIO_PIN_14
+
+#define RIGHT_EN_PORT                  GPIOB
+#define RIGHT_EN_PIN                   DL_GPIO_PIN_7
+
+/*==================================================
+ * 八路循迹引脚
+ *==================================================*/
+
+#define TRACK_X1_PORT                  GPIOA
+#define TRACK_X1_PIN                   DL_GPIO_PIN_21
+
+#define TRACK_X2_PORT                  GPIOB
+#define TRACK_X2_PIN                   DL_GPIO_PIN_19
+
+#define TRACK_X3_PORT                  GPIOA
+#define TRACK_X3_PIN                   DL_GPIO_PIN_18
+
+#define TRACK_X4_PORT                  GPIOA
+#define TRACK_X4_PIN                   DL_GPIO_PIN_17
+
+#define TRACK_X5_PORT                  GPIOA
+#define TRACK_X5_PIN                   DL_GPIO_PIN_16
+
+#define TRACK_X6_PORT                  GPIOA
+#define TRACK_X6_PIN                   DL_GPIO_PIN_15
+
+#define TRACK_X7_PORT                  GPIOA
+#define TRACK_X7_PIN                   DL_GPIO_PIN_14
+
+#define TRACK_X8_PORT                  GPIOA
+#define TRACK_X8_PIN                   DL_GPIO_PIN_13
+
+/*==================================================
+ * LED引脚
+ *==================================================*/
+
+#define STATUS_LED_PORT                GPIOA
+#define STATUS_LED_PIN                 DL_GPIO_PIN_5
+
+/*==================================================
+ * OLED软件I2C引脚
+ *==================================================*/
+
+#define OLED_SDA_PORT                  GPIOA
+#define OLED_SDA_PIN                   DL_GPIO_PIN_0
+
+#define OLED_SCL_PORT                  GPIOA
+#define OLED_SCL_PIN                   DL_GPIO_PIN_1
+
+#define OLED_I2C_ADDRESS               (0x3CU)
+
+/*
+ * OLED每100ms刷新一次。
+ */
+#define OLED_REFRESH_TICKS             (1000U)
+
+/*
+ * 最大显示时间：
+ * 99分59.99秒
+ */
+#define MOTION_TIME_MAX_MS             (5999990U)
+
+/*==================================================
+ * 运行状态
+ *==================================================*/
+
+enum {
+    RUN_STATE_INIT = 0U,
+    RUN_STATE_WAIT_LINE = 1U,
+    RUN_STATE_TRACKING = 2U,
+    RUN_STATE_LINE_LOST_HOLD = 3U,
+    RUN_STATE_LINE_LOST_STOP = 4U,
+    RUN_STATE_STOP_LINE = 5U,
+    RUN_STATE_SYSTICK_ERROR = 900U
+};
+
+/*==================================================
+ * 调试变量
+ *==================================================*/
+
+volatile uint32_t g_run_state =
+    RUN_STATE_INIT;
+
+volatile uint32_t g_sensor_mask = 0U;
+volatile uint32_t g_active_sensor_count = 0U;
+
+volatile int32_t g_line_error = 0;
+volatile int32_t g_filtered_error = 0;
+volatile int32_t g_error_derivative = 0;
+
+volatile int32_t g_steering_correction = 0;
+volatile int32_t g_left_correction = 0;
+volatile int32_t g_right_correction = 0;
+
+volatile int32_t g_left_base_pwm = 0;
+volatile int32_t g_right_base_pwm = 0;
+
+volatile int32_t g_left_target_pwm = 0;
+volatile int32_t g_right_target_pwm = 0;
+
+volatile int32_t g_left_pwm = 0;
+volatile int32_t g_right_pwm = 0;
+
+volatile uint32_t g_systick_heartbeat = 0U;
+volatile uint32_t g_line_lost_cycles = 0U;
+volatile uint32_t g_seen_line_once = 0U;
+
+/*
+ * 终点停车锁存。
+ *
+ * 0：没有触发
+ * 1：已经触发，永久停车
+ */
+volatile uint32_t g_stop_line_latched = 0U;
+
+/*==================================================
+ * OLED计时变量
+ *==================================================*/
+
+volatile uint32_t g_motion_time_ms = 0U;
+volatile uint32_t g_motion_timer_running = 0U;
+volatile uint32_t g_motion_timer_finished = 0U;
+
+static volatile uint32_t s_motion_ms_divider = 0U;
+static volatile uint32_t s_oled_refresh_tick = 0U;
+static volatile uint32_t s_oled_refresh_due = 0U;
+
+static uint32_t s_motion_timer_started_once = 0U;
+
+/*==================================================
+ * 软件PWM变量
+ *==================================================*/
+
+static volatile uint32_t s_pwm_phase = 0U;
+static volatile uint32_t s_control_tick = 0U;
+static volatile uint32_t s_control_due = 0U;
+static volatile uint32_t s_motor_output_enabled = 0U;
+
+/*==================================================
+ * 工具函数
+ *==================================================*/
+
+static int32_t ClampInt32(
+    int32_t value,
+    int32_t minimum,
+    int32_t maximum)
+{
+    if (value < minimum) {
+        return minimum;
+    }
+
+    if (value > maximum) {
+        return maximum;
+    }
+
+    return value;
+}
+
+static int32_t AbsInt32(int32_t value)
+{
+    return (value < 0) ? -value : value;
+}
+
+static int32_t MoveToward(
+    int32_t current,
+    int32_t target,
+    int32_t step)
+{
+    if (current < target) {
+        current += step;
+
+        if (current > target) {
+            current = target;
+        }
+    } else if (current > target) {
+        current -= step;
+
+        if (current < target) {
+            current = target;
+        }
+    }
+
+    return current;
+}
+
+/*==================================================
+ * OLED计时控制
+ *==================================================*/
+
+static void MotionTimerStartOnce(void)
+{
+    if (s_motion_timer_started_once != 0U) {
+        return;
+    }
+
+    __disable_irq();
+
+    g_motion_time_ms = 0U;
+    s_motion_ms_divider = 0U;
+
+    g_motion_timer_finished = 0U;
+    s_motion_timer_started_once = 1U;
+    g_motion_timer_running = 1U;
+
+    s_oled_refresh_due = 1U;
+
+    __enable_irq();
+}
+
+static void MotionTimerStop(void)
+{
+    if (g_motion_timer_running == 0U) {
+        return;
+    }
+
+    __disable_irq();
+
+    g_motion_timer_running = 0U;
+    g_motion_timer_finished = 1U;
+    s_oled_refresh_due = 1U;
+
+    __enable_irq();
+}
+
+/*==================================================
+ * SSD1306软件I2C
+ *==================================================*/
+
+static void OLED_I2CDelay(void)
+{
+    delay_cycles(24U);
+}
+
+static void OLED_SDALow(void)
+{
+    DL_GPIO_clearPins(
+        OLED_SDA_PORT,
+        OLED_SDA_PIN);
+
+    DL_GPIO_enableOutput(
+        OLED_SDA_PORT,
+        OLED_SDA_PIN);
+}
+
+static void OLED_SDARelease(void)
+{
+    DL_GPIO_disableOutput(
+        OLED_SDA_PORT,
+        OLED_SDA_PIN);
+}
+
+static void OLED_SCLLow(void)
+{
+    DL_GPIO_clearPins(
+        OLED_SCL_PORT,
+        OLED_SCL_PIN);
+
+    DL_GPIO_enableOutput(
+        OLED_SCL_PORT,
+        OLED_SCL_PIN);
+}
+
+static void OLED_SCLRelease(void)
+{
+    DL_GPIO_disableOutput(
+        OLED_SCL_PORT,
+        OLED_SCL_PIN);
+}
+
+static uint32_t OLED_ReadSDA(void)
+{
+    uint32_t level;
+
+    level = DL_GPIO_readPins(
+        OLED_SDA_PORT,
+        OLED_SDA_PIN);
+
+    return ((level & OLED_SDA_PIN) != 0U)
+        ? 1U
+        : 0U;
+}
+
+static void OLED_I2CStart(void)
+{
+    OLED_SDARelease();
+    OLED_SCLRelease();
+
+    OLED_I2CDelay();
+
+    OLED_SDALow();
+
+    OLED_I2CDelay();
+
+    OLED_SCLLow();
+
+    OLED_I2CDelay();
+}
+
+static void OLED_I2CStop(void)
+{
+    OLED_SDALow();
+
+    OLED_I2CDelay();
+
+    OLED_SCLRelease();
+
+    OLED_I2CDelay();
+
+    OLED_SDARelease();
+
+    OLED_I2CDelay();
+}
+
+static uint32_t OLED_I2CWriteByte(uint8_t data)
+{
+    uint32_t bitIndex;
+    uint32_t acknowledge;
+
+    for (bitIndex = 0U;
+         bitIndex < 8U;
+         bitIndex++) {
+        if ((data & 0x80U) != 0U) {
+            OLED_SDARelease();
+        } else {
+            OLED_SDALow();
+        }
+
+        OLED_I2CDelay();
+
+        OLED_SCLRelease();
+
+        OLED_I2CDelay();
+
+        OLED_SCLLow();
+
+        OLED_I2CDelay();
+
+        data <<= 1;
+    }
+
+    OLED_SDARelease();
+
+    OLED_I2CDelay();
+
+    OLED_SCLRelease();
+
+    OLED_I2CDelay();
+
+    acknowledge =
+        (OLED_ReadSDA() == 0U)
+        ? 1U
+        : 0U;
+
+    OLED_SCLLow();
+
+    OLED_I2CDelay();
+
+    return acknowledge;
+}
+
+static void OLED_WriteCommand(uint8_t command)
+{
+    OLED_I2CStart();
+
+    (void)OLED_I2CWriteByte(
+        (uint8_t)(OLED_I2C_ADDRESS << 1));
+
+    (void)OLED_I2CWriteByte(0x00U);
+
+    (void)OLED_I2CWriteByte(command);
+
+    OLED_I2CStop();
+}
+
+static void OLED_WriteDataBuffer(
+    const uint8_t *data,
+    uint32_t length)
+{
+    uint32_t index;
+
+    OLED_I2CStart();
+
+    (void)OLED_I2CWriteByte(
+        (uint8_t)(OLED_I2C_ADDRESS << 1));
+
+    (void)OLED_I2CWriteByte(0x40U);
+
+    for (index = 0U;
+         index < length;
+         index++) {
+        (void)OLED_I2CWriteByte(data[index]);
+    }
+
+    OLED_I2CStop();
+}
+
+static void OLED_SetPosition(
+    uint32_t page,
+    uint32_t column)
+{
+    OLED_WriteCommand(
+        (uint8_t)(0xB0U + page));
+
+    OLED_WriteCommand(
+        (uint8_t)(
+            0x00U |
+            (column & 0x0FU)));
+
+    OLED_WriteCommand(
+        (uint8_t)(
+            0x10U |
+            ((column >> 4) & 0x0FU)));
+}
+
+static void OLED_GPIOInit(void)
+{
+    DL_GPIO_clearPins(
+        GPIOA,
+        OLED_SDA_PIN |
+        OLED_SCL_PIN);
+
+    OLED_SDARelease();
+    OLED_SCLRelease();
+}
+
+static void OLED_ClearScreen(void)
+{
+    uint8_t zeroData[128];
+    uint32_t index;
+    uint32_t page;
+
+    for (index = 0U;
+         index < 128U;
+         index++) {
+        zeroData[index] = 0U;
+    }
+
+    for (page = 0U;
+         page < 8U;
+         page++) {
+        OLED_SetPosition(page, 0U);
+
+        OLED_WriteDataBuffer(
+            zeroData,
+            128U);
+    }
+}
+
+static void OLED_Init(void)
+{
+    OLED_GPIOInit();
+
+    delay_cycles(CPUCLK_FREQ / 10U);
+
+    OLED_WriteCommand(0xAEU);
+
+    OLED_WriteCommand(0xD5U);
+    OLED_WriteCommand(0x80U);
+
+    OLED_WriteCommand(0xA8U);
+    OLED_WriteCommand(0x3FU);
+
+    OLED_WriteCommand(0xD3U);
+    OLED_WriteCommand(0x00U);
+
+    OLED_WriteCommand(0x40U);
+
+    OLED_WriteCommand(0x8DU);
+    OLED_WriteCommand(0x14U);
+
+    OLED_WriteCommand(0x20U);
+    OLED_WriteCommand(0x02U);
+
+    OLED_WriteCommand(0xA1U);
+    OLED_WriteCommand(0xC8U);
+
+    OLED_WriteCommand(0xDAU);
+    OLED_WriteCommand(0x12U);
+
+    OLED_WriteCommand(0x81U);
+    OLED_WriteCommand(0x7FU);
+
+    OLED_WriteCommand(0xD9U);
+    OLED_WriteCommand(0xF1U);
+
+    OLED_WriteCommand(0xDBU);
+    OLED_WriteCommand(0x40U);
+
+    OLED_WriteCommand(0xA4U);
+    OLED_WriteCommand(0xA6U);
+
+    OLED_WriteCommand(0xAFU);
+
+    OLED_ClearScreen();
+}
+
+/*==================================================
+ * OLED字模
+ *==================================================*/
+
+static const uint8_t FONT_SPACE[5] =
+    {0x00U, 0x00U, 0x00U, 0x00U, 0x00U};
+
+static const uint8_t FONT_0[5] =
+    {0x3EU, 0x51U, 0x49U, 0x45U, 0x3EU};
+
+static const uint8_t FONT_1[5] =
+    {0x00U, 0x42U, 0x7FU, 0x40U, 0x00U};
+
+static const uint8_t FONT_2[5] =
+    {0x42U, 0x61U, 0x51U, 0x49U, 0x46U};
+
+static const uint8_t FONT_3[5] =
+    {0x21U, 0x41U, 0x45U, 0x4BU, 0x31U};
+
+static const uint8_t FONT_4[5] =
+    {0x18U, 0x14U, 0x12U, 0x7FU, 0x10U};
+
+static const uint8_t FONT_5[5] =
+    {0x27U, 0x45U, 0x45U, 0x45U, 0x39U};
+
+static const uint8_t FONT_6[5] =
+    {0x3CU, 0x4AU, 0x49U, 0x49U, 0x30U};
+
+static const uint8_t FONT_7[5] =
+    {0x01U, 0x71U, 0x09U, 0x05U, 0x03U};
+
+static const uint8_t FONT_8[5] =
+    {0x36U, 0x49U, 0x49U, 0x49U, 0x36U};
+
+static const uint8_t FONT_9[5] =
+    {0x06U, 0x49U, 0x49U, 0x29U, 0x1EU};
+
+static const uint8_t FONT_COLON[5] =
+    {0x00U, 0x36U, 0x36U, 0x00U, 0x00U};
+
+static const uint8_t FONT_DOT[5] =
+    {0x00U, 0x60U, 0x60U, 0x00U, 0x00U};
+
+static const uint8_t FONT_A[5] =
+    {0x7EU, 0x11U, 0x11U, 0x11U, 0x7EU};
+
+static const uint8_t FONT_E[5] =
+    {0x7FU, 0x49U, 0x49U, 0x49U, 0x41U};
+
+static const uint8_t FONT_I[5] =
+    {0x00U, 0x41U, 0x7FU, 0x41U, 0x00U};
+
+static const uint8_t FONT_M[5] =
+    {0x7FU, 0x02U, 0x0CU, 0x02U, 0x7FU};
+
+static const uint8_t FONT_N[5] =
+    {0x7FU, 0x04U, 0x08U, 0x10U, 0x7FU};
+
+static const uint8_t FONT_O[5] =
+    {0x3EU, 0x41U, 0x41U, 0x41U, 0x3EU};
+
+static const uint8_t FONT_P[5] =
+    {0x7FU, 0x09U, 0x09U, 0x09U, 0x06U};
+
+static const uint8_t FONT_R[5] =
+    {0x7FU, 0x09U, 0x19U, 0x29U, 0x46U};
+
+static const uint8_t FONT_S[5] =
+    {0x46U, 0x49U, 0x49U, 0x49U, 0x31U};
+
+static const uint8_t FONT_T[5] =
+    {0x01U, 0x01U, 0x7FU, 0x01U, 0x01U};
+
+static const uint8_t FONT_U[5] =
+    {0x3FU, 0x40U, 0x40U, 0x40U, 0x3FU};
+
+static const uint8_t FONT_W[5] =
+    {0x7FU, 0x20U, 0x18U, 0x20U, 0x7FU};
+
+static const uint8_t *OLED_GetGlyph(char character)
+{
+    switch (character) {
+        case '0': return FONT_0;
+        case '1': return FONT_1;
+        case '2': return FONT_2;
+        case '3': return FONT_3;
+        case '4': return FONT_4;
+        case '5': return FONT_5;
+        case '6': return FONT_6;
+        case '7': return FONT_7;
+        case '8': return FONT_8;
+        case '9': return FONT_9;
+
+        case ':': return FONT_COLON;
+        case '.': return FONT_DOT;
+
+        case 'A': return FONT_A;
+        case 'E': return FONT_E;
+        case 'I': return FONT_I;
+        case 'M': return FONT_M;
+        case 'N': return FONT_N;
+        case 'O': return FONT_O;
+        case 'P': return FONT_P;
+        case 'R': return FONT_R;
+        case 'S': return FONT_S;
+        case 'T': return FONT_T;
+        case 'U': return FONT_U;
+        case 'W': return FONT_W;
+
+        case ' ':
+        default:
+            return FONT_SPACE;
+    }
+}
+
+static void OLED_WriteSmallText(
+    uint32_t page,
+    uint32_t column,
+    const char *text)
+{
+    uint8_t data[128];
+
+    uint32_t dataLength = 0U;
+    uint32_t characterIndex = 0U;
+    uint32_t glyphColumn;
+
+    const uint8_t *glyph;
+
+    while (
+        (text[characterIndex] != '\0') &&
+        ((dataLength + 6U) <= sizeof(data))
+    ) {
+        glyph =
+            OLED_GetGlyph(
+                text[characterIndex]);
+
+        for (glyphColumn = 0U;
+             glyphColumn < 5U;
+             glyphColumn++) {
+            data[dataLength++] =
+                glyph[glyphColumn];
+        }
+
+        data[dataLength++] = 0x00U;
+
+        characterIndex++;
+    }
+
+    OLED_SetPosition(
+        page,
+        column);
+
+    OLED_WriteDataBuffer(
+        data,
+        dataLength);
+}
+
+static void OLED_WriteBigText(
+    uint32_t startPage,
+    uint32_t column,
+    const char *text)
+{
+    uint8_t upperData[128];
+    uint8_t lowerData[128];
+
+    uint32_t dataLength = 0U;
+    uint32_t characterIndex = 0U;
+    uint32_t glyphColumn;
+    uint32_t row;
+
+    uint16_t expandedColumn;
+
+    const uint8_t *glyph;
+
+    while (
+        (text[characterIndex] != '\0') &&
+        ((dataLength + 12U) <= sizeof(upperData))
+    ) {
+        glyph =
+            OLED_GetGlyph(
+                text[characterIndex]);
+
+        for (glyphColumn = 0U;
+             glyphColumn < 5U;
+             glyphColumn++) {
+            expandedColumn = 0U;
+
+            for (row = 0U;
+                 row < 7U;
+                 row++) {
+                if (
+                    (glyph[glyphColumn] &
+                     (1U << row)) != 0U
+                ) {
+                    expandedColumn |=
+                        (uint16_t)(
+                            3U <<
+                            (row * 2U));
+                }
+            }
+
+            upperData[dataLength] =
+                (uint8_t)(
+                    expandedColumn &
+                    0xFFU);
+
+            lowerData[dataLength] =
+                (uint8_t)(
+                    (expandedColumn >> 8) &
+                    0xFFU);
+
+            dataLength++;
+
+            upperData[dataLength] =
+                (uint8_t)(
+                    expandedColumn &
+                    0xFFU);
+
+            lowerData[dataLength] =
+                (uint8_t)(
+                    (expandedColumn >> 8) &
+                    0xFFU);
+
+            dataLength++;
+        }
+
+        upperData[dataLength] = 0U;
+        lowerData[dataLength] = 0U;
+        dataLength++;
+
+        upperData[dataLength] = 0U;
+        lowerData[dataLength] = 0U;
+        dataLength++;
+
+        characterIndex++;
+    }
+
+    OLED_SetPosition(
+        startPage,
+        column);
+
+    OLED_WriteDataBuffer(
+        upperData,
+        dataLength);
+
+    OLED_SetPosition(
+        startPage + 1U,
+        column);
+
+    OLED_WriteDataBuffer(
+        lowerData,
+        dataLength);
+}
+
+/*==================================================
+ * 时间显示
+ *==================================================*/
+
+static void FormatMotionTime(
+    uint32_t timeMs,
+    char output[9])
+{
+    uint32_t minutes;
+    uint32_t seconds;
+    uint32_t centiseconds;
+
+    if (timeMs > MOTION_TIME_MAX_MS) {
+        timeMs = MOTION_TIME_MAX_MS;
+    }
+
+    minutes =
+        timeMs / 60000U;
+
+    seconds =
+        (timeMs / 1000U) % 60U;
+
+    centiseconds =
+        (timeMs / 10U) % 100U;
+
+    output[0] =
+        (char)(
+            '0' +
+            (minutes / 10U));
+
+    output[1] =
+        (char)(
+            '0' +
+            (minutes % 10U));
+
+    output[2] = ':';
+
+    output[3] =
+        (char)(
+            '0' +
+            (seconds / 10U));
+
+    output[4] =
+        (char)(
+            '0' +
+            (seconds % 10U));
+
+    output[5] = '.';
+
+    output[6] =
+        (char)(
+            '0' +
+            (centiseconds / 10U));
+
+    output[7] =
+        (char)(
+            '0' +
+            (centiseconds % 10U));
+
+    output[8] = '\0';
+}
+
+static void OLED_ShowMotionTime(void)
+{
+    uint32_t timeSnapshot;
+    uint32_t runningSnapshot;
+    uint32_t finishedSnapshot;
+
+    char timeText[9];
+
+    __disable_irq();
+
+    timeSnapshot =
+        g_motion_time_ms;
+
+    runningSnapshot =
+        g_motion_timer_running;
+
+    finishedSnapshot =
+        g_motion_timer_finished;
+
+    __enable_irq();
+
+    FormatMotionTime(
+        timeSnapshot,
+        timeText);
+
+    if (runningSnapshot != 0U) {
+        OLED_WriteSmallText(
+            2U,
+            49U,
+            "RUN  ");
+    } else if (finishedSnapshot != 0U) {
+        OLED_WriteSmallText(
+            2U,
+            49U,
+            "STOP ");
+    } else {
+        OLED_WriteSmallText(
+            2U,
+            49U,
+            "WAIT ");
+    }
+
+    OLED_WriteBigText(
+        4U,
+        16U,
+        timeText);
+}
+
+/*==================================================
+ * 电机控制
+ *==================================================*/
+
+static void LeftMotorEnable(void)
+{
+    DL_GPIO_setPins(
+        LEFT_EN_PORT,
+        LEFT_EN_PIN);
+}
+
+static void LeftMotorDisable(void)
+{
+    DL_GPIO_clearPins(
+        LEFT_EN_PORT,
+        LEFT_EN_PIN);
+}
+
+static void RightMotorEnable(void)
+{
+    DL_GPIO_setPins(
+        RIGHT_EN_PORT,
+        RIGHT_EN_PIN);
+}
+
+static void RightMotorDisable(void)
+{
+    DL_GPIO_clearPins(
+        RIGHT_EN_PORT,
+        RIGHT_EN_PIN);
+}
+
+static void MotorGPIOInit(void)
+{
+    DL_GPIO_clearPins(
+        GPIOA,
+        LEFT_IN2_PIN);
+
+    DL_GPIO_clearPins(
+        GPIOB,
+        LEFT_IN1_PIN |
+        LEFT_EN_PIN |
+        RIGHT_IN3_PIN |
+        RIGHT_IN4_PIN |
+        RIGHT_EN_PIN);
+
+    DL_GPIO_enableOutput(
+        GPIOA,
+        LEFT_IN2_PIN);
+
+    DL_GPIO_enableOutput(
+        GPIOB,
+        LEFT_IN1_PIN |
+        LEFT_EN_PIN |
+        RIGHT_IN3_PIN |
+        RIGHT_IN4_PIN |
+        RIGHT_EN_PIN);
+}
+
+static void MotorSetForwardDirection(void)
+{
+    LeftMotorDisable();
+    RightMotorDisable();
+
+#if LEFT_FORWARD_REVERSE == 0
+
+    DL_GPIO_clearPins(
+        LEFT_IN2_PORT,
+        LEFT_IN2_PIN);
+
+    DL_GPIO_setPins(
+        LEFT_IN1_PORT,
+        LEFT_IN1_PIN);
+
+#else
+
+    DL_GPIO_clearPins(
+        LEFT_IN1_PORT,
+        LEFT_IN1_PIN);
+
+    DL_GPIO_setPins(
+        LEFT_IN2_PORT,
+        LEFT_IN2_PIN);
+
+#endif
+
+#if RIGHT_FORWARD_REVERSE == 0
+
+    DL_GPIO_clearPins(
+        RIGHT_IN4_PORT,
+        RIGHT_IN4_PIN);
+
+    DL_GPIO_setPins(
+        RIGHT_IN3_PORT,
+        RIGHT_IN3_PIN);
+
+#else
+
+    DL_GPIO_clearPins(
+        RIGHT_IN3_PORT,
+        RIGHT_IN3_PIN);
+
+    DL_GPIO_setPins(
+        RIGHT_IN4_PORT,
+        RIGHT_IN4_PIN);
+
+#endif
+}
+
+static void MotorStop(void)
+{
+    MotionTimerStop();
+
+    s_motor_output_enabled = 0U;
+
+    g_left_target_pwm = 0;
+    g_right_target_pwm = 0;
+
+    g_left_pwm = 0;
+    g_right_pwm = 0;
+
+    LeftMotorDisable();
+    RightMotorDisable();
+}
+
+/*==================================================
+ * 八路传感器读取
+ *==================================================*/
+
+static uint32_t ReadSensorActive(
+    GPIO_Regs *port,
+    uint32_t pin)
+{
+    uint32_t isHigh;
+
+    isHigh =
+        ((DL_GPIO_readPins(port, pin) &
+          pin) != 0U)
+        ? 1U
+        : 0U;
+
+#if BLACK_IS_HIGH == 1
+
+    return isHigh;
+
+#else
+
+    return (isHigh == 0U) ? 1U : 0U;
+
+#endif
+}
+
+static void ReadLineSensors(
+    uint32_t *sensorMask,
+    uint32_t *activeCount,
+    int32_t *lineError)
+{
+    uint32_t sensor[8];
+
+    uint32_t mask = 0U;
+    uint32_t count = 0U;
+    uint32_t i;
+
+    int32_t weightedSum = 0;
+
+    static const int32_t positionWeight[8] = {
+        -700,
+        -500,
+        -300,
+        -100,
+         100,
+         300,
+         500,
+         700
+    };
+
+    sensor[7] =
+        ReadSensorActive(
+            TRACK_X1_PORT,
+            TRACK_X1_PIN);
+
+    sensor[6] =
+        ReadSensorActive(
+            TRACK_X2_PORT,
+            TRACK_X2_PIN);
+
+    sensor[5] =
+        ReadSensorActive(
+            TRACK_X3_PORT,
+            TRACK_X3_PIN);
+
+    sensor[4] =
+        ReadSensorActive(
+            TRACK_X4_PORT,
+            TRACK_X4_PIN);
+
+    sensor[3] =
+        ReadSensorActive(
+            TRACK_X5_PORT,
+            TRACK_X5_PIN);
+
+    sensor[2] =
+        ReadSensorActive(
+            TRACK_X6_PORT,
+            TRACK_X6_PIN);
+
+    sensor[1] =
+        ReadSensorActive(
+            TRACK_X7_PORT,
+            TRACK_X7_PIN);
+
+    sensor[0] =
+        ReadSensorActive(
+            TRACK_X8_PORT,
+            TRACK_X8_PIN);
+
+    for (i = 0U;
+         i < 8U;
+         i++) {
+        if (sensor[i] != 0U) {
+            uint32_t logicalIndex;
+
+            mask |=
+                (1UL << i);
+
+            count++;
+
+#if LINE_SENSOR_REVERSE == 0
+
+            logicalIndex = i;
+
+#else
+
+            logicalIndex = 7U - i;
+
+#endif
+
+            weightedSum +=
+                positionWeight[logicalIndex];
+        }
+    }
+
+    *sensorMask = mask;
+    *activeCount = count;
+
+    if (count != 0U) {
+        *lineError =
+            weightedSum /
+            (int32_t)count;
+    }
+}
+
+/*==================================================
+ * 弯道增强
+ *==================================================*/
+
+static int32_t CalculateCurveBoost(int32_t error)
+{
+    int32_t boost = 0;
+    int32_t absoluteError;
+
+    absoluteError =
+        AbsInt32(error);
+
+    if (
+        absoluteError >=
+        LARGE_CURVE_ERROR
+    ) {
+        boost =
+            LARGE_CURVE_BOOST;
+    } else if (
+        absoluteError >=
+        MEDIUM_CURVE_ERROR
+    ) {
+        boost =
+            MEDIUM_CURVE_BOOST;
+    }
+
+    return (error < 0)
+        ? -boost
+        : boost;
+}
+
+/*==================================================
+ * 循迹控制
+ *==================================================*/
+
+static void LineControlUpdate(void)
+{
+    uint32_t sensorMask;
+    uint32_t activeCount;
+
+    int32_t rawError =
+        g_line_error;
+
+    int32_t previousFilteredError;
+    int32_t correction;
+    int32_t curveBoost;
+
+    int32_t leftBasePWM;
+    int32_t rightBasePWM;
+
+    int32_t leftCorrection;
+    int32_t rightCorrection;
+
+    int32_t leftTarget;
+    int32_t rightTarget;
+
+    /*
+     * 已经触发终点停车，
+     * 始终保持停止。
+     */
+    if (g_stop_line_latched != 0U) {
+        g_run_state =
+            RUN_STATE_STOP_LINE;
+
+        DL_GPIO_clearPins(
+            STATUS_LED_PORT,
+            STATUS_LED_PIN);
+
+        MotorStop();
+
+        return;
+    }
+
+    ReadLineSensors(
+        &sensorMask,
+        &activeCount,
+        &rawError);
+
+    g_sensor_mask =
+        sensorMask;
+
+    g_active_sensor_count =
+        activeCount;
+
+#if STOP_LINE_ENABLE == 1U
+
+    /*
+     * 至少4路同时检测到黑线，
+     * 立即停车并锁存。
+     */
+    if (
+        activeCount >=
+        STOP_BLACK_SENSOR_COUNT
+    ) {
+        g_stop_line_latched = 1U;
+
+        g_run_state =
+            RUN_STATE_STOP_LINE;
+
+        g_line_lost_cycles = 0U;
+
+        DL_GPIO_clearPins(
+            STATUS_LED_PORT,
+            STATUS_LED_PIN);
+
+        MotorStop();
+
+        s_oled_refresh_due = 1U;
+
+        return;
+    }
+
+#endif
+
+    /*
+     * 没有检测到黑线。
+     */
+    if (activeCount == 0U) {
+        if (g_seen_line_once == 0U) {
+            g_run_state =
+                RUN_STATE_WAIT_LINE;
+
+            DL_GPIO_clearPins(
+                STATUS_LED_PORT,
+                STATUS_LED_PIN);
+
+            MotorStop();
+
+            return;
+        }
+
+        /*
+         * 短暂丢线，
+         * 保持最后PWM 100ms。
+         */
+        if (
+            (s_motor_output_enabled != 0U) &&
+            (g_line_lost_cycles <
+             LINE_LOST_HOLD_CYCLES)
+        ) {
+            g_line_lost_cycles++;
+
+            g_run_state =
+                RUN_STATE_LINE_LOST_HOLD;
+
+            return;
+        }
+
+        /*
+         * 丢线超过100ms停车。
+         */
+        g_run_state =
+            RUN_STATE_LINE_LOST_STOP;
+
+        g_line_lost_cycles =
+            LINE_LOST_HOLD_CYCLES;
+
+        DL_GPIO_clearPins(
+            STATUS_LED_PORT,
+            STATUS_LED_PIN);
+
+        MotorStop();
+
+        return;
+    }
+
+    /*
+     * 检测到正常黑线。
+     */
+    g_line_lost_cycles = 0U;
+    g_seen_line_once = 1U;
+
+    g_run_state =
+        RUN_STATE_TRACKING;
+
+    g_line_error =
+        rawError;
+
+    DL_GPIO_setPins(
+        STATUS_LED_PORT,
+        STATUS_LED_PIN);
+
+    /*
+     * 第一次开始运动时开始计时。
+     */
+    MotionTimerStartOnce();
+
+    /*
+     * 原误差滤波。
+     */
+    previousFilteredError =
+        g_filtered_error;
+
+    g_filtered_error =
+        (previousFilteredError +
+         rawError) / 2;
+
+    g_error_derivative =
+        g_filtered_error -
+        previousFilteredError;
+
+    /*
+     * 原PD控制。
+     */
+    if (
+        AbsInt32(g_filtered_error) <=
+        LINE_CENTER_DEADBAND
+    ) {
+        correction = 0;
+    } else {
+        correction =
+            (g_filtered_error *
+             LINE_KP_NUM) /
+            LINE_KP_DEN;
+
+        correction +=
+            (g_error_derivative *
+             LINE_KD_NUM) /
+            LINE_KD_DEN;
+
+        curveBoost =
+            CalculateCurveBoost(
+                g_filtered_error);
+
+        correction +=
+            curveBoost;
+    }
+
+#if STEERING_REVERSE == 1
+
+    correction =
+        -correction;
+
+#endif
+
+    /*
+     * 根据误差选择直线、中弯或大弯基础速度。
+     */
+    if (
+        AbsInt32(g_filtered_error) >=
+        LARGE_CURVE_ERROR
+    ) {
+        leftBasePWM =
+            LEFT_LARGE_CURVE_PWM;
+
+        rightBasePWM =
+            RIGHT_LARGE_CURVE_PWM;
+    } else if (
+        AbsInt32(g_filtered_error) >=
+        MEDIUM_CURVE_ERROR
+    ) {
+        leftBasePWM =
+            LEFT_MEDIUM_CURVE_PWM;
+
+        rightBasePWM =
+            RIGHT_MEDIUM_CURVE_PWM;
+    } else {
+        leftBasePWM =
+            LEFT_STRAIGHT_PWM;
+
+        rightBasePWM =
+            RIGHT_STRAIGHT_PWM;
+    }
+
+    g_left_base_pwm =
+        leftBasePWM;
+
+    g_right_base_pwm =
+        rightBasePWM;
+
+    /*
+     * 左右轮分别计算修正量。
+     */
+    leftCorrection =
+        (correction *
+         LEFT_CORRECTION_NUM) /
+        LEFT_CORRECTION_DEN;
+
+    rightCorrection =
+        (correction *
+         RIGHT_CORRECTION_NUM) /
+        RIGHT_CORRECTION_DEN;
+
+    /*
+     * 分别限制左右轮最大修正量。
+     */
+    leftCorrection =
+        ClampInt32(
+            leftCorrection,
+            -LEFT_MAX_CORRECTION,
+            LEFT_MAX_CORRECTION);
+
+    rightCorrection =
+        ClampInt32(
+            rightCorrection,
+            -RIGHT_MAX_CORRECTION,
+            RIGHT_MAX_CORRECTION);
+
+    g_steering_correction =
+        correction;
+
+    g_left_correction =
+        leftCorrection;
+
+    g_right_correction =
+        rightCorrection;
+
+    /*
+     * 双轮差速。
+     *
+     * correction > 0：
+     *   左轮加速，右轮减速。
+     *
+     * correction < 0：
+     *   左轮减速，右轮加速。
+     */
+    leftTarget =
+        leftBasePWM +
+        leftCorrection;
+
+    rightTarget =
+        rightBasePWM -
+        rightCorrection;
+
+    /*
+     * 左右轮分别限制PWM。
+     */
+    leftTarget =
+        ClampInt32(
+            leftTarget,
+            LEFT_MOTOR_MIN_PWM,
+            LEFT_MOTOR_MAX_PWM);
+
+    rightTarget =
+        ClampInt32(
+            rightTarget,
+            RIGHT_MOTOR_MIN_PWM,
+            RIGHT_MOTOR_MAX_PWM);
+
+    g_left_target_pwm =
+        leftTarget;
+
+    g_right_target_pwm =
+        rightTarget;
+
+    /*
+     * 左右轮分别进行PWM平滑变化。
+     */
+    g_left_pwm =
+        MoveToward(
+            g_left_pwm,
+            leftTarget,
+            LEFT_PWM_CHANGE_LIMIT);
+
+    g_right_pwm =
+        MoveToward(
+            g_right_pwm,
+            rightTarget,
+            RIGHT_PWM_CHANGE_LIMIT);
+
+    s_motor_output_enabled = 1U;
+}
+
+/*==================================================
+ * SysTick中断
+ *==================================================*/
+
+void SysTick_Handler(void)
+{
+    g_systick_heartbeat++;
+
+    /*
+     * 计时：
+     *
+     * 10次SysTick = 1ms
+     */
+    if (g_motion_timer_running != 0U) {
+        s_motion_ms_divider++;
+
+        if (s_motion_ms_divider >= 10U) {
+            s_motion_ms_divider = 0U;
+
+            if (
+                g_motion_time_ms <
+                MOTION_TIME_MAX_MS
+            ) {
+                g_motion_time_ms++;
+            }
+        }
+    }
+
+    /*
+     * 每100ms刷新OLED。
+     */
+    s_oled_refresh_tick++;
+
+    if (
+        s_oled_refresh_tick >=
+        OLED_REFRESH_TICKS
+    ) {
+        s_oled_refresh_tick = 0U;
+        s_oled_refresh_due = 1U;
+    }
+
+    /*
+     * 软件PWM。
+     */
+    s_pwm_phase++;
+
+    if (
+        s_pwm_phase >=
+        PWM_PERIOD_COUNT
+    ) {
+        s_pwm_phase = 0U;
+    }
+
+    if (s_motor_output_enabled == 0U) {
+        LeftMotorDisable();
+        RightMotorDisable();
+    } else {
+        if (
+            s_pwm_phase <
+            (uint32_t)g_left_pwm
+        ) {
+            LeftMotorEnable();
+        } else {
+            LeftMotorDisable();
+        }
+
+        if (
+            s_pwm_phase <
+            (uint32_t)g_right_pwm
+        ) {
+            RightMotorEnable();
+        } else {
+            RightMotorDisable();
+        }
+    }
+
+    /*
+     * 每5ms进行一次循迹控制。
+     */
+    s_control_tick++;
+
+    if (
+        s_control_tick >=
+        CONTROL_INTERVAL_TICKS
+    ) {
+        s_control_tick = 0U;
+        s_control_due = 1U;
+    }
+}
+
+/*==================================================
+ * 主函数
+ *==================================================*/
+
+int main(void)
+{
+    uint32_t systickResult;
+
+    SYSCFG_DL_init();
+
+    MotorGPIOInit();
+
+    MotorSetForwardDirection();
+
+    MotorStop();
+
+    /*
+     * 初始化OLED：
+     *
+     * SDA = PA0
+     * SCL = PA1
+     */
+    OLED_Init();
+
+    /*
+     * 固定标题。
+     */
+    OLED_WriteSmallText(
+        0U,
+        52U,
+        "TIME");
+
+    /*
+     * 初始显示：
+     *
+     * TIME
+     * WAIT
+     * 00:00.00
+     */
+    OLED_ShowMotionTime();
+
+    DL_GPIO_clearPins(
+        STATUS_LED_PORT,
+        STATUS_LED_PIN);
+
+    g_run_state =
+        RUN_STATE_INIT;
+
+    systickResult =
+        SysTick_Config(
+            CPUCLK_FREQ /
+            SYSTICK_FREQUENCY_HZ);
+
+    if (systickResult != 0U) {
+        g_run_state =
+            RUN_STATE_SYSTICK_ERROR;
+
+        MotorStop();
+
+        g_motion_timer_finished = 1U;
+
+        OLED_ShowMotionTime();
+
+        while (1) {
+            __WFI();
+        }
+    }
+
+    /*
+     * 保留原来的上电等待2秒。
+     */
+    delay_cycles(
+        CPUCLK_FREQ * 2U);
+
+    g_run_state =
+        RUN_STATE_WAIT_LINE;
+
+    while (1) {
+        /*
+         * 循迹控制。
+         */
+        if (s_control_due != 0U) {
+            __disable_irq();
+
+            s_control_due = 0U;
+
+            __enable_irq();
+
+            LineControlUpdate();
+        }
+
+        /*
+         * OLED刷新。
+         */
+        if (s_oled_refresh_due != 0U) {
+            __disable_irq();
+
+            s_oled_refresh_due = 0U;
+
+            __enable_irq();
+
+            OLED_ShowMotionTime();
+        }
+
+        __WFI();
+    }
+}
