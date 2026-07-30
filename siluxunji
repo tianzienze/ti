@@ -1,0 +1,2262 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ *============================================================
+ * MSPM0G3507 + 四路红外循迹 + 双路直流电机
+ *============================================================
+ *
+ * 四路传感器实际物理顺序：
+ *
+ * 小车左侧                                  小车右侧
+ *
+ * S1              S2              S3              S4
+ * X4              X3              X2              X1
+ * PA17            PA18            PB19            PA21
+ *
+ * 模块输出：
+ *
+ * 低电平 = 黑线
+ * 高电平 = 白色
+ *
+ * 电机：
+ *
+ * 电机A：
+ * IN1 = PB2
+ * IN2 = PA7
+ * ENA = PB8
+ *
+ * 电机B：
+ * IN3 = PB9
+ * IN4 = PB14
+ * ENB = PB7
+ *
+ * 本程序功能：
+ *
+ * 1. 上电后等待300ms。
+ * 2. 检测到黑线后开始循迹。
+ * 3. 使用手册中的四路真值表控制方向。
+ * 4. 检测不到黑线时，保持丢线前的方向继续寻找。
+ * 5. 使用软件PWM控制速度。
+ * 6. 带速度渐变，避免电机突然全速和一冲一冲。
+ *
+ *============================================================
+ */
+
+
+/*============================================================
+ * 系统参数
+ *============================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                     (32000000UL)
+#endif
+
+/*
+ * SysTick频率为10kHz：
+ *
+ * 每个中断周期 = 0.1ms
+ * PWM周期       = 100个中断
+ * PWM频率       = 100Hz
+ */
+#define SYSTICK_FREQUENCY_HZ            (10000U)
+#define PWM_PERIOD_COUNT                (100U)
+
+/*
+ * 每50个SysTick运行一次循迹控制：
+ *
+ * 50 × 0.1ms = 5ms
+ */
+#define CONTROL_INTERVAL_TICKS          (50U)
+
+
+/*============================================================
+ * 用户可调参数
+ *============================================================*/
+
+/*
+ * 黑线电平。
+ *
+ * 手册规定：
+ * 低电平 = 黑线
+ *
+ * 如果你实际测试发现黑线为高电平，改成0。
+ */
+#define BLACK_IS_LOW                    (1)
+
+
+/*
+ * 传感器安装方向。
+ *
+ * 当前代码已经按照：
+ *
+ * 左 -> 右
+ * X4、X3、X2、X1
+ *
+ * 排列。
+ *
+ * 如果实际安装完全相反，改成1。
+ */
+#define LINE_SENSOR_REVERSE             (0)
+
+
+/*
+ * 转向方向修正。
+ *
+ * 如果左侧检测到黑线，小车却向右转，
+ * 将此参数改成1。
+ */
+#define STEERING_REVERSE                (0)
+
+
+/*
+ * 电机A是否为左轮。
+ *
+ * 1：
+ * 电机A = 左轮
+ * 电机B = 右轮
+ *
+ * 0：
+ * 电机A = 右轮
+ * 电机B = 左轮
+ */
+#define MOTOR_A_IS_LEFT                 (1)
+
+
+/*
+ * 单独修正电机转向。
+ *
+ * 如果小车前进指令下某个轮子反转，
+ * 将对应参数在0和1之间切换。
+ */
+#define MOTOR_A_REVERSED                (0)
+#define MOTOR_B_REVERSED                (0)
+
+
+/*
+ * 丢线处理：
+ *
+ * 0 = 检测不到黑线立即停车
+ * 1 = 保持丢线前的方向继续寻找黑线
+ *
+ * 当前按照你之前的要求设置为1。
+ */
+#define LOST_LINE_MODE                  (1)
+
+
+/*
+ * 上电时必须先检测到黑线才允许启动。
+ *
+ * 这样小车放在全白区域上电时不会直接冲出去。
+ */
+#define START_ONLY_AFTER_LINE_FOUND     (1)
+
+
+/*
+ * 左右电机补偿。
+ *
+ * 某个轮子明显较慢，可以增加对应数值。
+ *
+ * 例如左轮较慢：
+ *
+ * LEFT_MOTOR_TRIM = 2
+ */
+#define LEFT_MOTOR_TRIM                 (0)
+#define RIGHT_MOTOR_TRIM                (0)
+
+
+/*
+ * 基础直行速度。
+ *
+ * 范围0~100。
+ * 建议先使用25~35测试。
+ */
+#define LEFT_BASE_PWM                   (16)
+#define RIGHT_BASE_PWM                  (16)
+
+
+/*
+ * 微调速度。
+ *
+ * 左微调：
+ * 左轮较慢，右轮较快。
+ *
+ * 右微调：
+ * 左轮较快，右轮较慢。
+ */
+#define MICRO_INNER_PWM                 (15)
+#define MICRO_OUTER_PWM                 (17)
+
+
+/*
+ * 大弯速度。
+ *
+ * 内侧轮停止，外侧轮转动。
+ */
+#define BIG_TURN_INNER_PWM              (10)
+#define BIG_TURN_OUTER_PWM              (22)
+
+
+/*
+ * 直角弯速度。
+ *
+ * 内侧轮反转，外侧轮正转。
+ *
+ * SHARP_REVERSE_PWM不要设置太大，
+ * 否则小车容易原地快速旋转。
+ */
+#define SHARP_REVERSE_PWM               (12)
+#define SHARP_FORWARD_PWM               (20)
+
+
+/*
+ * 每5ms允许PWM变化的最大值。
+ *
+ * 数值越小越平滑，但响应越慢。
+ * 数值越大响应越快，但更容易顿挫。
+ */
+#define PWM_RAMP_STEP                   (2)
+
+
+/*
+ * 传感器状态连续出现多少次才接受。
+ *
+ * 控制周期为5ms：
+ *
+ * 2次 = 10ms滤波
+ * 3次 = 15ms滤波
+ */
+#define TRACK_FILTER_SAMPLES            (3U)
+
+
+/*
+ * 转弯退出缓冲：
+ *
+ * 大弯或直角弯结束后，不立刻恢复普通微调。
+ * 先用较小的左右速度差稳定一段时间，
+ * 防止传感器在中线两侧来回切换导致小车摇头。
+ */
+#define TURN_EXIT_RECOVERY_ENABLE       (1)
+
+#define TURN_EXIT_MIN_TIME_MS           (150U)
+#define TURN_EXIT_MAX_TIME_MS           (500U)
+#define TURN_EXIT_CENTER_SAMPLES        (6U)
+
+#define TURN_EXIT_STRAIGHT_PWM          (15)
+#define TURN_EXIT_MICRO_INNER_PWM       (15)
+#define TURN_EXIT_MICRO_OUTER_PWM       (16)
+
+
+/*
+ * 中线锁定：
+ *
+ * 当中间两路同时检测到黑线（1001）时，认为车身已经回到
+ * 赛道中央。此时左右轮使用接近相同的速度，不再因为一次
+ * 左微调/右微调信号就立刻大幅改变两轮速度。
+ *
+ * 只有同一侧微调状态连续出现若干次后，才使用1个PWM的
+ * 很小速度差进行修正。大弯和直角弯仍然立即响应。
+ */
+#define CENTER_LOCK_ENABLE              (1)
+
+/* 离开1001后，继续保持中线锁定的时间 */
+#define CENTER_LOCK_HOLD_MS             (100U)
+
+/* 同一侧微调连续出现4次（约20ms）后才修正 */
+#define CENTER_MICRO_CONFIRM_SAMPLES    (3U)
+
+/* 中间两路都在黑线上时的左右轮直行速度 */
+#define CENTER_STRAIGHT_LEFT_PWM        (16)
+#define CENTER_STRAIGHT_RIGHT_PWM       (16)
+
+/* 中线锁定期间的轻微修正，速度差只有1 */
+#define CENTER_MICRO_INNER_PWM          (15)
+#define CENTER_MICRO_OUTER_PWM          (16)
+
+
+/*
+ * LED有效电平。
+ *
+ * 1 = PA5输出高电平时点亮
+ * 0 = PA5输出低电平时点亮
+ */
+#define LED_ACTIVE_HIGH                 (1)
+
+
+/*============================================================
+ * 引脚定义
+ *============================================================*/
+
+/* 电机A */
+#define MOTOR_A_IN1_PORT                (GPIOB)
+#define MOTOR_A_IN1_PIN                 (DL_GPIO_PIN_2)
+
+#define MOTOR_A_IN2_PORT                (GPIOA)
+#define MOTOR_A_IN2_PIN                 (DL_GPIO_PIN_7)
+
+#define MOTOR_A_EN_PORT                 (GPIOB)
+#define MOTOR_A_EN_PIN                  (DL_GPIO_PIN_8)
+
+
+/* 电机B */
+#define MOTOR_B_IN1_PORT                (GPIOB)
+#define MOTOR_B_IN1_PIN                 (DL_GPIO_PIN_9)
+
+#define MOTOR_B_IN2_PORT                (GPIOB)
+#define MOTOR_B_IN2_PIN                 (DL_GPIO_PIN_14)
+
+#define MOTOR_B_EN_PORT                 (GPIOB)
+#define MOTOR_B_EN_PIN                  (DL_GPIO_PIN_7)
+
+
+/* 四路循迹传感器 */
+#define TRACK_X1_PORT                   (GPIOA)
+#define TRACK_X1_PIN                    (DL_GPIO_PIN_21)
+
+#define TRACK_X2_PORT                   (GPIOB)
+#define TRACK_X2_PIN                    (DL_GPIO_PIN_19)
+
+#define TRACK_X3_PORT                   (GPIOA)
+#define TRACK_X3_PIN                    (DL_GPIO_PIN_18)
+
+#define TRACK_X4_PORT                   (GPIOA)
+#define TRACK_X4_PIN                    (DL_GPIO_PIN_17)
+
+
+/* 调试LED */
+#define STATUS_LED_PORT                 (GPIOA)
+#define STATUS_LED_PIN                  (DL_GPIO_PIN_5)
+
+
+/*============================================================
+ * 循迹状态
+ *============================================================*/
+
+typedef enum
+{
+    TRACK_DIRECTION_STRAIGHT = 0,
+
+    TRACK_DIRECTION_LEFT_MICRO,
+    TRACK_DIRECTION_LEFT_BIG,
+    TRACK_DIRECTION_LEFT_SHARP,
+
+    TRACK_DIRECTION_RIGHT_MICRO,
+    TRACK_DIRECTION_RIGHT_BIG,
+    TRACK_DIRECTION_RIGHT_SHARP
+
+} TrackDirection;
+
+
+/*============================================================
+ * 全局调试变量
+ *
+ * 可以在CCS Expressions窗口观察。
+ *============================================================*/
+
+/*
+ * 传感器黑线状态：
+ *
+ * 1 = 检测到黑线
+ * 0 = 没检测到黑线
+ */
+volatile uint8_t g_black_s1 = 0U;
+volatile uint8_t g_black_s2 = 0U;
+volatile uint8_t g_black_s3 = 0U;
+volatile uint8_t g_black_s4 = 0U;
+
+
+/*
+ * 按照手册格式保存的四位状态：
+ *
+ * bit3 = S1
+ * bit2 = S2
+ * bit1 = S3
+ * bit0 = S4
+ *
+ * 注意：
+ * 这里仍然使用手册的：
+ *
+ * 0 = 黑线
+ * 1 = 白色
+ *
+ * 例如：
+ *
+ * 0x09 = 1001 = 直行
+ * 0x0B = 1011 = 左微调
+ * 0x0D = 1101 = 右微调
+ * 0x07 = 0111 = 左大弯
+ * 0x0E = 1110 = 右大弯
+ * 0x0F = 1111 = 丢线
+ */
+volatile uint8_t g_track_pattern = 0x0FU;
+
+
+/* 电机目标PWM，范围-100~100 */
+volatile int16_t g_left_target_pwm  = 0;
+volatile int16_t g_right_target_pwm = 0;
+
+
+/* 电机实际输出PWM，范围-100~100 */
+volatile int16_t g_left_output_pwm  = 0;
+volatile int16_t g_right_output_pwm = 0;
+
+
+/* 上一次有效循迹指令 */
+volatile int16_t g_last_valid_left_pwm  = 0;
+volatile int16_t g_last_valid_right_pwm = 0;
+
+
+/* 上一次循迹方向 */
+volatile TrackDirection g_last_direction =
+    TRACK_DIRECTION_STRAIGHT;
+
+
+/*
+ * 转弯结束后的稳定状态。
+ *
+ * 1 = 正处于转弯退出缓冲
+ * 0 = 正常循迹
+ */
+volatile uint8_t g_turn_exit_recovery_active = 0U;
+volatile uint32_t g_turn_exit_start_ms = 0U;
+volatile uint8_t g_turn_exit_center_count = 0U;
+
+
+/*
+ * 中线锁定调试变量。
+ *
+ * g_center_lock_active = 1：当前处于中线稳定模式。
+ * g_center_micro_count：同一侧微调连续出现次数。
+ */
+volatile uint8_t g_center_lock_active = 0U;
+volatile uint32_t g_center_last_seen_ms = 0U;
+volatile uint8_t g_center_micro_candidate = 0xFFU;
+volatile uint8_t g_center_micro_count = 0U;
+
+
+/* 是否已经检测到过黑线 */
+volatile uint8_t g_line_has_been_found = 0U;
+
+
+/* 系统时间 */
+volatile uint32_t g_system_ms = 0U;
+
+
+/* 主循环控制标志 */
+volatile uint8_t g_control_due = 0U;
+
+
+/*============================================================
+ * 函数声明
+ *============================================================*/
+
+static int16_t ClampPWM(int16_t pwm);
+
+static void HardwareMotorStop(void);
+
+static void ApplyMotorA(
+    int16_t command,
+    uint16_t pwmPhase
+);
+
+static void ApplyMotorB(
+    int16_t command,
+    uint16_t pwmPhase
+);
+
+static void ApplyMotorOutputs(
+    uint16_t pwmPhase
+);
+
+static uint8_t ConvertToWhiteBit(
+    uint8_t rawHigh
+);
+
+static uint8_t ReadTrackPattern(void);
+
+static uint8_t FilterTrackPattern(
+    uint8_t rawPattern
+);
+
+static void SetStatusLED(
+    uint8_t enabled
+);
+
+static int16_t AddMotorTrim(
+    int16_t command,
+    int16_t trim
+);
+
+static void SetMotorTarget(
+    int16_t leftPWM,
+    int16_t rightPWM,
+    uint8_t rememberCommand
+);
+
+static int16_t RampPWM(
+    int16_t current,
+    int16_t target
+);
+
+static void UpdateMotorRamp(void);
+
+static uint8_t IsStrongTurnPattern(
+    uint8_t pattern
+);
+
+static void CancelCenterLock(void);
+
+static void ControlCenterStraight(void);
+
+static uint8_t HandleCenterLock(
+    uint8_t pattern
+);
+
+static uint8_t IsStrongTurnDirection(
+    TrackDirection direction
+);
+
+static void CancelTurnExitRecovery(void);
+
+static uint8_t HandleTurnExitRecovery(
+    uint8_t pattern
+);
+
+static void ControlStraight(void);
+static void ControlLeftMicro(void);
+static void ControlRightMicro(void);
+static void ControlLeftBig(void);
+static void ControlRightBig(void);
+static void ControlLeftSharp(void);
+static void ControlRightSharp(void);
+
+static void HandleLostLine(void);
+
+static void HandleUnknownPattern(
+    uint8_t pattern
+);
+
+static void TrackControl(
+    uint8_t pattern
+);
+
+static void DelayMs(
+    uint32_t delayMs
+);
+
+
+/*============================================================
+ * PWM限幅
+ *============================================================*/
+
+static int16_t ClampPWM(int16_t pwm)
+{
+    if (pwm > 100)
+    {
+        return 100;
+    }
+
+    if (pwm < -100)
+    {
+        return -100;
+    }
+
+    return pwm;
+}
+
+
+/*============================================================
+ * 立即关闭两个电机
+ *============================================================*/
+
+static void HardwareMotorStop(void)
+{
+    /* 先关闭使能 */
+    DL_GPIO_clearPins(
+        MOTOR_A_EN_PORT,
+        MOTOR_A_EN_PIN
+    );
+
+    DL_GPIO_clearPins(
+        MOTOR_B_EN_PORT,
+        MOTOR_B_EN_PIN
+    );
+
+    /* 再关闭方向引脚 */
+    DL_GPIO_clearPins(
+        MOTOR_A_IN1_PORT,
+        MOTOR_A_IN1_PIN
+    );
+
+    DL_GPIO_clearPins(
+        MOTOR_A_IN2_PORT,
+        MOTOR_A_IN2_PIN
+    );
+
+    DL_GPIO_clearPins(
+        MOTOR_B_IN1_PORT,
+        MOTOR_B_IN1_PIN
+    );
+
+    DL_GPIO_clearPins(
+        MOTOR_B_IN2_PORT,
+        MOTOR_B_IN2_PIN
+    );
+}
+
+
+/*============================================================
+ * 电机A软件PWM输出
+ *============================================================*/
+
+static void ApplyMotorA(
+    int16_t command,
+    uint16_t pwmPhase
+)
+{
+    uint16_t magnitude;
+
+    command = ClampPWM(command);
+
+    if (command == 0)
+    {
+        DL_GPIO_clearPins(
+            MOTOR_A_EN_PORT,
+            MOTOR_A_EN_PIN
+        );
+
+        DL_GPIO_clearPins(
+            MOTOR_A_IN1_PORT,
+            MOTOR_A_IN1_PIN
+        );
+
+        DL_GPIO_clearPins(
+            MOTOR_A_IN2_PORT,
+            MOTOR_A_IN2_PIN
+        );
+
+        return;
+    }
+
+    if (command > 0)
+    {
+        magnitude = (uint16_t)command;
+
+#if MOTOR_A_REVERSED
+
+        DL_GPIO_clearPins(
+            MOTOR_A_IN1_PORT,
+            MOTOR_A_IN1_PIN
+        );
+
+        DL_GPIO_setPins(
+            MOTOR_A_IN2_PORT,
+            MOTOR_A_IN2_PIN
+        );
+
+#else
+
+        DL_GPIO_setPins(
+            MOTOR_A_IN1_PORT,
+            MOTOR_A_IN1_PIN
+        );
+
+        DL_GPIO_clearPins(
+            MOTOR_A_IN2_PORT,
+            MOTOR_A_IN2_PIN
+        );
+
+#endif
+    }
+    else
+    {
+        magnitude = (uint16_t)(-command);
+
+#if MOTOR_A_REVERSED
+
+        DL_GPIO_setPins(
+            MOTOR_A_IN1_PORT,
+            MOTOR_A_IN1_PIN
+        );
+
+        DL_GPIO_clearPins(
+            MOTOR_A_IN2_PORT,
+            MOTOR_A_IN2_PIN
+        );
+
+#else
+
+        DL_GPIO_clearPins(
+            MOTOR_A_IN1_PORT,
+            MOTOR_A_IN1_PIN
+        );
+
+        DL_GPIO_setPins(
+            MOTOR_A_IN2_PORT,
+            MOTOR_A_IN2_PIN
+        );
+
+#endif
+    }
+
+    if (pwmPhase < magnitude)
+    {
+        DL_GPIO_setPins(
+            MOTOR_A_EN_PORT,
+            MOTOR_A_EN_PIN
+        );
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            MOTOR_A_EN_PORT,
+            MOTOR_A_EN_PIN
+        );
+    }
+}
+
+
+/*============================================================
+ * 电机B软件PWM输出
+ *============================================================*/
+
+static void ApplyMotorB(
+    int16_t command,
+    uint16_t pwmPhase
+)
+{
+    uint16_t magnitude;
+
+    command = ClampPWM(command);
+
+    if (command == 0)
+    {
+        DL_GPIO_clearPins(
+            MOTOR_B_EN_PORT,
+            MOTOR_B_EN_PIN
+        );
+
+        DL_GPIO_clearPins(
+            MOTOR_B_IN1_PORT,
+            MOTOR_B_IN1_PIN
+        );
+
+        DL_GPIO_clearPins(
+            MOTOR_B_IN2_PORT,
+            MOTOR_B_IN2_PIN
+        );
+
+        return;
+    }
+
+    if (command > 0)
+    {
+        magnitude = (uint16_t)command;
+
+#if MOTOR_B_REVERSED
+
+        DL_GPIO_clearPins(
+            MOTOR_B_IN1_PORT,
+            MOTOR_B_IN1_PIN
+        );
+
+        DL_GPIO_setPins(
+            MOTOR_B_IN2_PORT,
+            MOTOR_B_IN2_PIN
+        );
+
+#else
+
+        DL_GPIO_setPins(
+            MOTOR_B_IN1_PORT,
+            MOTOR_B_IN1_PIN
+        );
+
+        DL_GPIO_clearPins(
+            MOTOR_B_IN2_PORT,
+            MOTOR_B_IN2_PIN
+        );
+
+#endif
+    }
+    else
+    {
+        magnitude = (uint16_t)(-command);
+
+#if MOTOR_B_REVERSED
+
+        DL_GPIO_setPins(
+            MOTOR_B_IN1_PORT,
+            MOTOR_B_IN1_PIN
+        );
+
+        DL_GPIO_clearPins(
+            MOTOR_B_IN2_PORT,
+            MOTOR_B_IN2_PIN
+        );
+
+#else
+
+        DL_GPIO_clearPins(
+            MOTOR_B_IN1_PORT,
+            MOTOR_B_IN1_PIN
+        );
+
+        DL_GPIO_setPins(
+            MOTOR_B_IN2_PORT,
+            MOTOR_B_IN2_PIN
+        );
+
+#endif
+    }
+
+    if (pwmPhase < magnitude)
+    {
+        DL_GPIO_setPins(
+            MOTOR_B_EN_PORT,
+            MOTOR_B_EN_PIN
+        );
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            MOTOR_B_EN_PORT,
+            MOTOR_B_EN_PIN
+        );
+    }
+}
+
+
+/*============================================================
+ * 按照左右轮关系输出电机
+ *============================================================*/
+
+static void ApplyMotorOutputs(
+    uint16_t pwmPhase
+)
+{
+#if MOTOR_A_IS_LEFT
+
+    ApplyMotorA(
+        g_left_output_pwm,
+        pwmPhase
+    );
+
+    ApplyMotorB(
+        g_right_output_pwm,
+        pwmPhase
+    );
+
+#else
+
+    ApplyMotorA(
+        g_right_output_pwm,
+        pwmPhase
+    );
+
+    ApplyMotorB(
+        g_left_output_pwm,
+        pwmPhase
+    );
+
+#endif
+}
+
+
+/*============================================================
+ * 将原始电平转换成手册中的格式
+ *
+ * 返回：
+ *
+ * 0 = 黑线
+ * 1 = 白色
+ *============================================================*/
+
+static uint8_t ConvertToWhiteBit(
+    uint8_t rawHigh
+)
+{
+#if BLACK_IS_LOW
+
+    /*
+     * 黑线低电平、白色高电平时，
+     * 原始电平正好就是手册格式。
+     */
+    return rawHigh;
+
+#else
+
+    /*
+     * 黑线高电平时进行反相，
+     * 保证程序内部始终使用：
+     *
+     * 0 = 黑线
+     * 1 = 白色
+     */
+    return (uint8_t)(rawHigh ^ 1U);
+
+#endif
+}
+
+
+/*============================================================
+ * 读取四路传感器
+ *============================================================*/
+
+static uint8_t ReadTrackPattern(void)
+{
+    uint8_t s1;
+    uint8_t s2;
+    uint8_t s3;
+    uint8_t s4;
+
+    /*
+     * 根据实际安装顺序：
+     *
+     * 左 -> 右
+     *
+     * S1 = X4 = PA17
+     * S2 = X3 = PA18
+     * S3 = X2 = PB19
+     * S4 = X1 = PA21
+     */
+
+    s1 = ConvertToWhiteBit(
+        (DL_GPIO_readPins(
+            TRACK_X4_PORT,
+            TRACK_X4_PIN
+        ) != 0U) ? 1U : 0U
+    );
+
+    s2 = ConvertToWhiteBit(
+        (DL_GPIO_readPins(
+            TRACK_X3_PORT,
+            TRACK_X3_PIN
+        ) != 0U) ? 1U : 0U
+    );
+
+    s3 = ConvertToWhiteBit(
+        (DL_GPIO_readPins(
+            TRACK_X2_PORT,
+            TRACK_X2_PIN
+        ) != 0U) ? 1U : 0U
+    );
+
+    s4 = ConvertToWhiteBit(
+        (DL_GPIO_readPins(
+            TRACK_X1_PORT,
+            TRACK_X1_PIN
+        ) != 0U) ? 1U : 0U
+    );
+
+
+#if LINE_SENSOR_REVERSE
+
+    {
+        uint8_t temporary;
+
+        temporary = s1;
+        s1 = s4;
+        s4 = temporary;
+
+        temporary = s2;
+        s2 = s3;
+        s3 = temporary;
+    }
+
+#endif
+
+
+    /* 黑线调试变量，1表示黑线 */
+    g_black_s1 = (s1 == 0U) ? 1U : 0U;
+    g_black_s2 = (s2 == 0U) ? 1U : 0U;
+    g_black_s3 = (s3 == 0U) ? 1U : 0U;
+    g_black_s4 = (s4 == 0U) ? 1U : 0U;
+
+
+    /*
+     * bit3 = S1
+     * bit2 = S2
+     * bit1 = S3
+     * bit0 = S4
+     */
+    return (uint8_t)(
+        (s1 << 3) |
+        (s2 << 2) |
+        (s3 << 1) |
+        s4
+    );
+}
+
+
+/*============================================================
+ * 简单连续采样滤波
+ *============================================================*/
+
+static uint8_t FilterTrackPattern(
+    uint8_t rawPattern
+)
+{
+    static uint8_t initialized = 0U;
+    static uint8_t acceptedPattern = 0x0FU;
+    static uint8_t candidatePattern = 0x0FU;
+    static uint8_t candidateCount = 0U;
+
+    if (initialized == 0U)
+    {
+        initialized = 1U;
+
+        acceptedPattern = rawPattern;
+        candidatePattern = rawPattern;
+        candidateCount = 0U;
+
+        return acceptedPattern;
+    }
+
+    if (rawPattern == acceptedPattern)
+    {
+        candidatePattern = rawPattern;
+        candidateCount = 0U;
+
+        return acceptedPattern;
+    }
+
+    if (rawPattern == candidatePattern)
+    {
+        if (candidateCount < 255U)
+        {
+            candidateCount++;
+        }
+    }
+    else
+    {
+        candidatePattern = rawPattern;
+        candidateCount = 1U;
+    }
+
+    if (candidateCount >= TRACK_FILTER_SAMPLES)
+    {
+        acceptedPattern = candidatePattern;
+        candidateCount = 0U;
+    }
+
+    return acceptedPattern;
+}
+
+
+/*============================================================
+ * LED控制
+ *============================================================*/
+
+static void SetStatusLED(
+    uint8_t enabled
+)
+{
+#if LED_ACTIVE_HIGH
+
+    if (enabled != 0U)
+    {
+        DL_GPIO_setPins(
+            STATUS_LED_PORT,
+            STATUS_LED_PIN
+        );
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            STATUS_LED_PORT,
+            STATUS_LED_PIN
+        );
+    }
+
+#else
+
+    if (enabled != 0U)
+    {
+        DL_GPIO_clearPins(
+            STATUS_LED_PORT,
+            STATUS_LED_PIN
+        );
+    }
+    else
+    {
+        DL_GPIO_setPins(
+            STATUS_LED_PORT,
+            STATUS_LED_PIN
+        );
+    }
+
+#endif
+}
+
+
+/*============================================================
+ * 电机补偿
+ *============================================================*/
+
+static int16_t AddMotorTrim(
+    int16_t command,
+    int16_t trim
+)
+{
+    if (command > 0)
+    {
+        command += trim;
+    }
+    else if (command < 0)
+    {
+        command -= trim;
+    }
+
+    return ClampPWM(command);
+}
+
+
+/*============================================================
+ * 设置左右电机目标速度
+ *============================================================*/
+
+static void SetMotorTarget(
+    int16_t leftPWM,
+    int16_t rightPWM,
+    uint8_t rememberCommand
+)
+{
+    int16_t temporary;
+
+#if STEERING_REVERSE
+
+    temporary = leftPWM;
+    leftPWM = rightPWM;
+    rightPWM = temporary;
+
+#else
+
+    /*
+     * 防止部分编译器提示temporary未使用。
+     */
+    (void)temporary;
+
+#endif
+
+    leftPWM = AddMotorTrim(
+        leftPWM,
+        LEFT_MOTOR_TRIM
+    );
+
+    rightPWM = AddMotorTrim(
+        rightPWM,
+        RIGHT_MOTOR_TRIM
+    );
+
+    g_left_target_pwm = ClampPWM(leftPWM);
+    g_right_target_pwm = ClampPWM(rightPWM);
+
+    if (rememberCommand != 0U)
+    {
+        g_last_valid_left_pwm =
+            g_left_target_pwm;
+
+        g_last_valid_right_pwm =
+            g_right_target_pwm;
+    }
+}
+
+
+/*============================================================
+ * PWM缓慢变化
+ *============================================================*/
+
+static int16_t RampPWM(
+    int16_t current,
+    int16_t target
+)
+{
+    if (current < target)
+    {
+        current += PWM_RAMP_STEP;
+
+        if (current > target)
+        {
+            current = target;
+        }
+    }
+    else if (current > target)
+    {
+        current -= PWM_RAMP_STEP;
+
+        if (current < target)
+        {
+            current = target;
+        }
+    }
+
+    return current;
+}
+
+
+static void UpdateMotorRamp(void)
+{
+    g_left_output_pwm = RampPWM(
+        g_left_output_pwm,
+        g_left_target_pwm
+    );
+
+    g_right_output_pwm = RampPWM(
+        g_right_output_pwm,
+        g_right_target_pwm
+    );
+}
+
+
+/*============================================================
+ * 判断当前传感器状态是否为大弯或直角弯
+ *============================================================*/
+
+static uint8_t IsStrongTurnPattern(
+    uint8_t pattern
+)
+{
+    if (
+        (pattern == 0x01U) ||
+        (pattern == 0x08U) ||
+        (pattern == 0x07U) ||
+        (pattern == 0x0EU)
+    )
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+
+/*============================================================
+ * 退出中线锁定
+ *============================================================*/
+
+static void CancelCenterLock(void)
+{
+    g_center_lock_active = 0U;
+    g_center_micro_candidate = 0xFFU;
+    g_center_micro_count = 0U;
+}
+
+
+/*============================================================
+ * 中线锁定时直行
+ *
+ * 中间两路同时检测到黑线后，左右轮使用固定且接近相同的
+ * 速度。这样可以把刚才弯道留下的左右速度差逐渐消除。
+ *============================================================*/
+
+static void ControlCenterStraight(void)
+{
+    g_last_direction =
+        TRACK_DIRECTION_STRAIGHT;
+
+    SetMotorTarget(
+        CENTER_STRAIGHT_LEFT_PWM,
+        CENTER_STRAIGHT_RIGHT_PWM,
+        1U
+    );
+}
+
+
+/*============================================================
+ * 中线锁定与小幅迟滞控制
+ *
+ * 1001：中间两路检测到黑线，立即进入中线锁定并直行。
+ * 1011/1101：先确认同一方向连续出现，再只做1个PWM的微调。
+ * 0111/1110/0001/1000：真实大弯，立即退出锁定正常转弯。
+ *
+ * 这样能够避免：
+ * 左微调 -> 直行 -> 右微调 -> 直行
+ * 在很短时间内反复切换造成的大幅摇头。
+ *============================================================*/
+
+static uint8_t HandleCenterLock(
+    uint8_t pattern
+)
+{
+#if CENTER_LOCK_ENABLE
+
+    uint32_t elapsedFromCenter;
+
+    /*
+     * 1001表示中间两路同时在黑线上。
+     * 每次看到1001都重新刷新锁定时间。
+     */
+    if (pattern == 0x09U)
+    {
+        g_center_lock_active = 1U;
+        g_center_last_seen_ms = g_system_ms;
+        g_center_micro_candidate = 0xFFU;
+        g_center_micro_count = 0U;
+
+        /* 中线锁定已经接管，不再需要转弯退出缓冲。 */
+        CancelTurnExitRecovery();
+
+        ControlCenterStraight();
+        return 1U;
+    }
+
+    if (g_center_lock_active == 0U)
+    {
+        return 0U;
+    }
+
+    /*
+     * 最外侧传感器或直角状态出现时，说明真的进入弯道，
+     * 不能继续锁直线，立即恢复正常强转向。
+     */
+    if (IsStrongTurnPattern(pattern) != 0U)
+    {
+        CancelCenterLock();
+        return 0U;
+    }
+
+    elapsedFromCenter =
+        (uint32_t)(
+            g_system_ms -
+            g_center_last_seen_ms
+        );
+
+    if (elapsedFromCenter > CENTER_LOCK_HOLD_MS)
+    {
+        CancelCenterLock();
+        return 0U;
+    }
+
+    switch (pattern)
+    {
+        /*
+         * 四路都检测到黑线时继续直行。
+         * 这类状态常出现在宽线或路口。
+         */
+        case 0x00U:
+
+            g_center_micro_candidate = 0xFFU;
+            g_center_micro_count = 0U;
+            ControlCenterStraight();
+            return 1U;
+
+
+        /*
+         * 左微调。必须连续多次确认。
+         */
+        case 0x0BU:
+
+            if (g_center_micro_candidate == 0x0BU)
+            {
+                if (g_center_micro_count < 255U)
+                {
+                    g_center_micro_count++;
+                }
+            }
+            else
+            {
+                g_center_micro_candidate = 0x0BU;
+                g_center_micro_count = 1U;
+            }
+
+            if (
+                g_center_micro_count <
+                CENTER_MICRO_CONFIRM_SAMPLES
+            )
+            {
+                ControlCenterStraight();
+            }
+            else
+            {
+                g_last_direction =
+                    TRACK_DIRECTION_LEFT_MICRO;
+
+                SetMotorTarget(
+                    CENTER_MICRO_INNER_PWM,
+                    CENTER_MICRO_OUTER_PWM,
+                    1U
+                );
+            }
+
+            return 1U;
+
+
+        /*
+         * 右微调。必须连续多次确认。
+         */
+        case 0x0DU:
+
+            if (g_center_micro_candidate == 0x0DU)
+            {
+                if (g_center_micro_count < 255U)
+                {
+                    g_center_micro_count++;
+                }
+            }
+            else
+            {
+                g_center_micro_candidate = 0x0DU;
+                g_center_micro_count = 1U;
+            }
+
+            if (
+                g_center_micro_count <
+                CENTER_MICRO_CONFIRM_SAMPLES
+            )
+            {
+                ControlCenterStraight();
+            }
+            else
+            {
+                g_last_direction =
+                    TRACK_DIRECTION_RIGHT_MICRO;
+
+                SetMotorTarget(
+                    CENTER_MICRO_OUTER_PWM,
+                    CENTER_MICRO_INNER_PWM,
+                    1U
+                );
+            }
+
+            return 1U;
+
+
+        /*
+         * 在刚刚位于中线时发生很短的丢线，先保持直行，
+         * 不立刻恢复之前的大弯速度。
+         */
+        case 0x0FU:
+
+            g_center_micro_candidate = 0xFFU;
+            g_center_micro_count = 0U;
+            ControlCenterStraight();
+            return 1U;
+
+
+        default:
+
+            /*
+             * 其他不稳定组合在150ms锁定窗口内暂时按直行
+             * 处理。真正的大弯状态在前面已经直接放行。
+             */
+            g_center_micro_candidate = 0xFFU;
+            g_center_micro_count = 0U;
+            ControlCenterStraight();
+            return 1U;
+    }
+
+#else
+
+    (void)pattern;
+
+#endif
+
+    return 0U;
+}
+
+
+/*============================================================
+ * 判断上一次是否为大弯或直角弯
+ *============================================================*/
+
+static uint8_t IsStrongTurnDirection(
+    TrackDirection direction
+)
+{
+    if (
+        (direction == TRACK_DIRECTION_LEFT_BIG) ||
+        (direction == TRACK_DIRECTION_LEFT_SHARP) ||
+        (direction == TRACK_DIRECTION_RIGHT_BIG) ||
+        (direction == TRACK_DIRECTION_RIGHT_SHARP)
+    )
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+
+/*============================================================
+ * 退出转弯缓冲
+ *============================================================*/
+
+static void CancelTurnExitRecovery(void)
+{
+    g_turn_exit_recovery_active = 0U;
+    g_turn_exit_center_count = 0U;
+}
+
+
+/*============================================================
+ * 转弯结束缓冲处理
+ *
+ * 大弯或直角弯结束后，传感器往往会在：
+ *
+ * 左微调 -> 直行 -> 右微调
+ *
+ * 之间快速切换。如果立即使用普通微调速度，小车会出现
+ * 转完弯后大幅度左右摇头。
+ *
+ * 缓冲期间：
+ *
+ * 1. 直行速度略微降低。
+ * 2. 微调左右轮速度差缩小到1。
+ * 3. 中线状态稳定一段时间后再恢复正常循迹。
+ *============================================================*/
+
+static uint8_t HandleTurnExitRecovery(
+    uint8_t pattern
+)
+{
+#if TURN_EXIT_RECOVERY_ENABLE
+
+    uint32_t elapsedMs;
+
+    /*
+     * 从大弯或直角弯进入直行、左微调或右微调时，
+     * 自动进入转弯退出缓冲。
+     */
+    if (g_turn_exit_recovery_active == 0U)
+    {
+        if (
+            (IsStrongTurnDirection(g_last_direction) != 0U) &&
+            (
+                (pattern == 0x00U) ||
+                (pattern == 0x09U) ||
+                (pattern == 0x0BU) ||
+                (pattern == 0x0DU)
+            )
+        )
+        {
+            g_turn_exit_recovery_active = 1U;
+            g_turn_exit_start_ms = g_system_ms;
+            g_turn_exit_center_count = 0U;
+        }
+        else
+        {
+            return 0U;
+        }
+    }
+
+    elapsedMs =
+        (uint32_t)(
+            g_system_ms -
+            g_turn_exit_start_ms
+        );
+
+    /*
+     * 如果再次检测到大弯或直角弯，
+     * 说明弯还没真正结束，退出缓冲并正常执行转弯。
+     */
+    if (
+        (pattern == 0x01U) ||
+        (pattern == 0x08U) ||
+        (pattern == 0x07U) ||
+        (pattern == 0x0EU)
+    )
+    {
+        CancelTurnExitRecovery();
+        return 0U;
+    }
+
+    /*
+     * 防止异常状态下长时间停留在缓冲模式。
+     */
+    if (elapsedMs >= TURN_EXIT_MAX_TIME_MS)
+    {
+        CancelTurnExitRecovery();
+        return 0U;
+    }
+
+    switch (pattern)
+    {
+        /*
+         * 0000或1001都按照缓慢直行处理。
+         */
+        case 0x00U:
+        case 0x09U:
+
+            if (g_turn_exit_center_count < 255U)
+            {
+                g_turn_exit_center_count++;
+            }
+
+            /*
+             * 至少经过设定时间，并且中线连续稳定若干次，
+             * 才恢复普通循迹。
+             */
+            if (
+                (elapsedMs >= TURN_EXIT_MIN_TIME_MS) &&
+                (
+                    g_turn_exit_center_count >=
+                    TURN_EXIT_CENTER_SAMPLES
+                )
+            )
+            {
+                CancelTurnExitRecovery();
+                return 0U;
+            }
+
+            g_last_direction =
+                TRACK_DIRECTION_STRAIGHT;
+
+            SetMotorTarget(
+                TURN_EXIT_STRAIGHT_PWM,
+                TURN_EXIT_STRAIGHT_PWM,
+                1U
+            );
+
+            return 1U;
+
+
+        /*
+         * 左微调：只保留很小的速度差。
+         */
+        case 0x0BU:
+
+            g_turn_exit_center_count = 0U;
+
+            g_last_direction =
+                TRACK_DIRECTION_LEFT_MICRO;
+
+            SetMotorTarget(
+                TURN_EXIT_MICRO_INNER_PWM,
+                TURN_EXIT_MICRO_OUTER_PWM,
+                1U
+            );
+
+            return 1U;
+
+
+        /*
+         * 右微调：只保留很小的速度差。
+         */
+        case 0x0DU:
+
+            g_turn_exit_center_count = 0U;
+
+            g_last_direction =
+                TRACK_DIRECTION_RIGHT_MICRO;
+
+            SetMotorTarget(
+                TURN_EXIT_MICRO_OUTER_PWM,
+                TURN_EXIT_MICRO_INNER_PWM,
+                1U
+            );
+
+            return 1U;
+
+
+        /*
+         * 短暂丢线时保持缓冲期间最后一次温和指令，
+         * 不恢复到刚才的大弯或直角弯速度。
+         */
+        case 0x0FU:
+
+            g_turn_exit_center_count = 0U;
+
+            SetMotorTarget(
+                g_last_valid_left_pwm,
+                g_last_valid_right_pwm,
+                0U
+            );
+
+            return 1U;
+
+
+        default:
+
+            g_turn_exit_center_count = 0U;
+            break;
+    }
+
+#else
+
+    (void)pattern;
+
+#endif
+
+    return 0U;
+}
+
+
+/*============================================================
+ * 各种循迹动作
+ *============================================================*/
+
+static void ControlStraight(void)
+{
+    g_last_direction =
+        TRACK_DIRECTION_STRAIGHT;
+
+    SetMotorTarget(
+        LEFT_BASE_PWM,
+        RIGHT_BASE_PWM,
+        1U
+    );
+}
+
+
+static void ControlLeftMicro(void)
+{
+    g_last_direction =
+        TRACK_DIRECTION_LEFT_MICRO;
+
+    SetMotorTarget(
+        MICRO_INNER_PWM,
+        MICRO_OUTER_PWM,
+        1U
+    );
+}
+
+
+static void ControlRightMicro(void)
+{
+    g_last_direction =
+        TRACK_DIRECTION_RIGHT_MICRO;
+
+    SetMotorTarget(
+        MICRO_OUTER_PWM,
+        MICRO_INNER_PWM,
+        1U
+    );
+}
+
+
+static void ControlLeftBig(void)
+{
+    CancelTurnExitRecovery();
+
+    g_last_direction =
+        TRACK_DIRECTION_LEFT_BIG;
+
+    SetMotorTarget(
+        BIG_TURN_INNER_PWM,
+        BIG_TURN_OUTER_PWM,
+        1U
+    );
+}
+
+
+static void ControlRightBig(void)
+{
+    CancelTurnExitRecovery();
+
+    g_last_direction =
+        TRACK_DIRECTION_RIGHT_BIG;
+
+    SetMotorTarget(
+        BIG_TURN_OUTER_PWM,
+        BIG_TURN_INNER_PWM,
+        1U
+    );
+}
+
+
+static void ControlLeftSharp(void)
+{
+    CancelTurnExitRecovery();
+
+    g_last_direction =
+        TRACK_DIRECTION_LEFT_SHARP;
+
+    SetMotorTarget(
+        -SHARP_REVERSE_PWM,
+        SHARP_FORWARD_PWM,
+        1U
+    );
+}
+
+
+static void ControlRightSharp(void)
+{
+    CancelTurnExitRecovery();
+
+    g_last_direction =
+        TRACK_DIRECTION_RIGHT_SHARP;
+
+    SetMotorTarget(
+        SHARP_FORWARD_PWM,
+        -SHARP_REVERSE_PWM,
+        1U
+    );
+}
+
+
+/*============================================================
+ * 丢线处理
+ *============================================================*/
+
+static void HandleLostLine(void)
+{
+#if LOST_LINE_MODE == 0
+
+    SetMotorTarget(
+        0,
+        0,
+        0U
+    );
+
+#else
+
+    /*
+     * 没有任何有效历史状态时停车。
+     */
+    if (
+        (g_last_valid_left_pwm == 0) &&
+        (g_last_valid_right_pwm == 0)
+    )
+    {
+        SetMotorTarget(
+            0,
+            0,
+            0U
+        );
+
+        return;
+    }
+
+    /*
+     * 保持丢线前的方向和速度继续行驶。
+     */
+    SetMotorTarget(
+        g_last_valid_left_pwm,
+        g_last_valid_right_pwm,
+        0U
+    );
+
+#endif
+}
+
+
+/*============================================================
+ * 处理真值表中未单独列出的状态
+ *
+ * 使用四路传感器位置权重：
+ *
+ * S1 = -3
+ * S2 = -1
+ * S3 = +1
+ * S4 = +3
+ *
+ * 黑线偏左时向左修正，
+ * 黑线偏右时向右修正。
+ *============================================================*/
+
+static void HandleUnknownPattern(
+    uint8_t pattern
+)
+{
+    int16_t error = 0;
+    uint8_t blackCount = 0U;
+
+    /* S1检测到黑线 */
+    if ((pattern & 0x08U) == 0U)
+    {
+        error -= 3;
+        blackCount++;
+    }
+
+    /* S2检测到黑线 */
+    if ((pattern & 0x04U) == 0U)
+    {
+        error -= 1;
+        blackCount++;
+    }
+
+    /* S3检测到黑线 */
+    if ((pattern & 0x02U) == 0U)
+    {
+        error += 1;
+        blackCount++;
+    }
+
+    /* S4检测到黑线 */
+    if ((pattern & 0x01U) == 0U)
+    {
+        error += 3;
+        blackCount++;
+    }
+
+
+    if (blackCount == 0U)
+    {
+        HandleLostLine();
+    }
+    else if (blackCount == 4U)
+    {
+        ControlStraight();
+    }
+    else if (error <= -3)
+    {
+        ControlLeftBig();
+    }
+    else if (error < 0)
+    {
+        ControlLeftMicro();
+    }
+    else if (error >= 3)
+    {
+        ControlRightBig();
+    }
+    else if (error > 0)
+    {
+        ControlRightMicro();
+    }
+    else
+    {
+        ControlStraight();
+    }
+}
+
+
+/*============================================================
+ * 四路循迹真值表
+ *
+ * 四位数据顺序：
+ *
+ * S1 S2 S3 S4
+ *
+ * 0 = 黑线
+ * 1 = 白色
+ *============================================================*/
+
+static void TrackControl(
+    uint8_t pattern
+)
+{
+    /*
+     * 上电后第一次检测到黑线。
+     */
+    if (pattern != 0x0FU)
+    {
+        g_line_has_been_found = 1U;
+
+        SetStatusLED(1U);
+    }
+    else
+    {
+        SetStatusLED(0U);
+    }
+
+
+#if START_ONLY_AFTER_LINE_FOUND
+
+    /*
+     * 如果上电后从未检测到黑线，
+     * 保持停车。
+     */
+    if (g_line_has_been_found == 0U)
+    {
+        SetMotorTarget(
+            0,
+            0,
+            0U
+        );
+
+        return;
+    }
+
+#endif
+
+
+    /*
+     * 中间两路同时检测到黑线后，优先使用中线锁定。
+     * 返回1表示本次控制已经完成。
+     */
+    if (HandleCenterLock(pattern) != 0U)
+    {
+        return;
+    }
+
+
+    /*
+     * 大弯或直角弯结束后，再执行转弯退出缓冲。
+     * 返回1表示本次控制已经由缓冲逻辑处理。
+     */
+    if (HandleTurnExitRecovery(pattern) != 0U)
+    {
+        return;
+    }
+
+
+    switch (pattern)
+    {
+        /*
+         * 0000：
+         * 四路全部检测到黑线。
+         *
+         * 手册定义为十字路口。
+         * 默认继续直行。
+         */
+        case 0x00U:
+
+            ControlStraight();
+            break;
+
+
+        /*
+         * 0001：
+         * 左直角弯。
+         */
+        case 0x01U:
+
+            ControlLeftSharp();
+            break;
+
+
+        /*
+         * 1000：
+         * 右直角弯。
+         */
+        case 0x08U:
+
+            ControlRightSharp();
+            break;
+
+
+        /*
+         * 0111：
+         * 左侧最外传感器检测到黑线。
+         */
+        case 0x07U:
+
+            ControlLeftBig();
+            break;
+
+
+        /*
+         * 1110：
+         * 右侧最外传感器检测到黑线。
+         */
+        case 0x0EU:
+
+            ControlRightBig();
+            break;
+
+
+        /*
+         * 1011：
+         * 左中传感器检测到黑线。
+         */
+        case 0x0BU:
+
+            ControlLeftMicro();
+            break;
+
+
+        /*
+         * 1101：
+         * 右中传感器检测到黑线。
+         */
+        case 0x0DU:
+
+            ControlRightMicro();
+            break;
+
+
+        /*
+         * 1001：
+         * 中间两路检测到黑线。
+         */
+        case 0x09U:
+
+            ControlStraight();
+            break;
+
+
+        /*
+         * 1111：
+         * 四路全部为白色，丢线。
+         */
+        case 0x0FU:
+
+            HandleLostLine();
+            break;
+
+
+        /*
+         * 处理其他组合。
+         */
+        default:
+
+            HandleUnknownPattern(pattern);
+            break;
+    }
+}
+
+
+/*============================================================
+ * 毫秒延时
+ *============================================================*/
+
+static void DelayMs(
+    uint32_t delayMs
+)
+{
+    uint32_t startTime;
+
+    startTime = g_system_ms;
+
+    while (
+        (uint32_t)(g_system_ms - startTime) <
+        delayMs
+    )
+    {
+        __WFI();
+    }
+}
+
+
+/*============================================================
+ * SysTick中断
+ *============================================================*/
+
+void SysTick_Handler(void)
+{
+    static uint16_t pwmPhase = 0U;
+    static uint16_t controlDivider = 0U;
+    static uint8_t millisecondDivider = 0U;
+
+    /*
+     * 每0.1ms更新一次软件PWM。
+     */
+    ApplyMotorOutputs(pwmPhase);
+
+    pwmPhase++;
+
+    if (pwmPhase >= PWM_PERIOD_COUNT)
+    {
+        pwmPhase = 0U;
+    }
+
+
+    /*
+     * 每5ms通知主循环运行一次循迹控制。
+     */
+    controlDivider++;
+
+    if (
+        controlDivider >=
+        CONTROL_INTERVAL_TICKS
+    )
+    {
+        controlDivider = 0U;
+        g_control_due = 1U;
+    }
+
+
+    /*
+     * 10个SysTick = 1ms。
+     */
+    millisecondDivider++;
+
+    if (millisecondDivider >= 10U)
+    {
+        millisecondDivider = 0U;
+        g_system_ms++;
+    }
+}
+
+
+/*============================================================
+ * 主函数
+ *============================================================*/
+
+int main(void)
+{
+    uint8_t rawPattern;
+    uint8_t filteredPattern;
+
+    /*
+     * 初始化SysConfig中的GPIO、UART和系统时钟。
+     */
+    SYSCFG_DL_init();
+
+
+    /*
+     * 上电后立即关闭电机。
+     */
+    HardwareMotorStop();
+
+    g_left_target_pwm = 0;
+    g_right_target_pwm = 0;
+
+    g_left_output_pwm = 0;
+    g_right_output_pwm = 0;
+
+    g_last_valid_left_pwm = 0;
+    g_last_valid_right_pwm = 0;
+
+    SetStatusLED(0U);
+
+
+    /*
+     * 启动10kHz SysTick。
+     */
+    if (
+        SysTick_Config(
+            CPUCLK_FREQ /
+            SYSTICK_FREQUENCY_HZ
+        ) != 0U
+    )
+    {
+        /*
+         * SysTick配置失败，永久停车。
+         */
+        HardwareMotorStop();
+
+        while (1)
+        {
+            SetStatusLED(1U);
+        }
+    }
+
+
+    /*
+     * 等待电源及循迹模块稳定。
+     */
+    DelayMs(300U);
+
+
+    while (1)
+    {
+        if (g_control_due != 0U)
+        {
+            g_control_due = 0U;
+
+            /*
+             * 读取原始四路状态。
+             */
+            rawPattern =
+                ReadTrackPattern();
+
+            /*
+             * 对四路状态进行连续采样滤波。
+             */
+            filteredPattern =
+                FilterTrackPattern(
+                    rawPattern
+                );
+
+            g_track_pattern =
+                filteredPattern;
+
+            /*
+             * 根据四路真值表设置目标速度。
+             */
+            TrackControl(
+                filteredPattern
+            );
+
+            /*
+             * 缓慢接近目标速度，减少顿挫。
+             */
+            UpdateMotorRamp();
+        }
+
+        __WFI();
+    }
+}
