@@ -1,0 +1,5215 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ * ================================================================
+ * MSPM0G3507 + D36A + MS42C + K230 + JY60
+ *
+ * 钢球PID + K230位置反馈 + JY60小车加速度前馈补偿
+ *
+ * 本版新增：
+ *
+ * 1. 完整位置PID：P位置、I静差、D速度阻尼
+ * 2. 5帧趋势估计速度和加速度，降低单帧跳动影响
+ * 3. 根据 x + vT + 0.5aT^2 预测未来位置
+ * 4. 预测即将穿过0点时提前进入捕获制动
+ * 5. 捕获状态动态更新制动力，不再固定角度硬顶
+ * 6. 保留自适应静摩擦补偿和破静摩擦脉冲
+ * 7. 提高步进电机目标跟随速度和加速度
+ * 8. 新增JY60车辆纵向加速度前馈：
+ *    theta_ff = atan(a_car / g)
+ * 9. 小车启动、加速、减速时先转动摆杆抵消惯性，
+ *    K230位置PID再负责修正模型误差和剩余偏差
+ *
+ * K230发送格式：
+ *
+ *      -25\n
+ *      0\n
+ *      18\n
+ *
+ * 单位：mm
+ *
+ * 接线：
+ *
+ *      K230 TX -> PA1，MSPM0 UART0 RX
+ *      K230 RX <- PA0，MSPM0 UART0 TX
+ *      K230 GND与MSPM0 GND共地
+ *
+ *      JY60 TX -> PA18，MSPM0 UART1 RX
+ *      JY60 RX <- PA17，MSPM0 UART1 TX
+ *      JY60 GND与MSPM0 GND共地
+ *      JY60默认9600bit/s，8位数据，1位停止位，无校验
+ *
+ *      PB1 -> D36A ST1
+ *      PB2 -> D36A DIR1
+ *      PB4 -> D36A EN1
+ *
+ * 当前不使用MS42C编码器。
+ * 通过累计实际发送的STEP脉冲估计电机位置。
+ *
+ * 上电后的2秒内驱动关闭，
+ * 请手动将轨道调整到水平位置。
+ * ================================================================
+ */
+
+
+/*==============================================================
+ * 1. 系统时钟与控制频率
+ *==============================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                         (32000000UL)
+#endif
+
+/*
+ * SysTick为10kHz。
+ *
+ * 每100us进入一次中断。
+ */
+#define SYSTICK_FREQUENCY_HZ                (10000U)
+
+/*
+ * 钢球外环100Hz。
+ *
+ * 每10ms执行一次。
+ */
+#define BALL_CONTROL_FREQUENCY_HZ           (100U)
+
+#define BALL_CONTROL_INTERVAL_TICKS         \
+    (SYSTICK_FREQUENCY_HZ /                 \
+     BALL_CONTROL_FREQUENCY_HZ)
+
+#define BALL_CONTROL_DT_S                   (0.01f)
+
+/*
+ * 电机位置内环1kHz。
+ *
+ * 每1ms执行一次。
+ */
+#define MOTOR_CONTROL_FREQUENCY_HZ          (1000U)
+
+#define MOTOR_CONTROL_INTERVAL_TICKS        \
+    (SYSTICK_FREQUENCY_HZ /                 \
+     MOTOR_CONTROL_FREQUENCY_HZ)
+
+#define MOTOR_CONTROL_DT_S                  (0.001f)
+
+
+/*==============================================================
+ * 2. D36A控制引脚
+ *==============================================================*/
+
+#define STEP_PORT                           (GPIOB)
+#define STEP_PIN                            (DL_GPIO_PIN_1)
+
+#define DIR_PORT                            (GPIOB)
+#define DIR_PIN                             (DL_GPIO_PIN_2)
+
+#define EN_PORT                             (GPIOB)
+#define EN_PIN                              (DL_GPIO_PIN_4)
+
+
+/*==============================================================
+ * 3. 步进电机参数
+ *==============================================================*/
+
+/*
+ * MS42C步距角1.8°：
+ *
+ * 一圈200整步。
+ */
+#define MOTOR_FULL_STEPS_PER_REV            (200.0f)
+
+/*
+ * D36A使用16细分。
+ */
+#define MOTOR_MICROSTEP                     (16.0f)
+
+/*
+ * 一圈脉冲数：
+ *
+ * 200 × 16 = 3200。
+ */
+#define MOTOR_PULSES_PER_REV                \
+    (MOTOR_FULL_STEPS_PER_REV *             \
+     MOTOR_MICROSTEP)
+
+/*
+ * 每旋转1°需要的脉冲：
+ *
+ * 3200 / 360 = 8.8889。
+ */
+#define MOTOR_PULSES_PER_DEG                \
+    (MOTOR_PULSES_PER_REV / 360.0f)
+
+
+/*==============================================================
+ * 4. 方向及使能极性
+ *==============================================================*/
+
+/*
+ * PB4高电平使能D36A。
+ */
+#define ENABLE_ACTIVE_HIGH                  (1U)
+
+/*
+ * 正方向时PB2输出高电平。
+ */
+#define POSITIVE_DIRECTION_LEVEL            (1U)
+
+/*
+ * 你当前使用-1时方向正确，所以保留。
+ *
+ * 如果小球越来越远，改为1.0f。
+ */
+#define BALL_CONTROL_POLARITY               (-1.0f)
+
+
+/*==============================================================
+ * 5. K230通信参数
+ *==============================================================*/
+
+/*
+ * 25cm轨道中心两侧约125mm。
+ */
+#define BALL_POSITION_LIMIT_MM              (125)
+
+/*
+ * 超过500ms没有收到K230坐标，
+ * 认为通信超时。
+ */
+#define K230_TIMEOUT_MS                     (500U)
+
+
+/*==============================================================
+ * 5A. JY60小车加速度前馈参数
+ *==============================================================*/
+
+/*
+ * 本代码按WIT/JY60常见二进制输出格式解析：
+ *
+ * 0x55 0x51 AxL AxH AyL AyH AzL AzH TL TH SUM
+ *
+ * 加速度换算：
+ *
+ *      acceleration_g = raw / 32768 × 16
+ *
+ * PA17 = UART1_TX
+ * PA18 = UART1_RX
+ *
+ * SysConfig中请把UART1实例命名为JY60_UART，
+ * 这样会生成JY60_UART_INST和JY60_UART_INST_INT_IRQN。
+ */
+#define JY60_FRAME_LENGTH                   (11U)
+#define JY60_FRAME_HEADER                   (0x55U)
+#define JY60_FRAME_ACCELERATION             (0x51U)
+
+#define JY60_TIMEOUT_MS                     (200U)
+
+/*
+ * JY60安装方向：
+ *
+ * 0：使用X轴作为小车前后方向
+ * 1：使用Y轴作为小车前后方向
+ * 2：使用Z轴作为小车前后方向
+ *
+ * 推荐把JY60的X轴箭头沿小车前进方向安装，
+ * 此时保持0。
+ */
+#define JY60_FORWARD_AXIS                   (0U)
+
+/*
+ * 让“小车向前加速”最终得到正的g_vehicle_accel_g。
+ *
+ * 若调试时小车向前加速，
+ * g_debug_vehicle_accel_mg却为负数，
+ * 将1.0f改成-1.0f。
+ */
+#define JY60_ACCEL_AXIS_POLARITY            (1.0f)
+
+/*
+ * 加速度补偿角方向。
+ *
+ * 若启用后小球偏移更严重，
+ * 只改这一项为-1.0f，不要先改BALL_CONTROL_POLARITY。
+ */
+#define VEHICLE_COMPENSATION_POLARITY       (1.0f)
+
+/*
+ * JY60加速度帧的标准比例。
+ */
+#define JY60_ACCEL_RAW_TO_G                     (16.0f / 32768.0f)
+
+/*
+ * 上电静止标定至少需要的有效加速度帧数。
+ * 原程序有2秒启动等待，通常可以收到约200帧。
+ */
+#define JY60_CALIBRATION_MIN_SAMPLES        (30U)
+
+/*
+ * 最多累计2000帧，避免长时间不结束标定造成求和溢出。
+ */
+#define JY60_CALIBRATION_MAX_SAMPLES        (2000U)
+
+/*
+ * ==============================================================
+ * 启动和停车使用两套独立的加速度补偿参数。
+ *
+ * 本程序约定：
+ *
+ *   g_vehicle_accel_filtered_g > 0：小车向前启动/加速
+ *   g_vehicle_accel_filtered_g < 0：小车向前行驶时减速/停车
+ *
+ * 该约定适用于A到B向前行驶。
+ * 若向前启动时g_debug_vehicle_accel_mg为负，
+ * 请修改JY60_ACCEL_AXIS_POLARITY，而不是交换下面两套参数。
+ * ==============================================================
+ */
+
+/*
+ * 启动阶段加速度低通滤波。
+ * 当前启动补偿已经较好，保留原来的0.34。
+ */
+#define VEHICLE_START_FILTER_ALPHA          (0.34f)
+
+/*
+ * 停车减速阶段加速度低通滤波。
+ * 数值大于启动滤波，可以更快识别刹车产生的负加速度。
+ * 推荐调节范围：0.40～0.65。
+ */
+#define VEHICLE_STOP_FILTER_ALPHA           (0.65f)
+
+/*
+ * 小于0.015g约等于0.147m/s²，视为噪声。
+ */
+#define VEHICLE_ACCEL_DEADBAND_G            (0.015f)
+
+/*
+ * 最大只使用±0.30g进行补偿。
+ * 对应理论倾角约±16.7°，
+ * 但后面还会再由角度上限限制。
+ */
+#define VEHICLE_ACCEL_LIMIT_G               (0.30f)
+
+/*
+ * 启动加速补偿增益。
+ * 当前启动效果好，先保持1.00。
+ */
+#define VEHICLE_START_COMPENSATION_GAIN     (2.00f)
+
+/*
+ * 停车减速补偿增益。
+ *
+ * 停车时钢球仍继续向车头冲：逐步增大到1.20、1.25。
+ * 停车时钢球反而明显向车尾冲：逐步减小到1.10、1.05。
+ */
+#define VEHICLE_STOP_COMPENSATION_GAIN      (8.00f)
+
+/*
+ * 加速度前馈最大只占用±8°，
+ * 给钢球位置PID保留剩余角度。
+ */
+#define VEHICLE_COMPENSATION_MAX_ANGLE_DEG  (8.0f)
+
+/*
+ * 启动时补偿角最大变化速度。
+ */
+#define VEHICLE_START_SLEW_DEG_S            (520.0f)
+
+/*
+ * 停车通常比启动更突然，因此让停车补偿角响应更快。
+ */
+#define VEHICLE_STOP_SLEW_DEG_S             (720.0f)
+
+/*
+ * 加速度回到死区后，补偿角返回0°的速度。
+ *
+ * 太大：停车补偿撤得太快，钢球容易二次反弹。
+ * 太小：停车后轨道长时间保持倾斜。
+ */
+#define VEHICLE_ZERO_RETURN_SLEW_DEG_S      (180.0f)
+
+/*
+ * JY60掉线后缓慢回到0°，避免轨道突然跳回水平。
+ */
+#define VEHICLE_COMPENSATION_RETURN_DEG_S   (220.0f)
+
+#define RAD_TO_DEG                          (57.2957795f)
+
+
+/*==============================================================
+ * 6. 坐标、速度、加速度和预测参数
+ *==============================================================*/
+
+/*
+ * 位置低通滤波。
+ *
+ * 数值越大越跟随新坐标，越小越平滑。
+ */
+#define POSITION_FILTER_ALPHA               (0.72f)
+
+/*
+ * 多帧趋势速度与单帧速度的融合比例。
+ *
+ * 0.72表示主要相信最近5帧的整体趋势。
+ */
+#define MULTIFRAME_VELOCITY_WEIGHT          (0.72f)
+
+/*
+ * 速度低通滤波。
+ */
+#define VELOCITY_FILTER_ALPHA               (0.44f)
+
+/*
+ * 加速度低通滤波。
+ *
+ * 加速度比速度更容易受K230坐标抖动影响，
+ * 所以滤波系数不能太大。
+ */
+#define ACCELERATION_FILTER_ALPHA           (0.20f)
+
+/*
+ * 用最近5帧估计运动趋势。
+ */
+#define MOTION_HISTORY_SIZE                 (5U)
+
+/*
+ * 至少3帧后才允许使用预测。
+ */
+#define PREDICTION_MIN_HISTORY_FRAMES       (3U)
+
+/*
+ * 允许完整坐标跳变。
+ */
+#define MAX_POSITION_JUMP_PER_FRAME_MM      (125.0f)
+
+/*
+ * 最大速度估计。
+ */
+#define MAX_BALL_SPEED_MM_S                 (500.0f)
+
+/*
+ * 最大加速度估计。
+ *
+ * 限幅用于防止偶发识别跳点直接产生很大的预测量。
+ */
+#define MAX_BALL_ACCEL_MM_S2                (3500.0f)
+
+/*
+ * 很小的加速度直接当作0，减少原点附近噪声。
+ */
+#define ACCELERATION_DEADBAND_MM_S2         (60.0f)
+
+/*
+ * 预测时间随K230实际帧间隔自动变化：
+ *
+ * T = 帧间隔 × 2.5
+ *
+ * 并限制在55ms～120ms。
+ */
+#define PREDICTION_FRAME_MULTIPLIER         (2.5f)
+#define PREDICTION_MIN_TIME_S               (0.055f)
+#define PREDICTION_MAX_TIME_S               (0.120f)
+
+/*
+ * 预测位置相对当前滤波位置最多修正25mm。
+ *
+ * 防止加速度估计异常时预测过远。
+ */
+#define PREDICTION_MAX_CORRECTION_MM        (25.0f)
+
+/*
+ * PID位置项中，75%使用预测位置，
+ * 25%保留K230当前原始位置。
+ */
+#define PREDICTION_POSITION_WEIGHT          (0.58f)
+
+/*==============================================================
+ * 7. 控制状态
+ *==============================================================*/
+
+#define BALL_STATE_WAITING                  (0U)
+
+/* 正常向原点拉回。 */
+#define BALL_STATE_PULLING                  (1U)
+
+/* 原点附近软着陆状态。 */
+#define BALL_STATE_BRAKING                  (2U)
+
+/* 已经锁定在原点附近。 */
+#define BALL_STATE_HOLDING                  (3U)
+
+/* 自适应增加基础坡度。 */
+#define BALL_STATE_STATIC_BIAS              (4U)
+
+/* 一次性捕获制动。 */
+#define BALL_STATE_CAPTURE                  (5U)
+
+/* 快速破静摩擦脉冲。 */
+#define BALL_STATE_BREAKAWAY                (6U)
+
+
+/*==============================================================
+ * 8. 原点立即锁定参数
+ *==============================================================*/
+
+/*
+ * 检测到小球进入±3mm，
+ * 立即认为已到达原点附近。
+ */
+#define BALL_CENTER_ENTER_MM                (4.0f)
+
+/*
+ * 锁定后超过±11mm才重新进入软着陆控制。
+ * 更大的滞环可以避免K230坐标在中心附近来回跳变时反复接管。
+ */
+#define BALL_CENTER_EXIT_MM                 (11.0f)
+
+/*
+ * 真正锁定要求速度已经很低。
+ */
+#define BALL_CENTER_ENTER_SPEED_MM_S        (7.0f)
+
+/*
+ * 连续4个新坐标帧满足条件后才锁定，避免高速穿过0点时误锁定。
+ */
+#define BALL_CENTER_CONFIRM_FRAMES          (4U)
+
+/*
+ * 进入±11mm且速度不高时，切换到低增益软着陆状态。
+ */
+#define CENTER_SETTLE_ENTER_MM              (11.0f)
+#define CENTER_SETTLE_EXIT_MM               (14.0f)
+#define CENTER_SETTLE_ENTRY_SPEED_MM_S      (32.0f)
+
+/*
+ * 中心软着陆只使用低增益PD，不使用预测加速度和普通积分。
+ */
+#define CENTER_SETTLE_KP                    (0.026f)
+#define CENTER_SETTLE_KD                    (0.018f)
+#define CENTER_SETTLE_MAX_ANGLE_DEG         (0.72f)
+#define CENTER_SETTLE_SLEW_DEG_S            (240.0f)
+
+/*
+ * 中心位置和速度小死区，滤掉K230整数坐标抖动。
+ */
+#define CENTER_POSITION_DEADBAND_MM         (1.5f)
+#define CENTER_VELOCITY_DEADBAND_MM_S       (3.0f)
+
+/*
+ * 锁定状态只保留很小的速度阻尼和慢速水平偏置学习。
+ */
+#define CENTER_HOLD_KD                      (0.010f)
+#define CENTER_HOLD_MAX_ANGLE_DEG           (0.45f)
+#define CENTER_HOLD_SLEW_DEG_S              (240.0f)
+#define CENTER_TRIM_KI                      (0.010f)
+#define CENTER_TRIM_MAX_ANGLE_DEG           (0.60f)
+#define CENTER_TRIM_ACTIVE_SPEED_MM_S       (9.0f)
+#define CENTER_EXIT_CONFIRM_FRAMES          (2U)
+
+
+/*==============================================================
+ * 9. 钢球位置PID参数
+ *==============================================================*/
+
+/*
+ * P：位置比例。
+ *
+ * 33mm约产生2.31°，100mm约产生7.0°。
+ */
+#define BALL_PID_KP                         (0.065f)
+
+/*
+ * I：消除轨道轻微不水平、机构间隙造成的长期静差。
+ *
+ * 积分只在距离原点较近时启用，并带防饱和限制。
+ */
+#define BALL_PID_KI                         (0.010f)
+
+/*
+ * D：使用预测速度作为阻尼。
+ *
+ * 小球向原点快速运动时，D项会提前减小拉回坡度；
+ * 小球远离原点时，D项会加大回中坡度。
+ */
+#define BALL_PID_KD                         (0.018f)
+
+/*
+ * A：加速度前馈。
+ *
+ * 小球仍在向原点加速时提前卸力，
+ * 小球正向外加速时提前加强修正。
+ */
+#define BALL_PID_KA                         (0.00015f)
+
+/*
+ * 只有在±35mm内才积累积分。
+ */
+#define PID_INTEGRAL_ACTIVE_MM              (24.0f)
+
+/*
+ * 速度过高时不积累积分，避免高速阶段积分过量。
+ */
+#define PID_INTEGRAL_MAX_SPEED_MM_S         (130.0f)
+
+/*
+ * 积分项最大只允许贡献±1.6°。
+ */
+#define PID_INTEGRAL_MAX_ANGLE_DEG          (0.7f)
+
+/*
+ * 不满足积分条件时，积分每个新坐标帧乘以0.90。
+ */
+#define PID_INTEGRAL_DECAY                  (0.90f)
+
+/*
+ * 加速度项最大只允许贡献±1.2°。
+ */
+#define PID_ACCEL_MAX_ANGLE_DEG             (0.45f)
+
+/*==============================================================
+ * 10. 回中进度检查
+ *==============================================================*/
+
+/*
+ * 每120ms检查一次是否真的靠近原点。
+ *
+ * 比上一版200ms更快。
+ */
+#define BALL_PROGRESS_CHECK_MS              (120U)
+
+/*
+ * 120ms内至少靠近原点1.5mm，
+ * 才认为小球确实在运动。
+ */
+#define BALL_MIN_PROGRESS_MM                (1.5f)
+
+/*
+ * 每次没有进展时，
+ * 基础坡度额外增加0.45°。
+ */
+#define STATIC_BIAS_STEP_DEG                (0.45f)
+
+/*
+ * 自适应静摩擦基础补偿最大6°。
+ */
+#define STATIC_BIAS_MAX_DEG                 (6.0f)
+
+/*
+ * 小球已经正常向0运动时，
+ * 每次检查将静摩擦补偿乘以0.80。
+ */
+#define STATIC_BIAS_DECAY                   (0.80f)
+
+
+/*==============================================================
+ * 11. 破静摩擦脉冲参数
+ *==============================================================*/
+
+/*
+ * 第一次破静摩擦脉冲附加2.4°。
+ */
+#define BREAKAWAY_BASE_ANGLE_DEG            (2.4f)
+
+/*
+ * 每次仍然卡住，
+ * 下一次冲击再增加0.75°。
+ */
+#define BREAKAWAY_LEVEL_STEP_DEG            (0.75f)
+
+/*
+ * 最大冲击等级。
+ */
+#define BREAKAWAY_MAX_LEVEL                 (4U)
+
+/*
+ * 一次破静摩擦脉冲持续110ms。
+ */
+#define BREAKAWAY_MAX_TIME_MS               (110U)
+
+/*
+ * 至少执行45ms后，
+ * 检测到小球已经明显向0运动时可以提前结束。
+ */
+#define BREAKAWAY_MIN_TIME_MS               (45U)
+
+/*
+ * 速度超过该值，
+ * 认为静摩擦已经被克服。
+ */
+#define BREAKAWAY_RELEASE_SPEED_MM_S        (18.0f)
+
+/*
+ * 破静摩擦时目标角度快速变化。
+ */
+#define BREAKAWAY_SLEW_DEG_S                (620.0f)
+
+
+/*==============================================================
+ * 12. 预测捕获制动参数
+ *==============================================================*/
+
+/*
+ * 实际位置进入±18mm后，无条件允许考虑捕获。
+ */
+#define BALL_CAPTURE_ENTER_MM               (18.0f)
+
+/*
+ * 即使实际位置还没有进入±18mm，
+ * 只要在±38mm内且预测即将到0，也可以提前捕获。
+ */
+#define PREDICTIVE_CAPTURE_MAX_DISTANCE_MM  (38.0f)
+
+/*
+ * 预测位置进入±5mm，认为即将到达原点。
+ */
+#define PREDICTIVE_CAPTURE_WINDOW_MM        (5.0f)
+
+/*
+ * 预计到达原点时间小于145ms时允许提前捕获。
+ */
+#define PREDICTIVE_CAPTURE_MAX_TTC_S        (0.145f)
+
+/*
+ * 正在向0运动并且速度超过10mm/s时，
+ * 才启动捕获。
+ */
+#define BALL_CAPTURE_MIN_SPEED_MM_S         (14.0f)
+
+/*
+ * 捕获至少持续35ms，避免刚切入就退出。
+ */
+#define BALL_CAPTURE_MIN_TIME_MS            (35U)
+
+/*
+ * 捕获最长持续190ms。
+ */
+#define BALL_CAPTURE_MAX_TIME_MS            (190U)
+
+/*
+ * 速度降低到8mm/s以下且已经接近原点，
+ * 可以结束捕获。
+ */
+#define BALL_CAPTURE_STOP_SPEED_MM_S        (8.0f)
+
+/*
+ * 捕获速度增益。
+ */
+#define BALL_CAPTURE_KD                     (0.046f)
+
+/*
+ * 捕获加速度前馈。
+ */
+#define BALL_CAPTURE_KA                     (0.00020f)
+
+/*
+ * 最小制动角度。
+ */
+#define BALL_CAPTURE_MIN_ANGLE_DEG          (0.45f)
+
+/*
+ * 最大制动角度。
+ */
+#define BALL_CAPTURE_MAX_ANGLE_DEG          (3.4f)
+
+/*
+ * 捕获目标角度快速执行。
+ */
+#define BALL_CAPTURE_SLEW_DEG_S             (420.0f)
+
+/*
+ * 捕获结束后短暂冷却，防止中心附近频繁切换状态。
+ */
+#define CAPTURE_COOLDOWN_MS                 (260U)
+
+/*==============================================================
+ * 13. 距离分段角度限制
+ *==============================================================*/
+
+/*
+ * 距离大于50mm：
+ * 最大允许14°。
+ */
+#define FAR_POSITION_MM                     (50.0f)
+#define FAR_MAX_ANGLE_DEG                   (14.0f)
+
+/*
+ * 距离在14～50mm：
+ * 最大允许9°。
+ */
+#define MIDDLE_POSITION_MM                  (14.0f)
+#define MIDDLE_MAX_ANGLE_DEG                (10.0f)
+
+/*
+ * 原点附近普通拉回最大3°。
+ */
+#define NEAR_MAX_ANGLE_DEG                  (4.0f)
+
+/*
+ * 总软件角度限位。
+ */
+#define MAX_MOTOR_ANGLE_DEG                 (14.0f)
+
+
+/*==============================================================
+ * 14. 目标角度响应参数
+ *==============================================================*/
+
+/*
+ * 普通拉回角度变化速度。
+ *
+ * 比上一版更快。
+ */
+#define NORMAL_TARGET_SLEW_DEG_S            (320.0f)
+
+/*
+ * 返回水平时的角度速度。
+ */
+#define LEVEL_RETURN_SLEW_DEG_S             (420.0f)
+
+
+/*==============================================================
+ * 15. 步进电机位置控制参数
+ *==============================================================*/
+
+/*
+ * 软件位置误差转换为STEP频率。
+ */
+#define MOTOR_POSITION_KP                   (22.0f)
+
+/*
+ * 最大STEP频率提高到1400。
+ */
+#define MOTOR_MAX_STEP_RATE_SPS             (1800.0f)
+
+/*
+ * 小误差时的最低STEP速度。
+ */
+#define MOTOR_MIN_STEP_RATE_SPS             (85.0f)
+
+/*
+ * 加速度提高到25000脉冲/s²。
+ */
+#define MOTOR_MAX_ACCEL_SPS2                (30000.0f)
+
+/*
+ * 目标位置误差不超过1脉冲时停止。
+ */
+#define MOTOR_POSITION_DEADBAND_PULSE       (1)
+
+
+/*==============================================================
+ * 16. 上电参数
+ *==============================================================*/
+
+/*
+ * 上电后关闭驱动2秒。
+ */
+#define START_DELAY_MS                      (2000U)
+
+/*
+ * 使能后的稳定等待时间。
+ */
+#define ENABLE_SETTLE_MS                    (100U)
+
+
+/*==============================================================
+ * 17. 全局调试变量
+ *==============================================================*/
+
+volatile uint32_t g_system_ms = 0U;
+
+volatile int32_t g_k230_position_mm = 0;
+
+volatile uint32_t g_k230_valid_count = 0U;
+
+volatile uint32_t g_frame_process_count = 0U;
+
+volatile uint32_t g_k230_last_rx_ms = 0U;
+
+volatile uint8_t g_k230_new_sample = 0U;
+
+volatile uint8_t g_ball_control_due = 0U;
+
+volatile uint8_t g_motor_control_due = 0U;
+
+
+/*
+ * =============================================================
+ * JY60接收与调试变量
+ * =============================================================
+ */
+
+/* 最近一帧三轴原始加速度。 */
+volatile int16_t g_jy60_accel_raw_x = 0;
+volatile int16_t g_jy60_accel_raw_y = 0;
+volatile int16_t g_jy60_accel_raw_z = 0;
+
+/* 最近一帧接收时间。 */
+volatile uint32_t g_jy60_last_rx_ms = 0U;
+
+/* 有效加速度帧数。 */
+volatile uint32_t g_jy60_valid_count = 0U;
+
+/* 校验失败帧数。 */
+volatile uint32_t g_jy60_checksum_error_count = 0U;
+
+/* 当前是否在收集上电静止零偏。 */
+volatile uint8_t g_jy60_collect_calibration = 1U;
+
+/* 静止标定原始值累加。 */
+volatile int32_t g_jy60_calibration_sum_raw = 0;
+
+/* 静止标定帧数。 */
+volatile uint32_t g_jy60_calibration_count = 0U;
+
+/*
+ * 0：未完成标定或JY60离线
+ * 1：标定完成且最近收到有效帧
+ */
+volatile uint32_t g_debug_jy60_online = 0U;
+
+/* 上电标定是否成功。 */
+volatile uint32_t g_debug_jy60_calibrated = 0U;
+
+/* 当前使用轴的原始值。 */
+volatile int32_t g_debug_jy60_forward_raw = 0;
+
+/* 上电静止零偏原始值。 */
+volatile int32_t g_debug_jy60_zero_raw = 0;
+
+/* JY60通信年龄，单位ms。 */
+volatile uint32_t g_debug_jy60_age_ms = 0U;
+
+/* 小车纵向滤波加速度，单位mg。 */
+volatile int32_t g_debug_vehicle_accel_mg = 0;
+
+/* 理论目标补偿角，单位0.01°。 */
+volatile int32_t g_debug_vehicle_comp_target_x100 = 0;
+
+/* 斜率限制后的实际前馈补偿角，单位0.01°。 */
+volatile int32_t g_debug_vehicle_comp_angle_x100 = 0;
+
+/*
+ * 当前车辆补偿阶段：
+ * 0 = 加速度死区/匀速/静止
+ * 1 = 向前启动或加速
+ * 2 = 向前减速或停车
+ * 3 = JY60离线或尚未完成标定
+ */
+volatile uint32_t g_debug_vehicle_comp_phase = 3U;
+
+/* 当前实际选中的滤波系数，乘1000显示。 */
+volatile int32_t g_debug_vehicle_filter_alpha_x1000 = 0;
+
+/* 当前实际选中的补偿增益，乘1000显示。 */
+volatile int32_t g_debug_vehicle_comp_gain_x1000 = 0;
+
+/* 当前实际选中的角度斜率，单位°/s。 */
+volatile int32_t g_debug_vehicle_comp_slew_deg_s = 0;
+
+
+/*
+ * 0：等待K230
+ * 1：正常拉回
+ * 2：原点软着陆
+ * 3：原点锁定
+ * 4：静摩擦补偿增加
+ * 5：一次性捕获
+ * 6：破静摩擦脉冲
+ */
+volatile uint32_t g_balance_state =
+    BALL_STATE_WAITING;
+
+volatile uint32_t g_center_confirm_count = 0U;
+
+/*
+ * 控制位置，单位0.1mm。
+ */
+volatile int32_t g_debug_position_x10 = 0;
+
+/*
+ * 滤波位置，单位0.1mm。
+ */
+volatile int32_t g_debug_filtered_position_x10 = 0;
+
+/*
+ * 速度，单位0.1mm/s。
+ */
+volatile int32_t g_debug_velocity_x10 = 0;
+
+/*
+ * 多帧估计加速度，单位0.1mm/s²。
+ */
+volatile int32_t g_debug_acceleration_x10 = 0;
+
+/*
+ * 预测位置，单位0.1mm。
+ */
+volatile int32_t g_debug_predicted_position_x10 = 0;
+
+/*
+ * 预测速度，单位0.1mm/s。
+ */
+volatile int32_t g_debug_predicted_velocity_x10 = 0;
+
+/*
+ * 当前预测时间，单位ms。
+ */
+volatile uint32_t g_debug_prediction_time_ms = 0U;
+
+/*
+ * 当前有效历史帧数。
+ */
+volatile uint32_t g_debug_motion_history_count = 0U;
+
+/*
+ * 预测功能是否已经有效。
+ */
+volatile uint32_t g_debug_prediction_ready = 0U;
+
+/*
+ * PID使用的预测融合位置，单位0.1mm。
+ */
+volatile int32_t g_debug_pid_position_x10 = 0;
+
+/*
+ * PID各项输出角度，单位0.01°。
+ */
+volatile int32_t g_debug_pid_p_x100 = 0;
+volatile int32_t g_debug_pid_i_x100 = 0;
+volatile int32_t g_debug_pid_d_x100 = 0;
+volatile int32_t g_debug_pid_a_x100 = 0;
+
+/*
+ * 预测捕获触发标志：
+ * 0未触发，1由预测位置/预计到达时间提前触发。
+ */
+volatile uint32_t g_debug_predictive_capture = 0U;
+
+/*
+ * 中心偏置学习角度，单位0.01°。
+ */
+volatile int32_t g_debug_center_trim_x100 = 0;
+
+/*
+ * 连续越出中心锁定区的帧数。
+ */
+volatile uint32_t g_debug_center_exit_count = 0U;
+
+/*
+ * 最终目标角度，单位0.01°。
+ */
+volatile int32_t g_debug_target_angle_x100 = 0;
+
+/*
+ * 当前软件电机角度，单位0.01°。
+ */
+volatile int32_t g_debug_motor_angle_x100 = 0;
+
+/*
+ * 静摩擦基础补偿，单位0.01°。
+ */
+volatile int32_t g_debug_static_bias_x100 = 0;
+
+/*
+ * 破静摩擦冲击角度，单位0.01°。
+ */
+volatile int32_t g_debug_breakaway_angle_x100 = 0;
+
+/*
+ * 捕获制动角度，单位0.01°。
+ */
+volatile int32_t g_debug_capture_angle_x100 = 0;
+
+/*
+ * 破静摩擦次数。
+ */
+volatile uint32_t g_breakaway_count = 0U;
+
+/*
+ * 当前冲击等级。
+ */
+volatile uint32_t g_breakaway_level = 0U;
+
+/*
+ * 捕获持续时间。
+ */
+volatile uint32_t g_debug_capture_elapsed_ms = 0U;
+
+/*
+ * 破静摩擦持续时间。
+ */
+volatile uint32_t g_debug_breakaway_elapsed_ms = 0U;
+
+/*
+ * K230通信年龄。
+ */
+volatile uint32_t g_debug_uart_age_ms = 0U;
+
+/*
+ * K230帧间隔。
+ */
+volatile uint32_t g_debug_frame_dt_ms = 0U;
+
+/*
+ * 电机目标脉冲。
+ */
+volatile int32_t g_motor_target_pulse = 0;
+
+/*
+ * 软件累计当前脉冲位置。
+ */
+volatile int32_t g_motor_current_pulse = 0;
+
+/*
+ * 当前STEP频率。
+ */
+volatile int32_t g_step_rate_sps = 0;
+
+volatile uint32_t g_step_output_level = 0U;
+volatile uint32_t g_direction_output_level = 0U;
+volatile uint32_t g_enable_output_level = 0U;
+
+
+/*==============================================================
+ * 18. 内部控制变量
+ *==============================================================*/
+
+static float g_filtered_position_mm = 0.0f;
+
+static float g_previous_filtered_position_mm = 0.0f;
+
+static float g_filtered_velocity_mm_s = 0.0f;
+
+/*
+ * 5帧趋势估计得到的加速度。
+ */
+static float g_filtered_acceleration_mm_s2 = 0.0f;
+
+/*
+ * 预测到未来T时刻的位置和速度。
+ */
+static float g_predicted_position_mm = 0.0f;
+static float g_predicted_velocity_mm_s = 0.0f;
+static float g_prediction_time_s = 0.0f;
+
+/*
+ * 最近若干帧的位置和时间历史。
+ *
+ * 下标0为最旧，下标count-1为最新。
+ */
+static float g_motion_position_history_mm[
+    MOTION_HISTORY_SIZE];
+
+static uint32_t g_motion_time_history_ms[
+    MOTION_HISTORY_SIZE];
+
+static uint8_t g_motion_history_count = 0U;
+
+/*
+ * 最近一次有效测量间隔，供PID积分使用。
+ */
+static float g_last_measurement_dt_s = 0.01f;
+
+/*
+ * PID积分状态，单位mm·s。
+ */
+static float g_pid_integral_mm_s = 0.0f;
+
+/*
+ * PID各项内部角度，便于调试。
+ */
+static float g_pid_p_angle_deg = 0.0f;
+static float g_pid_i_angle_deg = 0.0f;
+static float g_pid_d_angle_deg = 0.0f;
+static float g_pid_a_angle_deg = 0.0f;
+
+static float g_last_accepted_position_mm = 0.0f;
+
+/*
+ * 自适应静摩擦基础补偿。
+ *
+ * 尚未乘BALL_CONTROL_POLARITY。
+ */
+static float g_static_bias_angle_deg = 0.0f;
+
+/*
+ * 破静摩擦脉冲固定目标。
+ *
+ * 尚未乘BALL_CONTROL_POLARITY。
+ */
+static float g_breakaway_target_angle_deg = 0.0f;
+
+/*
+ * 捕获制动固定角度。
+ *
+ * 尚未乘BALL_CONTROL_POLARITY。
+ */
+static float g_capture_brake_angle_deg = 0.0f;
+
+static float g_requested_motor_angle_deg = 0.0f;
+
+static float g_applied_motor_angle_deg = 0.0f;
+
+/*
+ * 原点附近慢速学习的水平偏置，尚未乘控制极性。
+ */
+static float g_center_trim_angle_deg = 0.0f;
+
+static uint32_t g_center_exit_confirm_count = 0U;
+
+static uint32_t g_last_measurement_time_ms = 0U;
+
+static uint8_t g_observer_initialized = 0U;
+
+static uint8_t g_measurement_updated_for_control = 0U;
+
+/*
+ * 回中进度监测。
+ */
+static float g_progress_reference_abs_mm = 0.0f;
+
+static uint32_t g_progress_reference_ms = 0U;
+
+static uint8_t g_progress_initialized = 0U;
+
+/*
+ * 上一次位置，用于判断是否穿过原点。
+ */
+static float g_previous_control_position_mm = 0.0f;
+
+/*
+ * 捕获状态时间。
+ */
+static uint32_t g_capture_start_ms = 0U;
+
+/*
+ * 捕获冷却时间。
+ */
+static uint32_t g_capture_cooldown_remaining_ms = 0U;
+
+/*
+ * 本次捕获是否由预测条件提前触发。
+ */
+static uint8_t g_capture_started_predictively = 0U;
+
+/*
+ * 破静摩擦状态时间。
+ */
+static uint32_t g_breakaway_start_ms = 0U;
+
+
+/*
+ * =============================================================
+ * JY60车辆加速度前馈内部状态
+ * =============================================================
+ */
+
+/* 上电静止标定得到的前后轴零偏。 */
+static int32_t g_jy60_zero_raw = 0;
+
+/* 是否已经完成有效静止标定。 */
+static uint8_t g_jy60_calibrated = 0U;
+
+/* 滤波后的车辆纵向加速度，单位g。 */
+static float g_vehicle_accel_filtered_g = 0.0f;
+
+/* 按atan(a/g)计算的目标补偿角。 */
+static float g_vehicle_comp_target_angle_deg = 0.0f;
+
+/* 斜率限制后真正加入钢球控制的补偿角。 */
+static float g_vehicle_comp_angle_deg = 0.0f;
+
+
+/*==============================================================
+ * 19. 基础函数
+ *==============================================================*/
+
+static float FloatAbs(float value)
+{
+    if (value < 0.0f)
+    {
+        return -value;
+    }
+
+    return value;
+}
+
+
+static float FloatClamp(
+    float value,
+    float minimum,
+    float maximum)
+{
+    if (value > maximum)
+    {
+        return maximum;
+    }
+
+    if (value < minimum)
+    {
+        return minimum;
+    }
+
+    return value;
+}
+
+
+static float FloatSign(float value)
+{
+    if (value > 0.0f)
+    {
+        return 1.0f;
+    }
+
+    if (value < 0.0f)
+    {
+        return -1.0f;
+    }
+
+    return 0.0f;
+}
+
+
+static int32_t Int32Abs(int32_t value)
+{
+    if (value < 0)
+    {
+        return -value;
+    }
+
+    return value;
+}
+
+
+static int32_t FloatToInt32(float value)
+{
+    if (value >= 0.0f)
+    {
+        return (int32_t)(value + 0.5f);
+    }
+
+    return (int32_t)(value - 0.5f);
+}
+
+
+/*
+ * atan近似。
+ *
+ * 本项目只使用|a/g|<=0.30，
+ * 使用x-x^3/3+x^5/5已经足够准确，
+ * 同时避免引入math.h和额外数学库。
+ */
+static float AtanApproxRad(float value)
+{
+    float squared;
+
+
+    value =
+        FloatClamp(
+            value,
+            -0.50f,
+            0.50f);
+
+
+    squared =
+        value *
+        value;
+
+
+    return
+        value *
+        (
+            1.0f -
+            squared /
+            3.0f +
+            squared *
+            squared /
+            5.0f
+        );
+}
+
+
+/*
+ * 根据宏选择JY60作为小车前后方向的轴。
+ */
+static int16_t SelectJY60ForwardRaw(
+    int16_t rawX,
+    int16_t rawY,
+    int16_t rawZ)
+{
+#if JY60_FORWARD_AXIS == 0U
+
+    (void)rawY;
+    (void)rawZ;
+
+    return rawX;
+
+#elif JY60_FORWARD_AXIS == 1U
+
+    (void)rawX;
+    (void)rawZ;
+
+    return rawY;
+
+#else
+
+    (void)rawX;
+    (void)rawY;
+
+    return rawZ;
+
+#endif
+}
+
+
+/*==============================================================
+ * 20. 延时函数
+ *==============================================================*/
+
+static void DelayMs(uint32_t milliseconds)
+{
+    while (milliseconds > 0U)
+    {
+        DL_Common_delayCycles(
+            CPUCLK_FREQ / 1000U);
+
+        milliseconds--;
+    }
+}
+
+
+/*==============================================================
+ * 21. 调试变量更新
+ *==============================================================*/
+
+static void UpdateControlDebug(
+    float positionMm,
+    float velocityMmS)
+{
+    g_debug_position_x10 =
+        FloatToInt32(
+            positionMm *
+            10.0f);
+
+    g_debug_filtered_position_x10 =
+        FloatToInt32(
+            g_filtered_position_mm *
+            10.0f);
+
+    g_debug_velocity_x10 =
+        FloatToInt32(
+            velocityMmS *
+            10.0f);
+
+    g_debug_acceleration_x10 =
+        FloatToInt32(
+            g_filtered_acceleration_mm_s2 *
+            10.0f);
+
+    g_debug_predicted_position_x10 =
+        FloatToInt32(
+            g_predicted_position_mm *
+            10.0f);
+
+    g_debug_predicted_velocity_x10 =
+        FloatToInt32(
+            g_predicted_velocity_mm_s *
+            10.0f);
+
+    g_debug_prediction_time_ms =
+        (uint32_t)(
+            g_prediction_time_s *
+            1000.0f +
+            0.5f);
+
+    g_debug_motion_history_count =
+        g_motion_history_count;
+
+    if (g_motion_history_count >=
+        PREDICTION_MIN_HISTORY_FRAMES)
+    {
+        g_debug_prediction_ready = 1U;
+    }
+    else
+    {
+        g_debug_prediction_ready = 0U;
+    }
+
+    g_debug_pid_p_x100 =
+        FloatToInt32(
+            g_pid_p_angle_deg *
+            100.0f);
+
+    g_debug_pid_i_x100 =
+        FloatToInt32(
+            g_pid_i_angle_deg *
+            100.0f);
+
+    g_debug_pid_d_x100 =
+        FloatToInt32(
+            g_pid_d_angle_deg *
+            100.0f);
+
+    g_debug_pid_a_x100 =
+        FloatToInt32(
+            g_pid_a_angle_deg *
+            100.0f);
+
+    g_debug_target_angle_x100 =
+        FloatToInt32(
+            g_applied_motor_angle_deg *
+            100.0f);
+
+    g_debug_static_bias_x100 =
+        FloatToInt32(
+            g_static_bias_angle_deg *
+            100.0f);
+
+    g_debug_breakaway_angle_x100 =
+        FloatToInt32(
+            g_breakaway_target_angle_deg *
+            100.0f);
+
+    g_debug_capture_angle_x100 =
+        FloatToInt32(
+            g_capture_brake_angle_deg *
+            100.0f);
+
+    g_debug_center_trim_x100 =
+        FloatToInt32(
+            g_center_trim_angle_deg *
+            100.0f);
+
+    g_debug_center_exit_count =
+        g_center_exit_confirm_count;
+}
+
+
+/*==============================================================
+ * 22. 电机GPIO初始化
+ *==============================================================*/
+
+static void StepperGPIOInit(void)
+{
+    DL_GPIO_enableOutput(
+        GPIOB,
+        STEP_PIN |
+        DIR_PIN |
+        EN_PIN);
+
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN);
+
+    DL_GPIO_clearPins(
+        DIR_PORT,
+        DIR_PIN);
+
+    g_step_output_level = 0U;
+    g_direction_output_level = 0U;
+}
+
+
+/*==============================================================
+ * 23. D36A使能
+ *==============================================================*/
+
+static void StepperEnable(uint32_t enable)
+{
+#if ENABLE_ACTIVE_HIGH == 1U
+
+    if (enable != 0U)
+    {
+        DL_GPIO_setPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 1U;
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 0U;
+    }
+
+#else
+
+    if (enable != 0U)
+    {
+        DL_GPIO_clearPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 0U;
+    }
+    else
+    {
+        DL_GPIO_setPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 1U;
+    }
+
+#endif
+}
+
+
+/*==============================================================
+ * 24. 设置方向
+ *==============================================================*/
+
+static void SetMotorDirection(int32_t direction)
+{
+    uint32_t outputLevel;
+
+    if (direction > 0)
+    {
+        outputLevel =
+            POSITIVE_DIRECTION_LEVEL;
+    }
+    else
+    {
+        outputLevel =
+            (POSITIVE_DIRECTION_LEVEL == 0U) ?
+            1U : 0U;
+    }
+
+    if (outputLevel != 0U)
+    {
+        DL_GPIO_setPins(
+            DIR_PORT,
+            DIR_PIN);
+
+        g_direction_output_level = 1U;
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            DIR_PORT,
+            DIR_PIN);
+
+        g_direction_output_level = 0U;
+    }
+}
+
+
+/*==============================================================
+ * 25. 角度与脉冲换算
+ *==============================================================*/
+
+static int32_t MotorAngleToPulse(float angleDeg)
+{
+    return FloatToInt32(
+        angleDeg *
+        MOTOR_PULSES_PER_DEG);
+}
+
+
+static float MotorPulseToAngle(int32_t pulse)
+{
+    return
+        (float)pulse /
+        MOTOR_PULSES_PER_DEG;
+}
+
+
+/*==============================================================
+ * 26. STEP脉冲服务
+ *
+ * 调用频率10kHz。
+ *==============================================================*/
+
+static void StepPulseService100us(void)
+{
+    static uint32_t phaseAccumulator = 0U;
+
+    static uint8_t stepPinHigh = 0U;
+
+    static int32_t appliedDirection = 0;
+
+    int32_t requestedRate;
+
+    int32_t direction;
+
+    uint32_t magnitude;
+
+
+    requestedRate =
+        g_step_rate_sps;
+
+
+    /*
+     * 上一次STEP为高电平：
+     * 本周期先拉低。
+     */
+    if (stepPinHigh != 0U)
+    {
+        DL_GPIO_clearPins(
+            STEP_PORT,
+            STEP_PIN);
+
+        stepPinHigh = 0U;
+
+        g_step_output_level = 0U;
+    }
+
+
+    if (requestedRate == 0)
+    {
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    if (requestedRate > 0)
+    {
+        direction = 1;
+
+        magnitude =
+            (uint32_t)requestedRate;
+    }
+    else
+    {
+        direction = -1;
+
+        magnitude =
+            (uint32_t)(-requestedRate);
+    }
+
+
+    /*
+     * 已经到达目标位置。
+     */
+    if ((direction > 0) &&
+        (g_motor_current_pulse >=
+         g_motor_target_pulse))
+    {
+        g_step_rate_sps = 0;
+
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    if ((direction < 0) &&
+        (g_motor_current_pulse <=
+         g_motor_target_pulse))
+    {
+        g_step_rate_sps = 0;
+
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    /*
+     * 方向切换时，本周期只改变DIR。
+     */
+    if (direction != appliedDirection)
+    {
+        SetMotorDirection(
+            direction);
+
+        appliedDirection =
+            direction;
+
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    /*
+     * 软件总角度限位。
+     */
+    if ((direction > 0) &&
+        (g_motor_current_pulse >=
+         MotorAngleToPulse(
+             MAX_MOTOR_ANGLE_DEG)))
+    {
+        g_step_rate_sps = 0;
+
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    if ((direction < 0) &&
+        (g_motor_current_pulse <=
+         MotorAngleToPulse(
+             -MAX_MOTOR_ANGLE_DEG)))
+    {
+        g_step_rate_sps = 0;
+
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    phaseAccumulator +=
+        magnitude;
+
+
+    if (phaseAccumulator >=
+        SYSTICK_FREQUENCY_HZ)
+    {
+        phaseAccumulator -=
+            SYSTICK_FREQUENCY_HZ;
+
+
+        DL_GPIO_setPins(
+            STEP_PORT,
+            STEP_PIN);
+
+
+        stepPinHigh = 1U;
+
+        g_step_output_level = 1U;
+
+
+        g_motor_current_pulse +=
+            direction;
+    }
+}
+
+
+/*==============================================================
+ * 27. 提交K230坐标
+ *==============================================================*/
+
+static void CommitK230Coordinate(
+    int32_t coordinateMm)
+{
+    if (coordinateMm >
+        BALL_POSITION_LIMIT_MM)
+    {
+        coordinateMm =
+            BALL_POSITION_LIMIT_MM;
+    }
+
+    if (coordinateMm <
+        -BALL_POSITION_LIMIT_MM)
+    {
+        coordinateMm =
+            -BALL_POSITION_LIMIT_MM;
+    }
+
+    g_k230_position_mm =
+        coordinateMm;
+
+    g_k230_last_rx_ms =
+        g_system_ms;
+
+    g_k230_new_sample = 1U;
+
+    g_k230_valid_count++;
+}
+
+
+/*==============================================================
+ * 28. 解析K230字符串
+ *==============================================================*/
+
+static void ParseK230Byte(uint8_t data)
+{
+    static int32_t value = 0;
+
+    static int32_t sign = 1;
+
+    static uint8_t receivingNumber = 0U;
+
+    static uint8_t hasDigit = 0U;
+
+
+    if (data == '-')
+    {
+        value = 0;
+
+        sign = -1;
+
+        receivingNumber = 1U;
+
+        hasDigit = 0U;
+
+        return;
+    }
+
+
+    if (data == '+')
+    {
+        value = 0;
+
+        sign = 1;
+
+        receivingNumber = 1U;
+
+        hasDigit = 0U;
+
+        return;
+    }
+
+
+    if ((data >= '0') &&
+        (data <= '9'))
+    {
+        if (receivingNumber == 0U)
+        {
+            value = 0;
+
+            sign = 1;
+
+            receivingNumber = 1U;
+
+            hasDigit = 0U;
+        }
+
+
+        value =
+            value * 10 +
+            (int32_t)(data - '0');
+
+
+        if (value > 999)
+        {
+            value = 999;
+        }
+
+
+        hasDigit = 1U;
+
+        return;
+    }
+
+
+    if ((data == '\r') ||
+        (data == '\n') ||
+        (data == ' ')  ||
+        (data == ',')  ||
+        (data == ';'))
+    {
+        if ((receivingNumber != 0U) &&
+            (hasDigit != 0U))
+        {
+            CommitK230Coordinate(
+                sign * value);
+        }
+
+
+        value = 0;
+
+        sign = 1;
+
+        receivingNumber = 0U;
+
+        hasDigit = 0U;
+    }
+}
+
+
+/*==============================================================
+ * 29. UART0中断
+ *==============================================================*/
+
+void UART0_IRQHandler(void)
+{
+    uint32_t pendingInterrupt;
+
+
+    pendingInterrupt =
+        DL_UART_Main_getPendingInterrupt(
+            K230_UART_INST);
+
+
+    switch (pendingInterrupt)
+    {
+        case DL_UART_MAIN_IIDX_RX:
+
+            while (!DL_UART_Main_isRXFIFOEmpty(
+                        K230_UART_INST))
+            {
+                uint8_t receivedByte;
+
+
+                receivedByte =
+                    (uint8_t)
+                    DL_UART_Main_receiveData(
+                        K230_UART_INST);
+
+
+                ParseK230Byte(
+                    receivedByte);
+            }
+
+            break;
+
+
+        default:
+
+            break;
+    }
+}
+
+
+/*==============================================================
+ * 29A. JY60加速度帧提交
+ *==============================================================*/
+
+static void CommitJY60AccelerationFrame(
+    const uint8_t *frame)
+{
+    int16_t rawX;
+    int16_t rawY;
+    int16_t rawZ;
+    int16_t forwardRaw;
+
+
+    rawX =
+        (int16_t)(
+            (uint16_t)frame[2] |
+            ((uint16_t)frame[3] << 8));
+
+
+    rawY =
+        (int16_t)(
+            (uint16_t)frame[4] |
+            ((uint16_t)frame[5] << 8));
+
+
+    rawZ =
+        (int16_t)(
+            (uint16_t)frame[6] |
+            ((uint16_t)frame[7] << 8));
+
+
+    g_jy60_accel_raw_x =
+        rawX;
+
+    g_jy60_accel_raw_y =
+        rawY;
+
+    g_jy60_accel_raw_z =
+        rawZ;
+
+
+    g_jy60_last_rx_ms =
+        g_system_ms;
+
+
+    g_jy60_valid_count++;
+
+
+    /*
+     * 上电2秒内车辆必须静止。
+     * 在中断中直接累加原始值，避免浮点计算。
+     */
+    if ((g_jy60_collect_calibration != 0U) &&
+        (g_jy60_calibration_count <
+         JY60_CALIBRATION_MAX_SAMPLES))
+    {
+        forwardRaw =
+            SelectJY60ForwardRaw(
+                rawX,
+                rawY,
+                rawZ);
+
+
+        g_jy60_calibration_sum_raw +=
+            (int32_t)forwardRaw;
+
+
+        g_jy60_calibration_count++;
+    }
+}
+
+
+/*==============================================================
+ * 29B. JY60字节流解析
+ *==============================================================*/
+
+static void ParseJY60Byte(uint8_t data)
+{
+    static uint8_t frame[
+        JY60_FRAME_LENGTH];
+
+    static uint8_t index = 0U;
+
+    uint8_t checksum;
+
+    uint32_t i;
+
+
+    /*
+     * 等待帧头0x55。
+     */
+    if (index == 0U)
+    {
+        if (data ==
+            JY60_FRAME_HEADER)
+        {
+            frame[0] =
+                data;
+
+            index =
+                1U;
+        }
+
+        return;
+    }
+
+
+    frame[index] =
+        data;
+
+    index++;
+
+
+    if (index <
+        JY60_FRAME_LENGTH)
+    {
+        return;
+    }
+
+
+    checksum =
+        0U;
+
+
+    for (i = 0U;
+         i < 10U;
+         i++)
+    {
+        checksum =
+            (uint8_t)(
+                checksum +
+                frame[i]);
+    }
+
+
+    if (checksum ==
+        frame[10])
+    {
+        if (frame[1] ==
+            JY60_FRAME_ACCELERATION)
+        {
+            CommitJY60AccelerationFrame(
+                frame);
+        }
+    }
+    else
+    {
+        g_jy60_checksum_error_count++;
+    }
+
+
+    /*
+     * 一帧处理完后重新等待0x55。
+     */
+    index =
+        0U;
+}
+
+
+/*==============================================================
+ * 29C. UART1中断：JY60
+ *==============================================================*/
+
+void UART1_IRQHandler(void)
+{
+    uint32_t pendingInterrupt;
+
+
+    pendingInterrupt =
+        DL_UART_Main_getPendingInterrupt(
+            JY60_UART_INST);
+
+
+    switch (pendingInterrupt)
+    {
+        case DL_UART_MAIN_IIDX_RX:
+
+            while (!DL_UART_Main_isRXFIFOEmpty(
+                        JY60_UART_INST))
+            {
+                uint8_t receivedByte;
+
+
+                receivedByte =
+                    (uint8_t)
+                    DL_UART_Main_receiveData(
+                        JY60_UART_INST);
+
+
+                ParseJY60Byte(
+                    receivedByte);
+            }
+
+            break;
+
+
+        default:
+
+            break;
+    }
+}
+
+
+/*==============================================================
+ * 30. 更新位置和速度估计
+ *==============================================================*/
+
+static void UpdateBallMeasurement(
+    float measurementMm,
+    uint32_t sampleTimeMs)
+{
+    float dt;
+
+    float measurementJump;
+
+    float acceptedMeasurement;
+
+    float instantVelocity;
+
+    float trendVelocity;
+
+    float rawVelocity;
+
+    float oldVelocity;
+
+    float recentVelocity;
+
+    float rawAcceleration;
+
+    float historySpanS;
+
+    float oldSpanS;
+
+    float recentSpanS;
+
+    float accelerationSpanS;
+
+    float predictionCorrection;
+
+    uint32_t middleIndex;
+
+    uint32_t index;
+
+
+    if (g_observer_initialized == 0U)
+    {
+        g_last_accepted_position_mm =
+            measurementMm;
+
+        g_filtered_position_mm =
+            measurementMm;
+
+        g_previous_filtered_position_mm =
+            measurementMm;
+
+        g_filtered_velocity_mm_s =
+            0.0f;
+
+        g_filtered_acceleration_mm_s2 =
+            0.0f;
+
+        g_predicted_position_mm =
+            measurementMm;
+
+        g_predicted_velocity_mm_s =
+            0.0f;
+
+        g_prediction_time_s =
+            PREDICTION_MIN_TIME_S;
+
+        g_last_measurement_dt_s =
+            0.01f;
+
+        g_motion_position_history_mm[0] =
+            measurementMm;
+
+        g_motion_time_history_ms[0] =
+            sampleTimeMs;
+
+        g_motion_history_count =
+            1U;
+
+        g_last_measurement_time_ms =
+            sampleTimeMs;
+
+        g_observer_initialized = 1U;
+
+        g_measurement_updated_for_control =
+            1U;
+
+        g_debug_frame_dt_ms = 0U;
+
+        g_frame_process_count++;
+
+        return;
+    }
+
+
+    dt =
+        (float)(
+            sampleTimeMs -
+            g_last_measurement_time_ms) /
+        1000.0f;
+
+
+    if (dt < 0.005f)
+    {
+        dt = 0.005f;
+    }
+
+    if (dt > 0.150f)
+    {
+        dt = 0.150f;
+    }
+
+
+    g_last_measurement_dt_s =
+        dt;
+
+
+    g_debug_frame_dt_ms =
+        (uint32_t)(
+            dt *
+            1000.0f +
+            0.5f);
+
+
+    measurementJump =
+        measurementMm -
+        g_last_accepted_position_mm;
+
+
+    measurementJump =
+        FloatClamp(
+            measurementJump,
+            -MAX_POSITION_JUMP_PER_FRAME_MM,
+            MAX_POSITION_JUMP_PER_FRAME_MM);
+
+
+    acceptedMeasurement =
+        g_last_accepted_position_mm +
+        measurementJump;
+
+
+    g_last_accepted_position_mm =
+        acceptedMeasurement;
+
+
+    g_filtered_position_mm +=
+        POSITION_FILTER_ALPHA *
+        (
+            acceptedMeasurement -
+            g_filtered_position_mm
+        );
+
+
+    instantVelocity =
+        (
+            g_filtered_position_mm -
+            g_previous_filtered_position_mm
+        ) /
+        dt;
+
+
+    instantVelocity =
+        FloatClamp(
+            instantVelocity,
+            -MAX_BALL_SPEED_MM_S,
+            MAX_BALL_SPEED_MM_S);
+
+
+    /*
+     * 更新最近5帧历史。
+     */
+    if (g_motion_history_count <
+        MOTION_HISTORY_SIZE)
+    {
+        g_motion_position_history_mm[
+            g_motion_history_count] =
+            g_filtered_position_mm;
+
+        g_motion_time_history_ms[
+            g_motion_history_count] =
+            sampleTimeMs;
+
+        g_motion_history_count++;
+    }
+    else
+    {
+        for (index = 0U;
+             index <
+             (MOTION_HISTORY_SIZE - 1U);
+             index++)
+        {
+            g_motion_position_history_mm[index] =
+                g_motion_position_history_mm[
+                    index + 1U];
+
+            g_motion_time_history_ms[index] =
+                g_motion_time_history_ms[
+                    index + 1U];
+        }
+
+        g_motion_position_history_mm[
+            MOTION_HISTORY_SIZE - 1U] =
+            g_filtered_position_mm;
+
+        g_motion_time_history_ms[
+            MOTION_HISTORY_SIZE - 1U] =
+            sampleTimeMs;
+    }
+
+
+    trendVelocity =
+        instantVelocity;
+
+    rawAcceleration =
+        0.0f;
+
+
+    /*
+     * 3帧以上时，用最旧帧到最新帧的总体斜率
+     * 估计更稳定的速度。
+     */
+    if (g_motion_history_count >=
+        PREDICTION_MIN_HISTORY_FRAMES)
+    {
+        historySpanS =
+            (float)(
+                g_motion_time_history_ms[
+                    g_motion_history_count - 1U] -
+                g_motion_time_history_ms[0]) /
+            1000.0f;
+
+        if (historySpanS >= 0.010f)
+        {
+            trendVelocity =
+                (
+                    g_motion_position_history_mm[
+                        g_motion_history_count - 1U] -
+                    g_motion_position_history_mm[0]
+                ) /
+                historySpanS;
+        }
+    }
+
+
+    rawVelocity =
+        MULTIFRAME_VELOCITY_WEIGHT *
+        trendVelocity +
+        (
+            1.0f -
+            MULTIFRAME_VELOCITY_WEIGHT
+        ) *
+        instantVelocity;
+
+
+    rawVelocity =
+        FloatClamp(
+            rawVelocity,
+            -MAX_BALL_SPEED_MM_S,
+            MAX_BALL_SPEED_MM_S);
+
+
+    /*
+     * 5帧时，将历史分成前半段和后半段：
+     *
+     * 前半段速度 = 中间帧 - 最旧帧
+     * 后半段速度 = 最新帧 - 中间帧
+     *
+     * 两段速度之差除以时间，得到多帧加速度。
+     */
+    if (g_motion_history_count >=
+        MOTION_HISTORY_SIZE)
+    {
+        middleIndex =
+            g_motion_history_count /
+            2U;
+
+        oldSpanS =
+            (float)(
+                g_motion_time_history_ms[middleIndex] -
+                g_motion_time_history_ms[0]) /
+            1000.0f;
+
+        recentSpanS =
+            (float)(
+                g_motion_time_history_ms[
+                    g_motion_history_count - 1U] -
+                g_motion_time_history_ms[middleIndex]) /
+            1000.0f;
+
+        accelerationSpanS =
+            (float)(
+                g_motion_time_history_ms[
+                    g_motion_history_count - 1U] -
+                g_motion_time_history_ms[0]) /
+            2000.0f;
+
+        if ((oldSpanS >= 0.010f) &&
+            (recentSpanS >= 0.010f) &&
+            (accelerationSpanS >= 0.010f))
+        {
+            oldVelocity =
+                (
+                    g_motion_position_history_mm[middleIndex] -
+                    g_motion_position_history_mm[0]
+                ) /
+                oldSpanS;
+
+            recentVelocity =
+                (
+                    g_motion_position_history_mm[
+                        g_motion_history_count - 1U] -
+                    g_motion_position_history_mm[middleIndex]
+                ) /
+                recentSpanS;
+
+            rawAcceleration =
+                (
+                    recentVelocity -
+                    oldVelocity
+                ) /
+                accelerationSpanS;
+        }
+    }
+    else
+    {
+        rawAcceleration =
+            (
+                rawVelocity -
+                g_filtered_velocity_mm_s
+            ) /
+            dt;
+    }
+
+
+    rawAcceleration =
+        FloatClamp(
+            rawAcceleration,
+            -MAX_BALL_ACCEL_MM_S2,
+            MAX_BALL_ACCEL_MM_S2);
+
+
+    g_filtered_velocity_mm_s +=
+        VELOCITY_FILTER_ALPHA *
+        (
+            rawVelocity -
+            g_filtered_velocity_mm_s
+        );
+
+
+    g_filtered_acceleration_mm_s2 +=
+        ACCELERATION_FILTER_ALPHA *
+        (
+            rawAcceleration -
+            g_filtered_acceleration_mm_s2
+        );
+
+
+    if (FloatAbs(
+            g_filtered_acceleration_mm_s2) <
+        ACCELERATION_DEADBAND_MM_S2)
+    {
+        g_filtered_acceleration_mm_s2 =
+            0.0f;
+    }
+
+
+    /*
+     * 根据当前实际帧率自动选择预测时间。
+     */
+    g_prediction_time_s =
+        FloatClamp(
+            dt *
+            PREDICTION_FRAME_MULTIPLIER,
+            PREDICTION_MIN_TIME_S,
+            PREDICTION_MAX_TIME_S);
+
+
+    predictionCorrection =
+        g_filtered_velocity_mm_s *
+        g_prediction_time_s +
+        0.5f *
+        g_filtered_acceleration_mm_s2 *
+        g_prediction_time_s *
+        g_prediction_time_s;
+
+
+    predictionCorrection =
+        FloatClamp(
+            predictionCorrection,
+            -PREDICTION_MAX_CORRECTION_MM,
+            PREDICTION_MAX_CORRECTION_MM);
+
+
+    g_predicted_position_mm =
+        g_filtered_position_mm +
+        predictionCorrection;
+
+
+    g_predicted_velocity_mm_s =
+        g_filtered_velocity_mm_s +
+        g_filtered_acceleration_mm_s2 *
+        g_prediction_time_s;
+
+
+    g_predicted_velocity_mm_s =
+        FloatClamp(
+            g_predicted_velocity_mm_s,
+            -MAX_BALL_SPEED_MM_S,
+            MAX_BALL_SPEED_MM_S);
+
+
+    g_previous_filtered_position_mm =
+        g_filtered_position_mm;
+
+
+    g_last_measurement_time_ms =
+        sampleTimeMs;
+
+
+    g_measurement_updated_for_control =
+        1U;
+
+
+    g_frame_process_count++;
+}
+
+
+/*==============================================================
+ * 31. 角度斜率限制
+ *==============================================================*/
+
+static float ApplyAngleSlewLimit(
+    float currentAngle,
+    float requestedAngle,
+    float slewRateDegS)
+{
+    float maximumChange;
+
+    float difference;
+
+
+    maximumChange =
+        slewRateDegS *
+        BALL_CONTROL_DT_S;
+
+
+    difference =
+        requestedAngle -
+        currentAngle;
+
+
+    difference =
+        FloatClamp(
+            difference,
+            -maximumChange,
+            maximumChange);
+
+
+    return
+        currentAngle +
+        difference;
+}
+
+
+/*==============================================================
+ * 31A. 完成JY60上电静止零偏标定
+ *==============================================================*/
+
+static void FinishJY60Calibration(void)
+{
+    int32_t calibrationSum;
+
+    uint32_t calibrationCount;
+
+    int16_t rawX;
+    int16_t rawY;
+    int16_t rawZ;
+
+
+    __disable_irq();
+
+
+    g_jy60_collect_calibration =
+        0U;
+
+
+    calibrationSum =
+        g_jy60_calibration_sum_raw;
+
+
+    calibrationCount =
+        g_jy60_calibration_count;
+
+
+    rawX =
+        g_jy60_accel_raw_x;
+
+    rawY =
+        g_jy60_accel_raw_y;
+
+    rawZ =
+        g_jy60_accel_raw_z;
+
+
+    __enable_irq();
+
+
+    if (calibrationCount >=
+        JY60_CALIBRATION_MIN_SAMPLES)
+    {
+        g_jy60_zero_raw =
+            calibrationSum /
+            (int32_t)calibrationCount;
+
+
+        g_jy60_calibrated =
+            1U;
+    }
+    else
+    {
+        /*
+         * 帧数不足时只记录当前值，
+         * 但不启用前馈，避免无效串口数据造成突然倾斜。
+         */
+        g_jy60_zero_raw =
+            (int32_t)
+            SelectJY60ForwardRaw(
+                rawX,
+                rawY,
+                rawZ);
+
+
+        g_jy60_calibrated =
+            0U;
+    }
+
+
+    g_vehicle_accel_filtered_g =
+        0.0f;
+
+
+    g_vehicle_comp_target_angle_deg =
+        0.0f;
+
+
+    g_vehicle_comp_angle_deg =
+        0.0f;
+
+
+    g_debug_jy60_zero_raw =
+        g_jy60_zero_raw;
+
+
+    g_debug_jy60_calibrated =
+        g_jy60_calibrated;
+}
+
+
+/*==============================================================
+ * 31B. 100Hz更新小车加速度前馈角
+ *==============================================================*/
+
+static void UpdateVehicleCompensation100Hz(void)
+{
+    int16_t rawX;
+    int16_t rawY;
+    int16_t rawZ;
+
+    int16_t forwardRaw;
+
+    uint32_t lastRxMs;
+
+    uint32_t ageMs;
+
+    uint8_t calibrated;
+
+    float measuredAccelG;
+
+    float filteredForControl;
+
+    float targetAngleDeg;
+
+    float filterAlpha;
+
+    float compensationGain;
+
+    float compensationSlewDegS;
+
+    uint32_t compensationPhase;
+
+
+    __disable_irq();
+
+
+    rawX =
+        g_jy60_accel_raw_x;
+
+    rawY =
+        g_jy60_accel_raw_y;
+
+    rawZ =
+        g_jy60_accel_raw_z;
+
+
+    lastRxMs =
+        g_jy60_last_rx_ms;
+
+
+    calibrated =
+        g_jy60_calibrated;
+
+
+    __enable_irq();
+
+
+    ageMs =
+        g_system_ms -
+        lastRxMs;
+
+
+    g_debug_jy60_age_ms =
+        ageMs;
+
+
+    forwardRaw =
+        SelectJY60ForwardRaw(
+            rawX,
+            rawY,
+            rawZ);
+
+
+    g_debug_jy60_forward_raw =
+        (int32_t)forwardRaw;
+
+
+    if ((calibrated == 0U) ||
+        (ageMs >
+         JY60_TIMEOUT_MS))
+    {
+        g_debug_jy60_online =
+            0U;
+
+
+        g_vehicle_accel_filtered_g *=
+            0.82f;
+
+
+        g_vehicle_comp_target_angle_deg =
+            0.0f;
+
+
+        g_vehicle_comp_angle_deg =
+            ApplyAngleSlewLimit(
+                g_vehicle_comp_angle_deg,
+                0.0f,
+                VEHICLE_COMPENSATION_RETURN_DEG_S);
+
+
+        g_debug_vehicle_accel_mg =
+            FloatToInt32(
+                g_vehicle_accel_filtered_g *
+                1000.0f);
+
+
+        g_debug_vehicle_comp_target_x100 =
+            0;
+
+
+        g_debug_vehicle_comp_angle_x100 =
+            FloatToInt32(
+                g_vehicle_comp_angle_deg *
+                100.0f);
+
+
+        g_debug_vehicle_comp_phase =
+            3U;
+
+
+        g_debug_vehicle_filter_alpha_x1000 =
+            0;
+
+
+        g_debug_vehicle_comp_gain_x1000 =
+            0;
+
+
+        g_debug_vehicle_comp_slew_deg_s =
+            FloatToInt32(
+                VEHICLE_COMPENSATION_RETURN_DEG_S);
+
+
+        return;
+    }
+
+
+    g_debug_jy60_online =
+        1U;
+
+
+    measuredAccelG =
+        (
+            (float)(
+                (int32_t)forwardRaw -
+                g_jy60_zero_raw)
+        ) *
+        JY60_ACCEL_RAW_TO_G *
+        JY60_ACCEL_AXIS_POLARITY;
+
+
+    measuredAccelG =
+        FloatClamp(
+            measuredAccelG,
+            -VEHICLE_ACCEL_LIMIT_G,
+            VEHICLE_ACCEL_LIMIT_G);
+
+
+    /*
+     * 根据“本次刚测到的加速度方向”选择滤波响应速度。
+     *
+     * 向前启动为正，使用启动滤波；
+     * 向前停车为负，使用停车滤波。
+     *
+     * 零附近仍使用启动滤波，避免静止噪声在两套参数间频繁切换。
+     */
+    if (measuredAccelG <
+        -VEHICLE_ACCEL_DEADBAND_G)
+    {
+        filterAlpha =
+            VEHICLE_STOP_FILTER_ALPHA;
+    }
+    else
+    {
+        filterAlpha =
+            VEHICLE_START_FILTER_ALPHA;
+    }
+
+
+    g_vehicle_accel_filtered_g +=
+        filterAlpha *
+        (
+            measuredAccelG -
+            g_vehicle_accel_filtered_g
+        );
+
+
+    filteredForControl =
+        g_vehicle_accel_filtered_g;
+
+
+    if (FloatAbs(
+            filteredForControl) <
+        VEHICLE_ACCEL_DEADBAND_G)
+    {
+        filteredForControl =
+            0.0f;
+    }
+
+
+    /*
+     * 根据滤波后的加速度方向，选择真正用于角度计算的增益和斜率。
+     *
+     * 0：匀速、静止或加速度进入死区
+     * 1：向前启动/加速
+     * 2：向前减速/停车
+     */
+    if (filteredForControl <
+        -VEHICLE_ACCEL_DEADBAND_G)
+    {
+        compensationPhase =
+            2U;
+
+        compensationGain =
+            VEHICLE_STOP_COMPENSATION_GAIN;
+
+        compensationSlewDegS =
+            VEHICLE_STOP_SLEW_DEG_S;
+    }
+    else if (filteredForControl >
+             VEHICLE_ACCEL_DEADBAND_G)
+    {
+        compensationPhase =
+            1U;
+
+        compensationGain =
+            VEHICLE_START_COMPENSATION_GAIN;
+
+        compensationSlewDegS =
+            VEHICLE_START_SLEW_DEG_S;
+    }
+    else
+    {
+        compensationPhase =
+            0U;
+
+        /*
+         * 此时目标角为0°。
+         * 使用单独的慢回零速度，避免停车补偿突然撤销。
+         */
+        compensationGain =
+            VEHICLE_START_COMPENSATION_GAIN;
+
+        compensationSlewDegS =
+            VEHICLE_ZERO_RETURN_SLEW_DEG_S;
+    }
+
+
+    /*
+     * 非惯性系中钢球沿轨道的加速度近似：
+     *
+     *      a_ball = g*sin(theta) - a_car*cos(theta)
+     *
+     * 令a_ball=0：
+     *
+     *      tan(theta) = a_car/g
+     *
+     * JY60这里已经用g为单位，
+     * 因而theta=atan(acceleration_g)。
+     */
+    targetAngleDeg =
+        AtanApproxRad(
+            filteredForControl) *
+        RAD_TO_DEG *
+        compensationGain *
+        VEHICLE_COMPENSATION_POLARITY;
+
+
+    targetAngleDeg =
+        FloatClamp(
+            targetAngleDeg,
+            -VEHICLE_COMPENSATION_MAX_ANGLE_DEG,
+            VEHICLE_COMPENSATION_MAX_ANGLE_DEG);
+
+
+    g_vehicle_comp_target_angle_deg =
+        targetAngleDeg;
+
+
+    g_vehicle_comp_angle_deg =
+        ApplyAngleSlewLimit(
+            g_vehicle_comp_angle_deg,
+            g_vehicle_comp_target_angle_deg,
+            compensationSlewDegS);
+
+
+    g_debug_vehicle_accel_mg =
+        FloatToInt32(
+            g_vehicle_accel_filtered_g *
+            1000.0f);
+
+
+    g_debug_vehicle_comp_target_x100 =
+        FloatToInt32(
+            g_vehicle_comp_target_angle_deg *
+            100.0f);
+
+
+    g_debug_vehicle_comp_angle_x100 =
+        FloatToInt32(
+            g_vehicle_comp_angle_deg *
+            100.0f);
+
+
+    g_debug_vehicle_comp_phase =
+        compensationPhase;
+
+
+    g_debug_vehicle_filter_alpha_x1000 =
+        FloatToInt32(
+            filterAlpha *
+            1000.0f);
+
+
+    g_debug_vehicle_comp_gain_x1000 =
+        FloatToInt32(
+            compensationGain *
+            1000.0f);
+
+
+    g_debug_vehicle_comp_slew_deg_s =
+        FloatToInt32(
+            compensationSlewDegS);
+}
+
+
+/*
+ * 把小车加速度前馈角加入钢球反馈角，
+ * 最后再做总软件角度限位。
+ *
+ * 输入和输出均为“乘BALL_CONTROL_POLARITY之前”的控制角。
+ */
+static float AddVehicleCompensation(
+    float ballFeedbackAngleDeg)
+{
+    return
+        FloatClamp(
+            ballFeedbackAngleDeg +
+            g_vehicle_comp_angle_deg,
+            -MAX_MOTOR_ANGLE_DEG,
+            MAX_MOTOR_ANGLE_DEG);
+}
+
+
+/*==============================================================
+ * 32. 根据预测速度和加速度计算捕获制动角度
+ *==============================================================*/
+
+static float CalculateCaptureBrakeAngle(
+    float velocityMmS,
+    float accelerationMmS2)
+{
+    float brakeAngle;
+
+    float velocitySign;
+
+
+    velocitySign =
+        FloatSign(
+            velocityMmS);
+
+
+    brakeAngle =
+        BALL_CAPTURE_KD *
+        velocityMmS +
+        BALL_CAPTURE_KA *
+        accelerationMmS2;
+
+
+    /*
+     * 低速时仍保证有足够的制动角度。
+     */
+    if ((velocitySign != 0.0f) &&
+        (FloatAbs(brakeAngle) <
+         BALL_CAPTURE_MIN_ANGLE_DEG))
+    {
+        brakeAngle =
+            velocitySign *
+            BALL_CAPTURE_MIN_ANGLE_DEG;
+    }
+
+
+    return
+        FloatClamp(
+            brakeAngle,
+            -BALL_CAPTURE_MAX_ANGLE_DEG,
+            BALL_CAPTURE_MAX_ANGLE_DEG);
+}
+
+
+/*==============================================================
+ * 33. 进入原点软着陆
+ *==============================================================*/
+
+static void EnterCenterSettling(void)
+{
+    g_balance_state =
+        BALL_STATE_BRAKING;
+
+    g_center_confirm_count =
+        0U;
+
+    g_center_exit_confirm_count =
+        0U;
+
+    g_static_bias_angle_deg =
+        0.0f;
+
+    g_pid_integral_mm_s =
+        0.0f;
+
+    g_breakaway_target_angle_deg =
+        0.0f;
+
+    g_capture_brake_angle_deg =
+        0.0f;
+
+    g_capture_started_predictively =
+        0U;
+
+    g_debug_predictive_capture =
+        0U;
+
+    g_progress_initialized =
+        0U;
+}
+
+
+/*==============================================================
+ * 34. 进入原点锁定
+ *==============================================================*/
+
+static void EnterCenterHolding(void)
+{
+    g_balance_state =
+        BALL_STATE_HOLDING;
+
+    g_center_confirm_count =
+        BALL_CENTER_CONFIRM_FRAMES;
+
+    g_static_bias_angle_deg =
+        0.0f;
+
+    g_breakaway_target_angle_deg =
+        0.0f;
+
+    g_capture_brake_angle_deg =
+        0.0f;
+
+    g_breakaway_level =
+        0U;
+
+    g_progress_initialized =
+        0U;
+
+    g_capture_cooldown_remaining_ms =
+        CAPTURE_COOLDOWN_MS;
+
+    g_center_exit_confirm_count =
+        0U;
+
+    g_capture_started_predictively =
+        0U;
+
+    g_debug_predictive_capture =
+        0U;
+
+    g_pid_integral_mm_s =
+        0.0f;
+
+    g_pid_p_angle_deg =
+        0.0f;
+
+    g_pid_i_angle_deg =
+        0.0f;
+
+    g_pid_d_angle_deg =
+        0.0f;
+
+    g_pid_a_angle_deg =
+        0.0f;
+
+    /*
+     * 不再把轨道角度瞬间清零。
+     * 保留已经学习到的小偏置，并由锁定状态慢慢调整。
+     */
+    g_requested_motor_angle_deg =
+        AddVehicleCompensation(
+            g_center_trim_angle_deg) *
+        BALL_CONTROL_POLARITY;
+}
+
+
+/*==============================================================
+ * 35. 钢球100Hz控制
+ *==============================================================*/
+
+static void BallPositionControl100Hz(
+    uint8_t receivedNewMeasurement)
+{
+    float controlPosition;
+
+    float velocity;
+
+    float acceleration;
+
+    float predictedPosition;
+
+    float predictedVelocity;
+
+    float pidPosition;
+
+    float absPosition;
+
+    float absVelocity;
+
+    float absPredictedPosition;
+
+    float positionSign;
+
+    float integralLimit;
+
+    float requestedBeforePolarity;
+
+    float limitedRequested;
+
+    float angleLimit;
+
+    float progressMm;
+
+    float breakawayExtraAngle;
+
+    float timeToCenterS;
+
+    uint32_t uartAgeMs;
+
+    uint32_t stateElapsedMs;
+
+    uint8_t movingTowardCenter;
+
+    uint8_t crossedCenter;
+
+    uint8_t predictionReady;
+
+    uint8_t predictedCrossing;
+
+    uint8_t predictiveCaptureCondition;
+
+
+    g_debug_predictive_capture =
+        g_capture_started_predictively;
+
+
+    /*
+     * 每个100Hz控制周期先更新JY60车辆加速度前馈角。
+     */
+    UpdateVehicleCompensation100Hz();
+
+
+    /*
+     * 捕获冷却时间递减。
+     */
+    if (g_capture_cooldown_remaining_ms >
+        0U)
+    {
+        if (g_capture_cooldown_remaining_ms >
+            10U)
+        {
+            g_capture_cooldown_remaining_ms -=
+                10U;
+        }
+        else
+        {
+            g_capture_cooldown_remaining_ms =
+                0U;
+        }
+    }
+
+
+    uartAgeMs =
+        g_system_ms -
+        g_k230_last_rx_ms;
+
+
+    g_debug_uart_age_ms =
+        uartAgeMs;
+
+
+    /*
+     * 通信未初始化或者超时。
+     */
+    if ((g_observer_initialized == 0U) ||
+        (uartAgeMs >
+         K230_TIMEOUT_MS))
+    {
+        g_balance_state =
+            BALL_STATE_WAITING;
+
+        g_capture_started_predictively =
+            0U;
+
+        g_debug_predictive_capture =
+            0U;
+
+        g_center_confirm_count =
+            0U;
+
+        g_static_bias_angle_deg *=
+            0.90f;
+
+        g_pid_integral_mm_s *=
+            0.85f;
+
+        g_pid_p_angle_deg =
+            0.0f;
+
+        g_pid_i_angle_deg =
+            BALL_PID_KI *
+            g_pid_integral_mm_s;
+
+        g_pid_d_angle_deg =
+            0.0f;
+
+        g_pid_a_angle_deg =
+            0.0f;
+
+        g_progress_initialized =
+            0U;
+
+        g_breakaway_target_angle_deg =
+            0.0f;
+
+        g_capture_brake_angle_deg =
+            0.0f;
+
+        g_requested_motor_angle_deg =
+            0.0f;
+
+        g_applied_motor_angle_deg =
+            ApplyAngleSlewLimit(
+                g_applied_motor_angle_deg,
+                0.0f,
+                LEVEL_RETURN_SLEW_DEG_S);
+
+        g_debug_pid_position_x10 =
+            0;
+
+        UpdateControlDebug(
+            0.0f,
+            0.0f);
+
+        return;
+    }
+
+
+    /*
+     * 状态判定使用K230当前原始位置。
+     */
+    controlPosition =
+        (float)g_k230_position_mm;
+
+
+    velocity =
+        g_filtered_velocity_mm_s;
+
+
+    acceleration =
+        g_filtered_acceleration_mm_s2;
+
+
+    predictedPosition =
+        g_predicted_position_mm;
+
+
+    predictedVelocity =
+        g_predicted_velocity_mm_s;
+
+
+    if (g_motion_history_count >=
+        PREDICTION_MIN_HISTORY_FRAMES)
+    {
+        predictionReady = 1U;
+    }
+    else
+    {
+        predictionReady = 0U;
+
+        predictedPosition =
+            g_filtered_position_mm;
+
+        predictedVelocity =
+            velocity;
+    }
+
+
+    absPosition =
+        FloatAbs(
+            controlPosition);
+
+
+    absVelocity =
+        FloatAbs(
+            velocity);
+
+
+    absPredictedPosition =
+        FloatAbs(
+            predictedPosition);
+
+
+    positionSign =
+        FloatSign(
+            controlPosition);
+
+
+    /*
+     * 位置和速度异号：小球正在向0运动。
+     */
+    if ((controlPosition *
+         velocity) < 0.0f)
+    {
+        movingTowardCenter = 1U;
+    }
+    else
+    {
+        movingTowardCenter = 0U;
+    }
+
+
+    /*
+     * 判断实际位置是否已经穿过原点。
+     */
+    if ((controlPosition *
+         g_previous_control_position_mm) <
+        0.0f)
+    {
+        crossedCenter = 1U;
+    }
+    else
+    {
+        crossedCenter = 0U;
+    }
+
+
+    g_previous_control_position_mm =
+        controlPosition;
+
+
+    /*
+     * 判断预测轨迹是否会在预测时间内穿过0点。
+     */
+    if ((predictionReady != 0U) &&
+        (controlPosition != 0.0f) &&
+        ((controlPosition *
+          predictedPosition) <= 0.0f))
+    {
+        predictedCrossing = 1U;
+    }
+    else
+    {
+        predictedCrossing = 0U;
+    }
+
+
+    timeToCenterS =
+        1000.0f;
+
+
+    if ((movingTowardCenter != 0U) &&
+        (absVelocity >=
+         BALL_CAPTURE_MIN_SPEED_MM_S))
+    {
+        timeToCenterS =
+            absPosition /
+            absVelocity;
+    }
+
+
+    /*
+     * 穿过原点时立即清除旧方向积分和静摩擦补偿。
+     */
+    if (crossedCenter != 0U)
+    {
+        g_static_bias_angle_deg =
+            0.0f;
+
+        g_pid_integral_mm_s =
+            0.0f;
+
+        g_breakaway_level =
+            0U;
+
+        g_progress_initialized =
+            0U;
+    }
+
+
+    /*
+     * ==========================================================
+     * 原点锁定状态
+     * ==========================================================
+     */
+    if (g_balance_state ==
+        BALL_STATE_HOLDING)
+    {
+        float holdVelocity;
+        float holdBeforePolarity;
+        float trimError;
+
+
+        if (receivedNewMeasurement != 0U)
+        {
+            if (absPosition >
+                BALL_CENTER_EXIT_MM)
+            {
+                g_center_exit_confirm_count++;
+            }
+            else
+            {
+                g_center_exit_confirm_count =
+                    0U;
+            }
+
+
+            /*
+             * 只在低速时慢慢学习轨道的真实水平偏置。
+             * 这样不会因为轨道略微不水平而每次都漂出中心区。
+             */
+            if (absVelocity <=
+                CENTER_TRIM_ACTIVE_SPEED_MM_S)
+            {
+                trimError =
+                    g_filtered_position_mm;
+
+                if (FloatAbs(trimError) <=
+                    CENTER_POSITION_DEADBAND_MM)
+                {
+                    trimError =
+                        0.0f;
+                }
+
+                g_center_trim_angle_deg +=
+                    CENTER_TRIM_KI *
+                    trimError *
+                    g_last_measurement_dt_s;
+
+                g_center_trim_angle_deg =
+                    FloatClamp(
+                        g_center_trim_angle_deg,
+                        -CENTER_TRIM_MAX_ANGLE_DEG,
+                        CENTER_TRIM_MAX_ANGLE_DEG);
+            }
+        }
+
+
+        if (g_center_exit_confirm_count >=
+            CENTER_EXIT_CONFIRM_FRAMES)
+        {
+            EnterCenterSettling();
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        holdVelocity =
+            velocity;
+
+        if (FloatAbs(holdVelocity) <=
+            CENTER_VELOCITY_DEADBAND_MM_S)
+        {
+            holdVelocity =
+                0.0f;
+        }
+
+
+        holdBeforePolarity =
+            g_center_trim_angle_deg +
+            CENTER_HOLD_KD *
+            holdVelocity;
+
+
+        holdBeforePolarity =
+            FloatClamp(
+                holdBeforePolarity,
+                -CENTER_HOLD_MAX_ANGLE_DEG,
+                CENTER_HOLD_MAX_ANGLE_DEG);
+
+
+        g_requested_motor_angle_deg =
+            AddVehicleCompensation(
+                holdBeforePolarity) *
+            BALL_CONTROL_POLARITY;
+
+
+        g_applied_motor_angle_deg =
+            ApplyAngleSlewLimit(
+                g_applied_motor_angle_deg,
+                g_requested_motor_angle_deg,
+                CENTER_HOLD_SLEW_DEG_S);
+
+
+        g_static_bias_angle_deg =
+            0.0f;
+
+        g_pid_integral_mm_s =
+            0.0f;
+
+        g_pid_p_angle_deg =
+            0.0f;
+
+        g_pid_i_angle_deg =
+            0.0f;
+
+        g_pid_d_angle_deg =
+            CENTER_HOLD_KD *
+            holdVelocity;
+
+        g_pid_a_angle_deg =
+            0.0f;
+
+        g_breakaway_target_angle_deg =
+            0.0f;
+
+        g_capture_brake_angle_deg =
+            0.0f;
+
+        g_debug_pid_position_x10 =
+            FloatToInt32(
+                controlPosition *
+                10.0f);
+
+        UpdateControlDebug(
+            controlPosition,
+            velocity);
+
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 预测捕获状态
+     * ==========================================================
+     */
+    if (g_balance_state ==
+        BALL_STATE_CAPTURE)
+    {
+        stateElapsedMs =
+            g_system_ms -
+            g_capture_start_ms;
+
+
+        g_debug_capture_elapsed_ms =
+            stateElapsedMs;
+
+
+        /*
+         * 每收到一帧都根据最新预测速度和加速度
+         * 动态更新制动角度。
+         */
+        if ((receivedNewMeasurement != 0U) &&
+            (absVelocity >=
+             (BALL_CAPTURE_MIN_SPEED_MM_S *
+              0.5f)))
+        {
+            g_capture_brake_angle_deg =
+                CalculateCaptureBrakeAngle(
+                    predictedVelocity,
+                    acceleration);
+        }
+
+
+        g_requested_motor_angle_deg =
+            AddVehicleCompensation(
+                g_capture_brake_angle_deg) *
+            BALL_CONTROL_POLARITY;
+
+
+        g_applied_motor_angle_deg =
+            ApplyAngleSlewLimit(
+                g_applied_motor_angle_deg,
+                g_requested_motor_angle_deg,
+                BALL_CAPTURE_SLEW_DEG_S);
+
+
+        /*
+         * 真正满足“位置小、速度低”后才锁定。
+         * 不再因为刚穿过0点就立即撤掉制动。
+         */
+        if (
+            (stateElapsedMs >=
+             BALL_CAPTURE_MIN_TIME_MS) &&
+            (absPosition <=
+             BALL_CENTER_ENTER_MM) &&
+            (absVelocity <=
+             BALL_CENTER_ENTER_SPEED_MM_S)
+        )
+        {
+            EnterCenterHolding();
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        if (
+            (stateElapsedMs >=
+             BALL_CAPTURE_MIN_TIME_MS) &&
+            (absPosition <=
+             CENTER_SETTLE_ENTER_MM) &&
+            (absVelocity <=
+             BALL_CAPTURE_STOP_SPEED_MM_S)
+        )
+        {
+            EnterCenterSettling();
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        /*
+         * 已经被制停并开始向远离0点方向返回时，
+         * 退出捕获，交回PID重新拉回。
+         */
+        if (
+            (stateElapsedMs >=
+             BALL_CAPTURE_MIN_TIME_MS) &&
+            ((controlPosition *
+              velocity) > 0.0f) &&
+            (absPosition >
+             BALL_CENTER_ENTER_MM)
+        )
+        {
+            if (absPosition <=
+                CENTER_SETTLE_EXIT_MM)
+            {
+                EnterCenterSettling();
+            }
+            else
+            {
+                g_balance_state =
+                    BALL_STATE_PULLING;
+            }
+
+            g_capture_started_predictively =
+                0U;
+
+            g_debug_predictive_capture =
+                0U;
+
+            g_capture_brake_angle_deg =
+                0.0f;
+
+            g_capture_cooldown_remaining_ms =
+                CAPTURE_COOLDOWN_MS;
+
+            g_progress_initialized =
+                0U;
+
+            g_pid_integral_mm_s =
+                0.0f;
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        if (stateElapsedMs >=
+            BALL_CAPTURE_MAX_TIME_MS)
+        {
+            if ((absPosition <=
+                 BALL_CENTER_EXIT_MM) &&
+                (absVelocity <=
+                 BALL_CENTER_ENTER_SPEED_MM_S))
+            {
+                EnterCenterHolding();
+            }
+            else
+            {
+                if (absPosition <=
+                    CENTER_SETTLE_EXIT_MM)
+                {
+                    EnterCenterSettling();
+                }
+                else
+                {
+                    g_balance_state =
+                        BALL_STATE_PULLING;
+                }
+
+                g_capture_started_predictively =
+                    0U;
+
+                g_debug_predictive_capture =
+                    0U;
+
+                g_capture_brake_angle_deg =
+                    0.0f;
+
+                g_capture_cooldown_remaining_ms =
+                    CAPTURE_COOLDOWN_MS;
+
+                g_progress_initialized =
+                    0U;
+
+                g_pid_integral_mm_s =
+                    0.0f;
+            }
+
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        UpdateControlDebug(
+            controlPosition,
+            velocity);
+
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 破静摩擦脉冲状态
+     * ==========================================================
+     */
+    if (g_balance_state ==
+        BALL_STATE_BREAKAWAY)
+    {
+        stateElapsedMs =
+            g_system_ms -
+            g_breakaway_start_ms;
+
+
+        g_debug_breakaway_elapsed_ms =
+            stateElapsedMs;
+
+
+        g_requested_motor_angle_deg =
+            AddVehicleCompensation(
+                g_breakaway_target_angle_deg) *
+            BALL_CONTROL_POLARITY;
+
+
+        g_applied_motor_angle_deg =
+            ApplyAngleSlewLimit(
+                g_applied_motor_angle_deg,
+                g_requested_motor_angle_deg,
+                BREAKAWAY_SLEW_DEG_S);
+
+
+        if (
+            (stateElapsedMs >=
+             BREAKAWAY_MIN_TIME_MS) &&
+            (movingTowardCenter != 0U) &&
+            (absVelocity >=
+             BREAKAWAY_RELEASE_SPEED_MM_S)
+        )
+        {
+            g_balance_state =
+                BALL_STATE_PULLING;
+
+            g_breakaway_target_angle_deg =
+                0.0f;
+
+            g_progress_reference_abs_mm =
+                absPosition;
+
+            g_progress_reference_ms =
+                g_system_ms;
+
+            g_progress_initialized =
+                1U;
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        /*
+         * 已经接近捕获区域，立即结束冲击，
+         * 下一次控制周期由预测捕获判断接管。
+         */
+        if ((absPosition <=
+             BALL_CAPTURE_ENTER_MM) ||
+            (predictedCrossing != 0U) ||
+            (absPredictedPosition <=
+             PREDICTIVE_CAPTURE_WINDOW_MM))
+        {
+            g_balance_state =
+                BALL_STATE_PULLING;
+
+            g_breakaway_target_angle_deg =
+                0.0f;
+
+            g_progress_initialized =
+                0U;
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        if (stateElapsedMs >=
+            BREAKAWAY_MAX_TIME_MS)
+        {
+            g_balance_state =
+                BALL_STATE_PULLING;
+
+            g_breakaway_target_angle_deg =
+                0.0f;
+
+            g_progress_reference_abs_mm =
+                absPosition;
+
+            g_progress_reference_ms =
+                g_system_ms;
+
+            g_progress_initialized =
+                1U;
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        UpdateControlDebug(
+            controlPosition,
+            velocity);
+
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 原点附近低增益软着陆状态
+     * ==========================================================
+     */
+    if ((g_balance_state ==
+         BALL_STATE_BRAKING) ||
+        ((g_balance_state ==
+          BALL_STATE_PULLING) &&
+         (absPosition <=
+          CENTER_SETTLE_ENTER_MM) &&
+         (absVelocity <=
+          CENTER_SETTLE_ENTRY_SPEED_MM_S)))
+    {
+        float settlePosition;
+        float settleVelocity;
+        float settleBeforePolarity;
+        float trimError;
+
+
+        if (g_balance_state !=
+            BALL_STATE_BRAKING)
+        {
+            EnterCenterSettling();
+        }
+
+
+        if (absPosition >
+            CENTER_SETTLE_EXIT_MM)
+        {
+            g_balance_state =
+                BALL_STATE_PULLING;
+
+            g_center_confirm_count =
+                0U;
+        }
+        else
+        {
+            settlePosition =
+                g_filtered_position_mm;
+
+            settleVelocity =
+                velocity;
+
+
+            if (FloatAbs(settlePosition) <=
+                CENTER_POSITION_DEADBAND_MM)
+            {
+                settlePosition =
+                    0.0f;
+            }
+
+
+            if (FloatAbs(settleVelocity) <=
+                CENTER_VELOCITY_DEADBAND_MM_S)
+            {
+                settleVelocity =
+                    0.0f;
+            }
+
+
+            if ((receivedNewMeasurement != 0U) &&
+                (absVelocity <=
+                 CENTER_TRIM_ACTIVE_SPEED_MM_S))
+            {
+                trimError =
+                    settlePosition;
+
+                g_center_trim_angle_deg +=
+                    CENTER_TRIM_KI *
+                    trimError *
+                    g_last_measurement_dt_s;
+
+                g_center_trim_angle_deg =
+                    FloatClamp(
+                        g_center_trim_angle_deg,
+                        -CENTER_TRIM_MAX_ANGLE_DEG,
+                        CENTER_TRIM_MAX_ANGLE_DEG);
+            }
+
+
+            if (receivedNewMeasurement != 0U)
+            {
+                if ((absPosition <=
+                     BALL_CENTER_ENTER_MM) &&
+                    (absVelocity <=
+                     BALL_CENTER_ENTER_SPEED_MM_S))
+                {
+                    g_center_confirm_count++;
+                }
+                else
+                {
+                    g_center_confirm_count =
+                        0U;
+                }
+            }
+
+
+            if (g_center_confirm_count >=
+                BALL_CENTER_CONFIRM_FRAMES)
+            {
+                EnterCenterHolding();
+
+                UpdateControlDebug(
+                    controlPosition,
+                    velocity);
+
+                return;
+            }
+
+
+            settleBeforePolarity =
+                g_center_trim_angle_deg +
+                CENTER_SETTLE_KP *
+                settlePosition +
+                CENTER_SETTLE_KD *
+                settleVelocity;
+
+
+            settleBeforePolarity =
+                FloatClamp(
+                    settleBeforePolarity,
+                    -CENTER_SETTLE_MAX_ANGLE_DEG,
+                    CENTER_SETTLE_MAX_ANGLE_DEG);
+
+
+            g_requested_motor_angle_deg =
+                AddVehicleCompensation(
+                    settleBeforePolarity) *
+                BALL_CONTROL_POLARITY;
+
+
+            g_applied_motor_angle_deg =
+                ApplyAngleSlewLimit(
+                    g_applied_motor_angle_deg,
+                    g_requested_motor_angle_deg,
+                    CENTER_SETTLE_SLEW_DEG_S);
+
+
+            g_pid_p_angle_deg =
+                CENTER_SETTLE_KP *
+                settlePosition;
+
+            g_pid_i_angle_deg =
+                g_center_trim_angle_deg;
+
+            g_pid_d_angle_deg =
+                CENTER_SETTLE_KD *
+                settleVelocity;
+
+            g_pid_a_angle_deg =
+                0.0f;
+
+            g_pid_integral_mm_s =
+                0.0f;
+
+            g_static_bias_angle_deg =
+                0.0f;
+
+            g_breakaway_target_angle_deg =
+                0.0f;
+
+            g_capture_brake_angle_deg =
+                0.0f;
+
+            g_debug_pid_position_x10 =
+                FloatToInt32(
+                    settlePosition *
+                    10.0f);
+
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+    }
+
+
+    /*
+     * ==========================================================
+     * 位置和速度都进入中心范围后锁定
+     * ==========================================================
+     */
+    if (receivedNewMeasurement != 0U)
+    {
+        if ((absPosition <=
+             BALL_CENTER_ENTER_MM) &&
+            (absVelocity <=
+             BALL_CENTER_ENTER_SPEED_MM_S))
+        {
+            g_center_confirm_count++;
+
+
+            if (g_center_confirm_count >=
+                BALL_CENTER_CONFIRM_FRAMES)
+            {
+                EnterCenterHolding();
+
+                UpdateControlDebug(
+                    controlPosition,
+                    velocity);
+
+                return;
+            }
+        }
+        else
+        {
+            g_center_confirm_count =
+                0U;
+        }
+    }
+
+
+    /*
+     * ==========================================================
+     * 预测捕获判断
+     * ==========================================================
+     */
+    predictiveCaptureCondition =
+        0U;
+
+
+    if ((predictionReady != 0U) &&
+        (absPosition <=
+         PREDICTIVE_CAPTURE_MAX_DISTANCE_MM))
+    {
+        if ((predictedCrossing != 0U) ||
+            (absPredictedPosition <=
+             PREDICTIVE_CAPTURE_WINDOW_MM) ||
+            (timeToCenterS <=
+             PREDICTIVE_CAPTURE_MAX_TTC_S))
+        {
+            predictiveCaptureCondition =
+                1U;
+        }
+    }
+
+
+    if (
+        (receivedNewMeasurement != 0U) &&
+        (g_capture_cooldown_remaining_ms ==
+         0U) &&
+        (absPosition >
+         CENTER_SETTLE_ENTER_MM) &&
+        (movingTowardCenter != 0U) &&
+        (absVelocity >=
+         BALL_CAPTURE_MIN_SPEED_MM_S) &&
+        (
+            (absPosition <=
+             BALL_CAPTURE_ENTER_MM) ||
+            (predictiveCaptureCondition != 0U)
+        )
+    )
+    {
+        g_balance_state =
+            BALL_STATE_CAPTURE;
+
+
+        g_capture_start_ms =
+            g_system_ms;
+
+
+        g_capture_brake_angle_deg =
+            CalculateCaptureBrakeAngle(
+                predictedVelocity,
+                acceleration);
+
+
+        g_static_bias_angle_deg =
+            0.0f;
+
+
+        g_pid_integral_mm_s =
+            0.0f;
+
+
+        g_breakaway_target_angle_deg =
+            0.0f;
+
+
+        g_progress_initialized =
+            0U;
+
+
+        g_requested_motor_angle_deg =
+            AddVehicleCompensation(
+                g_capture_brake_angle_deg) *
+            BALL_CONTROL_POLARITY;
+
+
+        g_applied_motor_angle_deg =
+            ApplyAngleSlewLimit(
+                g_applied_motor_angle_deg,
+                g_requested_motor_angle_deg,
+                BALL_CAPTURE_SLEW_DEG_S);
+
+
+        g_debug_capture_elapsed_ms =
+            0U;
+
+
+        if (predictiveCaptureCondition != 0U)
+        {
+            g_capture_started_predictively =
+                1U;
+        }
+        else
+        {
+            g_capture_started_predictively =
+                0U;
+        }
+
+
+        g_debug_predictive_capture =
+            g_capture_started_predictively;
+
+
+        UpdateControlDebug(
+            controlPosition,
+            velocity);
+
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 回中进度检测及静摩擦处理
+     * ==========================================================
+     */
+    if (g_progress_initialized == 0U)
+    {
+        g_progress_reference_abs_mm =
+            absPosition;
+
+        g_progress_reference_ms =
+            g_system_ms;
+
+        g_progress_initialized =
+            1U;
+    }
+    else if ((uint32_t)(
+                 g_system_ms -
+                 g_progress_reference_ms) >=
+             BALL_PROGRESS_CHECK_MS)
+    {
+        progressMm =
+            g_progress_reference_abs_mm -
+            absPosition;
+
+
+        if ((absPosition >
+             BALL_CENTER_EXIT_MM) &&
+            (progressMm <
+             BALL_MIN_PROGRESS_MM))
+        {
+            if ((g_static_bias_angle_deg *
+                 positionSign) < 0.0f)
+            {
+                g_static_bias_angle_deg =
+                    0.0f;
+
+                g_breakaway_level =
+                    0U;
+            }
+
+
+            g_static_bias_angle_deg +=
+                positionSign *
+                STATIC_BIAS_STEP_DEG;
+
+
+            g_static_bias_angle_deg =
+                FloatClamp(
+                    g_static_bias_angle_deg,
+                    -STATIC_BIAS_MAX_DEG,
+                    STATIC_BIAS_MAX_DEG);
+
+
+            if (g_breakaway_level <
+                BREAKAWAY_MAX_LEVEL)
+            {
+                g_breakaway_level++;
+            }
+
+
+            breakawayExtraAngle =
+                BREAKAWAY_BASE_ANGLE_DEG +
+                (
+                    (float)g_breakaway_level *
+                    BREAKAWAY_LEVEL_STEP_DEG
+                );
+
+
+            g_breakaway_target_angle_deg =
+                BALL_PID_KP *
+                controlPosition +
+                g_static_bias_angle_deg +
+                positionSign *
+                breakawayExtraAngle;
+
+
+            g_breakaway_target_angle_deg =
+                FloatClamp(
+                    g_breakaway_target_angle_deg,
+                    -MAX_MOTOR_ANGLE_DEG,
+                    MAX_MOTOR_ANGLE_DEG);
+
+
+            g_breakaway_start_ms =
+                g_system_ms;
+
+
+            g_balance_state =
+                BALL_STATE_BREAKAWAY;
+
+
+            g_breakaway_count++;
+
+
+            g_progress_initialized =
+                0U;
+
+
+            g_pid_integral_mm_s =
+                0.0f;
+
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+        else
+        {
+            if (progressMm >=
+                BALL_MIN_PROGRESS_MM)
+            {
+                g_static_bias_angle_deg *=
+                    STATIC_BIAS_DECAY;
+
+
+                if (g_breakaway_level >
+                    0U)
+                {
+                    g_breakaway_level--;
+                }
+            }
+        }
+
+
+        g_progress_reference_abs_mm =
+            absPosition;
+
+
+        g_progress_reference_ms =
+            g_system_ms;
+    }
+
+
+    /*
+     * ==========================================================
+     * 位置PID + 多帧加速度预测控制
+     * ==========================================================
+     */
+
+    if (predictionReady != 0U)
+    {
+        float predictionWeight;
+
+
+        if (absPosition <=
+            25.0f)
+        {
+            predictionWeight =
+                0.30f;
+        }
+        else
+        {
+            predictionWeight =
+                PREDICTION_POSITION_WEIGHT;
+        }
+
+
+        pidPosition =
+            predictionWeight *
+            predictedPosition +
+            (
+                1.0f -
+                predictionWeight
+            ) *
+            controlPosition;
+    }
+    else
+    {
+        pidPosition =
+            controlPosition;
+    }
+
+
+    g_debug_pid_position_x10 =
+        FloatToInt32(
+            pidPosition *
+            10.0f);
+
+
+    /*
+     * 积分只在新坐标到达时更新，
+     * 避免100Hz控制循环重复积分同一帧数据。
+     */
+    if (receivedNewMeasurement != 0U)
+    {
+        if ((absPosition <=
+             PID_INTEGRAL_ACTIVE_MM) &&
+            (absVelocity <=
+             PID_INTEGRAL_MAX_SPEED_MM_S) &&
+            (crossedCenter == 0U))
+        {
+            g_pid_integral_mm_s +=
+                g_filtered_position_mm *
+                g_last_measurement_dt_s;
+        }
+        else
+        {
+            g_pid_integral_mm_s *=
+                PID_INTEGRAL_DECAY;
+        }
+    }
+
+
+    integralLimit =
+        PID_INTEGRAL_MAX_ANGLE_DEG /
+        BALL_PID_KI;
+
+
+    g_pid_integral_mm_s =
+        FloatClamp(
+            g_pid_integral_mm_s,
+            -integralLimit,
+            integralLimit);
+
+
+    g_pid_p_angle_deg =
+        BALL_PID_KP *
+        pidPosition;
+
+
+    g_pid_i_angle_deg =
+        BALL_PID_KI *
+        g_pid_integral_mm_s;
+
+
+    g_pid_d_angle_deg =
+        BALL_PID_KD *
+        predictedVelocity;
+
+
+    if (absPosition <=
+        25.0f)
+    {
+        /*
+         * 中心附近不使用加速度项，避免坐标噪声被二次差分放大。
+         */
+        g_pid_a_angle_deg =
+            0.0f;
+    }
+    else
+    {
+        g_pid_a_angle_deg =
+            BALL_PID_KA *
+            acceleration;
+
+        g_pid_a_angle_deg =
+            FloatClamp(
+                g_pid_a_angle_deg,
+                -PID_ACCEL_MAX_ANGLE_DEG,
+                PID_ACCEL_MAX_ANGLE_DEG);
+    }
+
+
+    requestedBeforePolarity =
+        g_pid_p_angle_deg +
+        g_pid_i_angle_deg +
+        g_pid_d_angle_deg +
+        g_pid_a_angle_deg +
+        g_static_bias_angle_deg;
+
+
+    if (absPosition >
+        FAR_POSITION_MM)
+    {
+        angleLimit =
+            FAR_MAX_ANGLE_DEG;
+    }
+    else if (absPosition >
+             MIDDLE_POSITION_MM)
+    {
+        angleLimit =
+            MIDDLE_MAX_ANGLE_DEG;
+    }
+    else
+    {
+        angleLimit =
+            NEAR_MAX_ANGLE_DEG;
+    }
+
+
+    limitedRequested =
+        FloatClamp(
+            requestedBeforePolarity,
+            -angleLimit,
+            angleLimit);
+
+
+    /*
+     * 简单积分防饱和：
+     * 如果输出已经饱和且积分还在继续把输出推向饱和方向，
+     * 立即轻微释放积分。
+     */
+    if ((limitedRequested !=
+         requestedBeforePolarity) &&
+        ((g_pid_i_angle_deg *
+          requestedBeforePolarity) > 0.0f))
+    {
+        g_pid_integral_mm_s *=
+            0.96f;
+
+        g_pid_i_angle_deg =
+            BALL_PID_KI *
+            g_pid_integral_mm_s;
+    }
+
+
+    g_requested_motor_angle_deg =
+        AddVehicleCompensation(
+            limitedRequested) *
+        BALL_CONTROL_POLARITY;
+
+
+    g_applied_motor_angle_deg =
+        ApplyAngleSlewLimit(
+            g_applied_motor_angle_deg,
+            g_requested_motor_angle_deg,
+            NORMAL_TARGET_SLEW_DEG_S);
+
+
+    g_balance_state =
+        BALL_STATE_PULLING;
+
+
+    g_debug_capture_elapsed_ms =
+        0U;
+
+
+    g_debug_breakaway_elapsed_ms =
+        0U;
+
+
+    UpdateControlDebug(
+        controlPosition,
+        velocity);
+}
+
+
+/*==============================================================
+ * 35. 电机1kHz软件位置控制
+ *==============================================================*/
+
+static void MotorPositionControl1ms(
+    float targetAngleDeg)
+{
+    static float previousRate = 0.0f;
+
+    int32_t targetPulse;
+
+    int32_t positionError;
+
+    float requestedRate;
+
+    float maximumRateChange;
+
+
+    targetPulse =
+        MotorAngleToPulse(
+            targetAngleDeg);
+
+
+    if (targetPulse >
+        MotorAngleToPulse(
+            MAX_MOTOR_ANGLE_DEG))
+    {
+        targetPulse =
+            MotorAngleToPulse(
+                MAX_MOTOR_ANGLE_DEG);
+    }
+
+
+    if (targetPulse <
+        MotorAngleToPulse(
+            -MAX_MOTOR_ANGLE_DEG))
+    {
+        targetPulse =
+            MotorAngleToPulse(
+                -MAX_MOTOR_ANGLE_DEG);
+    }
+
+
+    g_motor_target_pulse =
+        targetPulse;
+
+
+    positionError =
+        targetPulse -
+        g_motor_current_pulse;
+
+
+    /*
+     * 到达目标位置后立即停止。
+     */
+    if (Int32Abs(positionError) <=
+        MOTOR_POSITION_DEADBAND_PULSE)
+    {
+        g_step_rate_sps = 0;
+
+        previousRate = 0.0f;
+
+
+        g_debug_motor_angle_x100 =
+            FloatToInt32(
+                MotorPulseToAngle(
+                    g_motor_current_pulse) *
+                100.0f);
+
+        return;
+    }
+
+
+    /*
+     * 目标方向反转时立即清除旧速度。
+     */
+    if (((positionError > 0) &&
+         (previousRate < 0.0f)) ||
+        ((positionError < 0) &&
+         (previousRate > 0.0f)))
+    {
+        previousRate = 0.0f;
+    }
+
+
+    requestedRate =
+        MOTOR_POSITION_KP *
+        (float)positionError;
+
+
+    /*
+     * 保证小误差时仍能快速动作。
+     */
+    if ((requestedRate > 0.0f) &&
+        (requestedRate <
+         MOTOR_MIN_STEP_RATE_SPS))
+    {
+        requestedRate =
+            MOTOR_MIN_STEP_RATE_SPS;
+    }
+
+
+    if ((requestedRate < 0.0f) &&
+        (requestedRate >
+         -MOTOR_MIN_STEP_RATE_SPS))
+    {
+        requestedRate =
+            -MOTOR_MIN_STEP_RATE_SPS;
+    }
+
+
+    requestedRate =
+        FloatClamp(
+            requestedRate,
+            -MOTOR_MAX_STEP_RATE_SPS,
+            MOTOR_MAX_STEP_RATE_SPS);
+
+
+    maximumRateChange =
+        MOTOR_MAX_ACCEL_SPS2 *
+        MOTOR_CONTROL_DT_S;
+
+
+    requestedRate =
+        FloatClamp(
+            requestedRate,
+            previousRate -
+            maximumRateChange,
+            previousRate +
+            maximumRateChange);
+
+
+    g_step_rate_sps =
+        FloatToInt32(
+            requestedRate);
+
+
+    previousRate =
+        requestedRate;
+
+
+    g_debug_motor_angle_x100 =
+        FloatToInt32(
+            MotorPulseToAngle(
+                g_motor_current_pulse) *
+            100.0f);
+}
+
+
+/*==============================================================
+ * 36. SysTick中断
+ *==============================================================*/
+
+void SysTick_Handler(void)
+{
+    static uint32_t millisecondDivider = 0U;
+
+    static uint32_t ballControlDivider = 0U;
+
+    static uint32_t motorControlDivider = 0U;
+
+
+    /*
+     * STEP脉冲服务10kHz。
+     */
+    StepPulseService100us();
+
+
+    /*
+     * 毫秒计时。
+     */
+    millisecondDivider++;
+
+
+    if (millisecondDivider >= 10U)
+    {
+        millisecondDivider = 0U;
+
+        g_system_ms++;
+    }
+
+
+    /*
+     * 钢球控制100Hz。
+     */
+    ballControlDivider++;
+
+
+    if (ballControlDivider >=
+        BALL_CONTROL_INTERVAL_TICKS)
+    {
+        ballControlDivider = 0U;
+
+        g_ball_control_due = 1U;
+    }
+
+
+    /*
+     * 电机控制1kHz。
+     */
+    motorControlDivider++;
+
+
+    if (motorControlDivider >=
+        MOTOR_CONTROL_INTERVAL_TICKS)
+    {
+        motorControlDivider = 0U;
+
+        g_motor_control_due = 1U;
+    }
+}
+
+
+/*==============================================================
+ * 37. 主函数
+ *==============================================================*/
+
+int main(void)
+{
+    uint8_t hasNewSample;
+
+    uint8_t ballControlDue;
+
+    uint8_t motorControlDue;
+
+    uint8_t measurementUpdated;
+
+    int32_t receivedPosition;
+
+    uint32_t receivedTime;
+
+
+    SYSCFG_DL_init();
+
+
+    StepperGPIOInit();
+
+
+    /*
+     * 上电先关闭驱动。
+     */
+    StepperEnable(0U);
+
+
+    /*
+     * 打开UART0接收中断。
+     */
+    DL_UART_Main_enableInterrupt(
+        K230_UART_INST,
+        DL_UART_MAIN_INTERRUPT_RX);
+
+
+    NVIC_ClearPendingIRQ(
+        K230_UART_INST_INT_IRQN);
+
+
+    NVIC_EnableIRQ(
+        K230_UART_INST_INT_IRQN);
+
+
+    /*
+     * 打开UART1接收中断，用于JY60。
+     */
+    DL_UART_Main_enableInterrupt(
+        JY60_UART_INST,
+        DL_UART_MAIN_INTERRUPT_RX);
+
+
+    NVIC_ClearPendingIRQ(
+        JY60_UART_INST_INT_IRQN);
+
+
+    NVIC_EnableIRQ(
+        JY60_UART_INST_INT_IRQN);
+
+
+    /*
+     * 开启10kHz SysTick。
+     */
+    if (SysTick_Config(
+            CPUCLK_FREQ /
+            SYSTICK_FREQUENCY_HZ) != 0U)
+    {
+        while (1)
+        {
+            __WFI();
+        }
+    }
+
+
+    __enable_irq();
+
+
+    /*
+     * 等待2秒，手动调平轨道。
+     */
+    DelayMs(
+        START_DELAY_MS);
+
+
+    /*
+     * 结束JY60静止零偏标定。
+     *
+     * 这2秒内小车和JY60必须保持静止，
+     * 同时手动把摆杆调到水平零位。
+     */
+    FinishJY60Calibration();
+
+
+    /*
+     * 将当前位置作为软件水平零点。
+     */
+    g_motor_current_pulse = 0;
+
+    g_motor_target_pulse = 0;
+
+    g_step_rate_sps = 0;
+
+
+    g_requested_motor_angle_deg =
+        0.0f;
+
+    g_applied_motor_angle_deg =
+        0.0f;
+
+
+    g_center_trim_angle_deg =
+        0.0f;
+
+    g_center_exit_confirm_count =
+        0U;
+
+
+    g_static_bias_angle_deg =
+        0.0f;
+
+    g_breakaway_target_angle_deg =
+        0.0f;
+
+    g_capture_brake_angle_deg =
+        0.0f;
+
+
+    g_filtered_position_mm =
+        0.0f;
+
+    g_previous_filtered_position_mm =
+        0.0f;
+
+    g_filtered_velocity_mm_s =
+        0.0f;
+
+    g_filtered_acceleration_mm_s2 =
+        0.0f;
+
+    g_predicted_position_mm =
+        0.0f;
+
+    g_predicted_velocity_mm_s =
+        0.0f;
+
+    g_prediction_time_s =
+        PREDICTION_MIN_TIME_S;
+
+    g_motion_history_count =
+        0U;
+
+    g_last_measurement_dt_s =
+        0.01f;
+
+    g_pid_integral_mm_s =
+        0.0f;
+
+    g_pid_p_angle_deg =
+        0.0f;
+
+    g_pid_i_angle_deg =
+        0.0f;
+
+    g_pid_d_angle_deg =
+        0.0f;
+
+    g_pid_a_angle_deg =
+        0.0f;
+
+
+    g_observer_initialized =
+        0U;
+
+
+    g_balance_state =
+        BALL_STATE_WAITING;
+
+
+    g_center_confirm_count =
+        0U;
+
+    g_progress_initialized =
+        0U;
+
+    g_previous_control_position_mm =
+        0.0f;
+
+
+    g_breakaway_level =
+        0U;
+
+    g_breakaway_count =
+        0U;
+
+    g_capture_cooldown_remaining_ms =
+        0U;
+
+    g_capture_started_predictively =
+        0U;
+
+    g_debug_predictive_capture =
+        0U;
+
+
+    /*
+     * JY60补偿角从0开始。
+     */
+    g_vehicle_accel_filtered_g =
+        0.0f;
+
+    g_vehicle_comp_target_angle_deg =
+        0.0f;
+
+    g_vehicle_comp_angle_deg =
+        0.0f;
+
+
+    /*
+     * 清除启动等待期间的旧帧标志。
+     */
+    __disable_irq();
+
+
+    g_k230_new_sample =
+        0U;
+
+
+    __enable_irq();
+
+
+    /*
+     * 使能D36A并锁轴。
+     */
+    StepperEnable(1U);
+
+
+    DelayMs(
+        ENABLE_SETTLE_MS);
+
+
+    while (1)
+    {
+        /*
+         * ======================================================
+         * 读取K230坐标
+         * ======================================================
+         */
+        __disable_irq();
+
+
+        hasNewSample =
+            g_k230_new_sample;
+
+
+        receivedPosition =
+            g_k230_position_mm;
+
+
+        receivedTime =
+            g_k230_last_rx_ms;
+
+
+        if (hasNewSample != 0U)
+        {
+            g_k230_new_sample = 0U;
+        }
+
+
+        __enable_irq();
+
+
+        if (hasNewSample != 0U)
+        {
+            UpdateBallMeasurement(
+                (float)receivedPosition,
+                receivedTime);
+        }
+
+
+        /*
+         * ======================================================
+         * 读取100Hz钢球控制标志
+         * ======================================================
+         */
+        __disable_irq();
+
+
+        ballControlDue =
+            g_ball_control_due;
+
+
+        if (ballControlDue != 0U)
+        {
+            g_ball_control_due = 0U;
+        }
+
+
+        __enable_irq();
+
+
+        if (ballControlDue != 0U)
+        {
+            measurementUpdated =
+                g_measurement_updated_for_control;
+
+
+            g_measurement_updated_for_control =
+                0U;
+
+
+            BallPositionControl100Hz(
+                measurementUpdated);
+        }
+
+
+        /*
+         * ======================================================
+         * 读取1kHz电机控制标志
+         * ======================================================
+         */
+        __disable_irq();
+
+
+        motorControlDue =
+            g_motor_control_due;
+
+
+        if (motorControlDue != 0U)
+        {
+            g_motor_control_due = 0U;
+        }
+
+
+        __enable_irq();
+
+
+        if (motorControlDue != 0U)
+        {
+            MotorPositionControl1ms(
+                g_applied_motor_angle_deg);
+        }
+
+
+        __WFI();
+    }
+}
