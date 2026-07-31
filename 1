@@ -1,0 +1,2860 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ * ================================================================
+ * MSPM0G3507 + D36A + MS42C + K230
+ *
+ * 钢球快速回原点控制
+ *
+ * 新增：
+ *
+ * 1. 自适应静摩擦补偿
+ * 2. 破静摩擦快速坡度脉冲
+ * 3. 更强的一次性捕获制动
+ * 4. 原点附近立即锁定，不连续正反调整
+ *
+ * K230发送格式：
+ *
+ *      -25\n
+ *      0\n
+ *      18\n
+ *
+ * 单位：mm
+ *
+ * 接线：
+ *
+ *      K230 TX -> PA1，MSPM0 UART0 RX
+ *      K230 RX <- PA0，MSPM0 UART0 TX
+ *      K230 GND与MSPM0 GND共地
+ *
+ *      PB1 -> D36A ST1
+ *      PB2 -> D36A DIR1
+ *      PB4 -> D36A EN1
+ *
+ * 当前不使用MS42C编码器。
+ * 通过累计实际发送的STEP脉冲估计电机位置。
+ *
+ * 上电后的2秒内驱动关闭，
+ * 请手动将轨道调整到水平位置。
+ * ================================================================
+ */
+
+
+/*==============================================================
+ * 1. 系统时钟与控制频率
+ *==============================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                         (32000000UL)
+#endif
+
+/*
+ * SysTick为10kHz。
+ *
+ * 每100us进入一次中断。
+ */
+#define SYSTICK_FREQUENCY_HZ                (10000U)
+
+/*
+ * 钢球外环100Hz。
+ *
+ * 每10ms执行一次。
+ */
+#define BALL_CONTROL_FREQUENCY_HZ           (100U)
+
+#define BALL_CONTROL_INTERVAL_TICKS         \
+    (SYSTICK_FREQUENCY_HZ /                 \
+     BALL_CONTROL_FREQUENCY_HZ)
+
+#define BALL_CONTROL_DT_S                   (0.01f)
+
+/*
+ * 电机位置内环1kHz。
+ *
+ * 每1ms执行一次。
+ */
+#define MOTOR_CONTROL_FREQUENCY_HZ          (1000U)
+
+#define MOTOR_CONTROL_INTERVAL_TICKS        \
+    (SYSTICK_FREQUENCY_HZ /                 \
+     MOTOR_CONTROL_FREQUENCY_HZ)
+
+#define MOTOR_CONTROL_DT_S                  (0.001f)
+
+
+/*==============================================================
+ * 2. D36A控制引脚
+ *==============================================================*/
+
+#define STEP_PORT                           (GPIOB)
+#define STEP_PIN                            (DL_GPIO_PIN_1)
+
+#define DIR_PORT                            (GPIOB)
+#define DIR_PIN                             (DL_GPIO_PIN_2)
+
+#define EN_PORT                             (GPIOB)
+#define EN_PIN                              (DL_GPIO_PIN_4)
+
+
+/*==============================================================
+ * 3. 步进电机参数
+ *==============================================================*/
+
+/*
+ * MS42C步距角1.8°：
+ *
+ * 一圈200整步。
+ */
+#define MOTOR_FULL_STEPS_PER_REV            (200.0f)
+
+/*
+ * D36A使用16细分。
+ */
+#define MOTOR_MICROSTEP                     (16.0f)
+
+/*
+ * 一圈脉冲数：
+ *
+ * 200 × 16 = 3200。
+ */
+#define MOTOR_PULSES_PER_REV                \
+    (MOTOR_FULL_STEPS_PER_REV *             \
+     MOTOR_MICROSTEP)
+
+/*
+ * 每旋转1°需要的脉冲：
+ *
+ * 3200 / 360 = 8.8889。
+ */
+#define MOTOR_PULSES_PER_DEG                \
+    (MOTOR_PULSES_PER_REV / 360.0f)
+
+
+/*==============================================================
+ * 4. 方向及使能极性
+ *==============================================================*/
+
+/*
+ * PB4高电平使能D36A。
+ */
+#define ENABLE_ACTIVE_HIGH                  (1U)
+
+/*
+ * 正方向时PB2输出高电平。
+ */
+#define POSITIVE_DIRECTION_LEVEL            (1U)
+
+/*
+ * 你当前使用-1时方向正确，所以保留。
+ *
+ * 如果小球越来越远，改为1.0f。
+ */
+#define BALL_CONTROL_POLARITY               (-1.0f)
+
+
+/*==============================================================
+ * 5. K230通信参数
+ *==============================================================*/
+
+/*
+ * 25cm轨道中心两侧约125mm。
+ */
+#define BALL_POSITION_LIMIT_MM              (125)
+
+/*
+ * 超过500ms没有收到K230坐标，
+ * 认为通信超时。
+ */
+#define K230_TIMEOUT_MS                     (500U)
+
+
+/*==============================================================
+ * 6. 坐标和速度滤波参数
+ *==============================================================*/
+
+/*
+ * 滤波位置只用于计算速度。
+ *
+ * 实际位置控制直接使用K230原始坐标。
+ */
+#define POSITION_FILTER_ALPHA               (0.78f)
+
+/*
+ * 速度低通滤波。
+ */
+#define VELOCITY_FILTER_ALPHA               (0.38f)
+
+/*
+ * 允许完整坐标跳变。
+ */
+#define MAX_POSITION_JUMP_PER_FRAME_MM      (125.0f)
+
+/*
+ * 最大速度估计。
+ */
+#define MAX_BALL_SPEED_MM_S                 (500.0f)
+
+
+/*==============================================================
+ * 7. 控制状态
+ *==============================================================*/
+
+#define BALL_STATE_WAITING                  (0U)
+
+/* 正常向原点拉回。 */
+#define BALL_STATE_PULLING                  (1U)
+
+/* 预留。 */
+#define BALL_STATE_BRAKING                  (2U)
+
+/* 已经锁定在原点附近。 */
+#define BALL_STATE_HOLDING                  (3U)
+
+/* 自适应增加基础坡度。 */
+#define BALL_STATE_STATIC_BIAS              (4U)
+
+/* 一次性捕获制动。 */
+#define BALL_STATE_CAPTURE                  (5U)
+
+/* 快速破静摩擦脉冲。 */
+#define BALL_STATE_BREAKAWAY                (6U)
+
+
+/*==============================================================
+ * 8. 原点立即锁定参数
+ *==============================================================*/
+
+/*
+ * 检测到小球进入±3mm，
+ * 立即认为已到达原点附近。
+ */
+#define BALL_CENTER_ENTER_MM                (3.0f)
+
+/*
+ * 锁定后超过±7mm才重新控制。
+ *
+ * 形成滞环，防止原点附近抖动。
+ */
+#define BALL_CENTER_EXIT_MM                 (7.0f)
+
+/*
+ * 低速直接锁定的速度范围。
+ */
+#define BALL_CENTER_ENTER_SPEED_MM_S        (18.0f)
+
+/*
+ * 只需一帧满足即可立即锁定。
+ */
+#define BALL_CENTER_CONFIRM_FRAMES          (1U)
+
+
+/*==============================================================
+ * 9. 正常回中参数
+ *==============================================================*/
+
+/*
+ * 正常位置比例。
+ *
+ * 例如：
+ *
+ * 33mm × 0.055 = 1.815°
+ * 100mm × 0.055 = 5.5°
+ */
+#define BALL_PULL_KP                        (0.055f)
+
+/*
+ * 正常拉回时保留少量速度反馈。
+ */
+#define BALL_PULL_KD                        (0.006f)
+
+
+/*==============================================================
+ * 10. 回中进度检查
+ *==============================================================*/
+
+/*
+ * 每120ms检查一次是否真的靠近原点。
+ *
+ * 比上一版200ms更快。
+ */
+#define BALL_PROGRESS_CHECK_MS              (120U)
+
+/*
+ * 120ms内至少靠近原点1.5mm，
+ * 才认为小球确实在运动。
+ */
+#define BALL_MIN_PROGRESS_MM                (1.5f)
+
+/*
+ * 每次没有进展时，
+ * 基础坡度额外增加0.45°。
+ */
+#define STATIC_BIAS_STEP_DEG                (0.45f)
+
+/*
+ * 自适应静摩擦基础补偿最大6°。
+ */
+#define STATIC_BIAS_MAX_DEG                 (6.0f)
+
+/*
+ * 小球已经正常向0运动时，
+ * 每次检查将静摩擦补偿乘以0.80。
+ */
+#define STATIC_BIAS_DECAY                   (0.80f)
+
+
+/*==============================================================
+ * 11. 破静摩擦脉冲参数
+ *==============================================================*/
+
+/*
+ * 第一次破静摩擦脉冲附加2.4°。
+ */
+#define BREAKAWAY_BASE_ANGLE_DEG            (2.4f)
+
+/*
+ * 每次仍然卡住，
+ * 下一次冲击再增加0.75°。
+ */
+#define BREAKAWAY_LEVEL_STEP_DEG            (0.75f)
+
+/*
+ * 最大冲击等级。
+ */
+#define BREAKAWAY_MAX_LEVEL                 (4U)
+
+/*
+ * 一次破静摩擦脉冲持续110ms。
+ */
+#define BREAKAWAY_MAX_TIME_MS               (110U)
+
+/*
+ * 至少执行45ms后，
+ * 检测到小球已经明显向0运动时可以提前结束。
+ */
+#define BREAKAWAY_MIN_TIME_MS               (45U)
+
+/*
+ * 速度超过该值，
+ * 认为静摩擦已经被克服。
+ */
+#define BREAKAWAY_RELEASE_SPEED_MM_S        (18.0f)
+
+/*
+ * 破静摩擦时目标角度快速变化。
+ */
+#define BREAKAWAY_SLEW_DEG_S                (500.0f)
+
+
+/*==============================================================
+ * 12. 一次性捕获制动参数
+ *==============================================================*/
+
+/*
+ * 进入±14mm后开始考虑捕获。
+ *
+ * 比上一版±10mm更早开始制动。
+ */
+#define BALL_CAPTURE_ENTER_MM               (14.0f)
+
+/*
+ * 正在向0运动并且速度超过10mm/s时，
+ * 启动一次性捕获。
+ */
+#define BALL_CAPTURE_MIN_SPEED_MM_S         (10.0f)
+
+/*
+ * 捕获至少持续70ms。
+ */
+#define BALL_CAPTURE_MIN_TIME_MS            (70U)
+
+/*
+ * 捕获最长持续180ms。
+ */
+#define BALL_CAPTURE_MAX_TIME_MS            (180U)
+
+/*
+ * 速度降低到6mm/s以下且已经接近原点，
+ * 可以结束捕获。
+ */
+#define BALL_CAPTURE_STOP_SPEED_MM_S        (6.0f)
+
+/*
+ * 捕获速度增益。
+ *
+ * 相比上一版0.050提高到0.075，
+ * 捕获效果明显增强。
+ */
+#define BALL_CAPTURE_KD                     (0.075f)
+
+/*
+ * 最小制动角度。
+ */
+#define BALL_CAPTURE_MIN_ANGLE_DEG          (1.2f)
+
+/*
+ * 最大制动角度。
+ *
+ * 相比上一版2.2°提高到3.8°。
+ */
+#define BALL_CAPTURE_MAX_ANGLE_DEG          (3.8f)
+
+/*
+ * 捕获目标角度快速执行。
+ */
+#define BALL_CAPTURE_SLEW_DEG_S             (500.0f)
+
+/*
+ * 捕获没有成功后，
+ * 180ms内不重复启动捕获。
+ *
+ * 避免在中心附近连续正反摆动。
+ */
+#define CAPTURE_COOLDOWN_MS                 (180U)
+
+
+/*==============================================================
+ * 13. 距离分段角度限制
+ *==============================================================*/
+
+/*
+ * 距离大于50mm：
+ * 最大允许14°。
+ */
+#define FAR_POSITION_MM                     (50.0f)
+#define FAR_MAX_ANGLE_DEG                   (14.0f)
+
+/*
+ * 距离在14～50mm：
+ * 最大允许9°。
+ */
+#define MIDDLE_POSITION_MM                  (14.0f)
+#define MIDDLE_MAX_ANGLE_DEG                (9.0f)
+
+/*
+ * 原点附近普通拉回最大3°。
+ */
+#define NEAR_MAX_ANGLE_DEG                  (3.0f)
+
+/*
+ * 总软件角度限位。
+ */
+#define MAX_MOTOR_ANGLE_DEG                 (14.0f)
+
+
+/*==============================================================
+ * 14. 目标角度响应参数
+ *==============================================================*/
+
+/*
+ * 普通拉回角度变化速度。
+ *
+ * 比上一版更快。
+ */
+#define NORMAL_TARGET_SLEW_DEG_S            (220.0f)
+
+/*
+ * 返回水平时的角度速度。
+ */
+#define LEVEL_RETURN_SLEW_DEG_S             (350.0f)
+
+
+/*==============================================================
+ * 15. 步进电机位置控制参数
+ *==============================================================*/
+
+/*
+ * 软件位置误差转换为STEP频率。
+ */
+#define MOTOR_POSITION_KP                   (18.0f)
+
+/*
+ * 最大STEP频率提高到1400。
+ */
+#define MOTOR_MAX_STEP_RATE_SPS             (1400.0f)
+
+/*
+ * 小误差时的最低STEP速度。
+ */
+#define MOTOR_MIN_STEP_RATE_SPS             (120.0f)
+
+/*
+ * 加速度提高到25000脉冲/s²。
+ */
+#define MOTOR_MAX_ACCEL_SPS2                (25000.0f)
+
+/*
+ * 目标位置误差不超过1脉冲时停止。
+ */
+#define MOTOR_POSITION_DEADBAND_PULSE       (1)
+
+
+/*==============================================================
+ * 16. 上电参数
+ *==============================================================*/
+
+/*
+ * 上电后关闭驱动2秒。
+ */
+#define START_DELAY_MS                      (2000U)
+
+/*
+ * 使能后的稳定等待时间。
+ */
+#define ENABLE_SETTLE_MS                    (100U)
+
+
+/*==============================================================
+ * 17. 全局调试变量
+ *==============================================================*/
+
+volatile uint32_t g_system_ms = 0U;
+
+volatile int32_t g_k230_position_mm = 0;
+
+volatile uint32_t g_k230_valid_count = 0U;
+
+volatile uint32_t g_frame_process_count = 0U;
+
+volatile uint32_t g_k230_last_rx_ms = 0U;
+
+volatile uint8_t g_k230_new_sample = 0U;
+
+volatile uint8_t g_ball_control_due = 0U;
+
+volatile uint8_t g_motor_control_due = 0U;
+
+/*
+ * 0：等待K230
+ * 1：正常拉回
+ * 3：原点锁定
+ * 4：静摩擦补偿增加
+ * 5：一次性捕获
+ * 6：破静摩擦脉冲
+ */
+volatile uint32_t g_balance_state =
+    BALL_STATE_WAITING;
+
+volatile uint32_t g_center_confirm_count = 0U;
+
+/*
+ * 控制位置，单位0.1mm。
+ */
+volatile int32_t g_debug_position_x10 = 0;
+
+/*
+ * 滤波位置，单位0.1mm。
+ */
+volatile int32_t g_debug_filtered_position_x10 = 0;
+
+/*
+ * 速度，单位0.1mm/s。
+ */
+volatile int32_t g_debug_velocity_x10 = 0;
+
+/*
+ * 最终目标角度，单位0.01°。
+ */
+volatile int32_t g_debug_target_angle_x100 = 0;
+
+/*
+ * 当前软件电机角度，单位0.01°。
+ */
+volatile int32_t g_debug_motor_angle_x100 = 0;
+
+/*
+ * 静摩擦基础补偿，单位0.01°。
+ */
+volatile int32_t g_debug_static_bias_x100 = 0;
+
+/*
+ * 破静摩擦冲击角度，单位0.01°。
+ */
+volatile int32_t g_debug_breakaway_angle_x100 = 0;
+
+/*
+ * 捕获制动角度，单位0.01°。
+ */
+volatile int32_t g_debug_capture_angle_x100 = 0;
+
+/*
+ * 破静摩擦次数。
+ */
+volatile uint32_t g_breakaway_count = 0U;
+
+/*
+ * 当前冲击等级。
+ */
+volatile uint32_t g_breakaway_level = 0U;
+
+/*
+ * 捕获持续时间。
+ */
+volatile uint32_t g_debug_capture_elapsed_ms = 0U;
+
+/*
+ * 破静摩擦持续时间。
+ */
+volatile uint32_t g_debug_breakaway_elapsed_ms = 0U;
+
+/*
+ * K230通信年龄。
+ */
+volatile uint32_t g_debug_uart_age_ms = 0U;
+
+/*
+ * K230帧间隔。
+ */
+volatile uint32_t g_debug_frame_dt_ms = 0U;
+
+/*
+ * 电机目标脉冲。
+ */
+volatile int32_t g_motor_target_pulse = 0;
+
+/*
+ * 软件累计当前脉冲位置。
+ */
+volatile int32_t g_motor_current_pulse = 0;
+
+/*
+ * 当前STEP频率。
+ */
+volatile int32_t g_step_rate_sps = 0;
+
+volatile uint32_t g_step_output_level = 0U;
+volatile uint32_t g_direction_output_level = 0U;
+volatile uint32_t g_enable_output_level = 0U;
+
+
+/*==============================================================
+ * 18. 内部控制变量
+ *==============================================================*/
+
+static float g_filtered_position_mm = 0.0f;
+
+static float g_previous_filtered_position_mm = 0.0f;
+
+static float g_filtered_velocity_mm_s = 0.0f;
+
+static float g_last_accepted_position_mm = 0.0f;
+
+/*
+ * 自适应静摩擦基础补偿。
+ *
+ * 尚未乘BALL_CONTROL_POLARITY。
+ */
+static float g_static_bias_angle_deg = 0.0f;
+
+/*
+ * 破静摩擦脉冲固定目标。
+ *
+ * 尚未乘BALL_CONTROL_POLARITY。
+ */
+static float g_breakaway_target_angle_deg = 0.0f;
+
+/*
+ * 捕获制动固定角度。
+ *
+ * 尚未乘BALL_CONTROL_POLARITY。
+ */
+static float g_capture_brake_angle_deg = 0.0f;
+
+static float g_requested_motor_angle_deg = 0.0f;
+
+static float g_applied_motor_angle_deg = 0.0f;
+
+static uint32_t g_last_measurement_time_ms = 0U;
+
+static uint8_t g_observer_initialized = 0U;
+
+static uint8_t g_measurement_updated_for_control = 0U;
+
+/*
+ * 回中进度监测。
+ */
+static float g_progress_reference_abs_mm = 0.0f;
+
+static uint32_t g_progress_reference_ms = 0U;
+
+static uint8_t g_progress_initialized = 0U;
+
+/*
+ * 上一次位置，用于判断是否穿过原点。
+ */
+static float g_previous_control_position_mm = 0.0f;
+
+/*
+ * 捕获状态时间。
+ */
+static uint32_t g_capture_start_ms = 0U;
+
+/*
+ * 捕获冷却时间。
+ */
+static uint32_t g_capture_cooldown_remaining_ms = 0U;
+
+/*
+ * 破静摩擦状态时间。
+ */
+static uint32_t g_breakaway_start_ms = 0U;
+
+
+/*==============================================================
+ * 19. 基础函数
+ *==============================================================*/
+
+static float FloatAbs(float value)
+{
+    if (value < 0.0f)
+    {
+        return -value;
+    }
+
+    return value;
+}
+
+
+static float FloatClamp(
+    float value,
+    float minimum,
+    float maximum)
+{
+    if (value > maximum)
+    {
+        return maximum;
+    }
+
+    if (value < minimum)
+    {
+        return minimum;
+    }
+
+    return value;
+}
+
+
+static float FloatSign(float value)
+{
+    if (value > 0.0f)
+    {
+        return 1.0f;
+    }
+
+    if (value < 0.0f)
+    {
+        return -1.0f;
+    }
+
+    return 0.0f;
+}
+
+
+static int32_t Int32Abs(int32_t value)
+{
+    if (value < 0)
+    {
+        return -value;
+    }
+
+    return value;
+}
+
+
+static int32_t FloatToInt32(float value)
+{
+    if (value >= 0.0f)
+    {
+        return (int32_t)(value + 0.5f);
+    }
+
+    return (int32_t)(value - 0.5f);
+}
+
+
+/*==============================================================
+ * 20. 延时函数
+ *==============================================================*/
+
+static void DelayMs(uint32_t milliseconds)
+{
+    while (milliseconds > 0U)
+    {
+        DL_Common_delayCycles(
+            CPUCLK_FREQ / 1000U);
+
+        milliseconds--;
+    }
+}
+
+
+/*==============================================================
+ * 21. 调试变量更新
+ *==============================================================*/
+
+static void UpdateControlDebug(
+    float positionMm,
+    float velocityMmS)
+{
+    g_debug_position_x10 =
+        FloatToInt32(
+            positionMm *
+            10.0f);
+
+    g_debug_filtered_position_x10 =
+        FloatToInt32(
+            g_filtered_position_mm *
+            10.0f);
+
+    g_debug_velocity_x10 =
+        FloatToInt32(
+            velocityMmS *
+            10.0f);
+
+    g_debug_target_angle_x100 =
+        FloatToInt32(
+            g_applied_motor_angle_deg *
+            100.0f);
+
+    g_debug_static_bias_x100 =
+        FloatToInt32(
+            g_static_bias_angle_deg *
+            100.0f);
+
+    g_debug_breakaway_angle_x100 =
+        FloatToInt32(
+            g_breakaway_target_angle_deg *
+            100.0f);
+
+    g_debug_capture_angle_x100 =
+        FloatToInt32(
+            g_capture_brake_angle_deg *
+            100.0f);
+}
+
+
+/*==============================================================
+ * 22. 电机GPIO初始化
+ *==============================================================*/
+
+static void StepperGPIOInit(void)
+{
+    DL_GPIO_enableOutput(
+        GPIOB,
+        STEP_PIN |
+        DIR_PIN |
+        EN_PIN);
+
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN);
+
+    DL_GPIO_clearPins(
+        DIR_PORT,
+        DIR_PIN);
+
+    g_step_output_level = 0U;
+    g_direction_output_level = 0U;
+}
+
+
+/*==============================================================
+ * 23. D36A使能
+ *==============================================================*/
+
+static void StepperEnable(uint32_t enable)
+{
+#if ENABLE_ACTIVE_HIGH == 1U
+
+    if (enable != 0U)
+    {
+        DL_GPIO_setPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 1U;
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 0U;
+    }
+
+#else
+
+    if (enable != 0U)
+    {
+        DL_GPIO_clearPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 0U;
+    }
+    else
+    {
+        DL_GPIO_setPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 1U;
+    }
+
+#endif
+}
+
+
+/*==============================================================
+ * 24. 设置方向
+ *==============================================================*/
+
+static void SetMotorDirection(int32_t direction)
+{
+    uint32_t outputLevel;
+
+    if (direction > 0)
+    {
+        outputLevel =
+            POSITIVE_DIRECTION_LEVEL;
+    }
+    else
+    {
+        outputLevel =
+            (POSITIVE_DIRECTION_LEVEL == 0U) ?
+            1U : 0U;
+    }
+
+    if (outputLevel != 0U)
+    {
+        DL_GPIO_setPins(
+            DIR_PORT,
+            DIR_PIN);
+
+        g_direction_output_level = 1U;
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            DIR_PORT,
+            DIR_PIN);
+
+        g_direction_output_level = 0U;
+    }
+}
+
+
+/*==============================================================
+ * 25. 角度与脉冲换算
+ *==============================================================*/
+
+static int32_t MotorAngleToPulse(float angleDeg)
+{
+    return FloatToInt32(
+        angleDeg *
+        MOTOR_PULSES_PER_DEG);
+}
+
+
+static float MotorPulseToAngle(int32_t pulse)
+{
+    return
+        (float)pulse /
+        MOTOR_PULSES_PER_DEG;
+}
+
+
+/*==============================================================
+ * 26. STEP脉冲服务
+ *
+ * 调用频率10kHz。
+ *==============================================================*/
+
+static void StepPulseService100us(void)
+{
+    static uint32_t phaseAccumulator = 0U;
+
+    static uint8_t stepPinHigh = 0U;
+
+    static int32_t appliedDirection = 0;
+
+    int32_t requestedRate;
+
+    int32_t direction;
+
+    uint32_t magnitude;
+
+
+    requestedRate =
+        g_step_rate_sps;
+
+
+    /*
+     * 上一次STEP为高电平：
+     * 本周期先拉低。
+     */
+    if (stepPinHigh != 0U)
+    {
+        DL_GPIO_clearPins(
+            STEP_PORT,
+            STEP_PIN);
+
+        stepPinHigh = 0U;
+
+        g_step_output_level = 0U;
+    }
+
+
+    if (requestedRate == 0)
+    {
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    if (requestedRate > 0)
+    {
+        direction = 1;
+
+        magnitude =
+            (uint32_t)requestedRate;
+    }
+    else
+    {
+        direction = -1;
+
+        magnitude =
+            (uint32_t)(-requestedRate);
+    }
+
+
+    /*
+     * 已经到达目标位置。
+     */
+    if ((direction > 0) &&
+        (g_motor_current_pulse >=
+         g_motor_target_pulse))
+    {
+        g_step_rate_sps = 0;
+
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    if ((direction < 0) &&
+        (g_motor_current_pulse <=
+         g_motor_target_pulse))
+    {
+        g_step_rate_sps = 0;
+
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    /*
+     * 方向切换时，本周期只改变DIR。
+     */
+    if (direction != appliedDirection)
+    {
+        SetMotorDirection(
+            direction);
+
+        appliedDirection =
+            direction;
+
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    /*
+     * 软件总角度限位。
+     */
+    if ((direction > 0) &&
+        (g_motor_current_pulse >=
+         MotorAngleToPulse(
+             MAX_MOTOR_ANGLE_DEG)))
+    {
+        g_step_rate_sps = 0;
+
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    if ((direction < 0) &&
+        (g_motor_current_pulse <=
+         MotorAngleToPulse(
+             -MAX_MOTOR_ANGLE_DEG)))
+    {
+        g_step_rate_sps = 0;
+
+        phaseAccumulator = 0U;
+
+        return;
+    }
+
+
+    phaseAccumulator +=
+        magnitude;
+
+
+    if (phaseAccumulator >=
+        SYSTICK_FREQUENCY_HZ)
+    {
+        phaseAccumulator -=
+            SYSTICK_FREQUENCY_HZ;
+
+
+        DL_GPIO_setPins(
+            STEP_PORT,
+            STEP_PIN);
+
+
+        stepPinHigh = 1U;
+
+        g_step_output_level = 1U;
+
+
+        g_motor_current_pulse +=
+            direction;
+    }
+}
+
+
+/*==============================================================
+ * 27. 提交K230坐标
+ *==============================================================*/
+
+static void CommitK230Coordinate(
+    int32_t coordinateMm)
+{
+    if (coordinateMm >
+        BALL_POSITION_LIMIT_MM)
+    {
+        coordinateMm =
+            BALL_POSITION_LIMIT_MM;
+    }
+
+    if (coordinateMm <
+        -BALL_POSITION_LIMIT_MM)
+    {
+        coordinateMm =
+            -BALL_POSITION_LIMIT_MM;
+    }
+
+    g_k230_position_mm =
+        coordinateMm;
+
+    g_k230_last_rx_ms =
+        g_system_ms;
+
+    g_k230_new_sample = 1U;
+
+    g_k230_valid_count++;
+}
+
+
+/*==============================================================
+ * 28. 解析K230字符串
+ *==============================================================*/
+
+static void ParseK230Byte(uint8_t data)
+{
+    static int32_t value = 0;
+
+    static int32_t sign = 1;
+
+    static uint8_t receivingNumber = 0U;
+
+    static uint8_t hasDigit = 0U;
+
+
+    if (data == '-')
+    {
+        value = 0;
+
+        sign = -1;
+
+        receivingNumber = 1U;
+
+        hasDigit = 0U;
+
+        return;
+    }
+
+
+    if (data == '+')
+    {
+        value = 0;
+
+        sign = 1;
+
+        receivingNumber = 1U;
+
+        hasDigit = 0U;
+
+        return;
+    }
+
+
+    if ((data >= '0') &&
+        (data <= '9'))
+    {
+        if (receivingNumber == 0U)
+        {
+            value = 0;
+
+            sign = 1;
+
+            receivingNumber = 1U;
+
+            hasDigit = 0U;
+        }
+
+
+        value =
+            value * 10 +
+            (int32_t)(data - '0');
+
+
+        if (value > 999)
+        {
+            value = 999;
+        }
+
+
+        hasDigit = 1U;
+
+        return;
+    }
+
+
+    if ((data == '\r') ||
+        (data == '\n') ||
+        (data == ' ')  ||
+        (data == ',')  ||
+        (data == ';'))
+    {
+        if ((receivingNumber != 0U) &&
+            (hasDigit != 0U))
+        {
+            CommitK230Coordinate(
+                sign * value);
+        }
+
+
+        value = 0;
+
+        sign = 1;
+
+        receivingNumber = 0U;
+
+        hasDigit = 0U;
+    }
+}
+
+
+/*==============================================================
+ * 29. UART0中断
+ *==============================================================*/
+
+void UART0_IRQHandler(void)
+{
+    uint32_t pendingInterrupt;
+
+
+    pendingInterrupt =
+        DL_UART_Main_getPendingInterrupt(
+            K230_UART_INST);
+
+
+    switch (pendingInterrupt)
+    {
+        case DL_UART_MAIN_IIDX_RX:
+
+            while (!DL_UART_Main_isRXFIFOEmpty(
+                        K230_UART_INST))
+            {
+                uint8_t receivedByte;
+
+
+                receivedByte =
+                    (uint8_t)
+                    DL_UART_Main_receiveData(
+                        K230_UART_INST);
+
+
+                ParseK230Byte(
+                    receivedByte);
+            }
+
+            break;
+
+
+        default:
+
+            break;
+    }
+}
+
+
+/*==============================================================
+ * 30. 更新位置和速度估计
+ *==============================================================*/
+
+static void UpdateBallMeasurement(
+    float measurementMm,
+    uint32_t sampleTimeMs)
+{
+    float dt;
+
+    float measurementJump;
+
+    float acceptedMeasurement;
+
+    float rawVelocity;
+
+
+    if (g_observer_initialized == 0U)
+    {
+        g_last_accepted_position_mm =
+            measurementMm;
+
+        g_filtered_position_mm =
+            measurementMm;
+
+        g_previous_filtered_position_mm =
+            measurementMm;
+
+        g_filtered_velocity_mm_s =
+            0.0f;
+
+        g_last_measurement_time_ms =
+            sampleTimeMs;
+
+        g_observer_initialized = 1U;
+
+        g_measurement_updated_for_control =
+            1U;
+
+        g_debug_frame_dt_ms = 0U;
+
+        g_frame_process_count++;
+
+        return;
+    }
+
+
+    dt =
+        (float)(
+            sampleTimeMs -
+            g_last_measurement_time_ms) /
+        1000.0f;
+
+
+    if (dt < 0.005f)
+    {
+        dt = 0.005f;
+    }
+
+    if (dt > 0.150f)
+    {
+        dt = 0.150f;
+    }
+
+
+    g_debug_frame_dt_ms =
+        (uint32_t)(
+            dt *
+            1000.0f);
+
+
+    measurementJump =
+        measurementMm -
+        g_last_accepted_position_mm;
+
+
+    measurementJump =
+        FloatClamp(
+            measurementJump,
+            -MAX_POSITION_JUMP_PER_FRAME_MM,
+            MAX_POSITION_JUMP_PER_FRAME_MM);
+
+
+    acceptedMeasurement =
+        g_last_accepted_position_mm +
+        measurementJump;
+
+
+    g_last_accepted_position_mm =
+        acceptedMeasurement;
+
+
+    g_filtered_position_mm +=
+        POSITION_FILTER_ALPHA *
+        (
+            acceptedMeasurement -
+            g_filtered_position_mm
+        );
+
+
+    rawVelocity =
+        (
+            g_filtered_position_mm -
+            g_previous_filtered_position_mm
+        ) /
+        dt;
+
+
+    rawVelocity =
+        FloatClamp(
+            rawVelocity,
+            -MAX_BALL_SPEED_MM_S,
+            MAX_BALL_SPEED_MM_S);
+
+
+    g_filtered_velocity_mm_s +=
+        VELOCITY_FILTER_ALPHA *
+        (
+            rawVelocity -
+            g_filtered_velocity_mm_s
+        );
+
+
+    g_previous_filtered_position_mm =
+        g_filtered_position_mm;
+
+
+    g_last_measurement_time_ms =
+        sampleTimeMs;
+
+
+    g_measurement_updated_for_control =
+        1U;
+
+
+    g_frame_process_count++;
+}
+
+
+/*==============================================================
+ * 31. 角度斜率限制
+ *==============================================================*/
+
+static float ApplyAngleSlewLimit(
+    float currentAngle,
+    float requestedAngle,
+    float slewRateDegS)
+{
+    float maximumChange;
+
+    float difference;
+
+
+    maximumChange =
+        slewRateDegS *
+        BALL_CONTROL_DT_S;
+
+
+    difference =
+        requestedAngle -
+        currentAngle;
+
+
+    difference =
+        FloatClamp(
+            difference,
+            -maximumChange,
+            maximumChange);
+
+
+    return
+        currentAngle +
+        difference;
+}
+
+
+/*==============================================================
+ * 32. 进入原点锁定
+ *==============================================================*/
+
+static void EnterCenterHolding(void)
+{
+    g_balance_state =
+        BALL_STATE_HOLDING;
+
+    g_center_confirm_count =
+        BALL_CENTER_CONFIRM_FRAMES;
+
+    g_static_bias_angle_deg =
+        0.0f;
+
+    g_breakaway_target_angle_deg =
+        0.0f;
+
+    g_capture_brake_angle_deg =
+        0.0f;
+
+    g_breakaway_level =
+        0U;
+
+    g_progress_initialized =
+        0U;
+
+    g_capture_cooldown_remaining_ms =
+        0U;
+
+    g_requested_motor_angle_deg =
+        0.0f;
+
+    /*
+     * 立即将轨道目标设为水平。
+     */
+    g_applied_motor_angle_deg =
+        0.0f;
+}
+
+
+/*==============================================================
+ * 33. 钢球100Hz控制
+ *==============================================================*/
+
+static void BallPositionControl100Hz(
+    uint8_t receivedNewMeasurement)
+{
+    float controlPosition;
+
+    float velocity;
+
+    float absPosition;
+
+    float absVelocity;
+
+    float positionSign;
+
+    float positionTerm;
+
+    float velocityTerm;
+
+    float requestedBeforePolarity;
+
+    float angleLimit;
+
+    float progressMm;
+
+    float breakawayExtraAngle;
+
+    uint32_t uartAgeMs;
+
+    uint32_t stateElapsedMs;
+
+    uint8_t movingTowardCenter;
+
+    uint8_t crossedCenter;
+
+
+    /*
+     * 捕获冷却时间递减。
+     */
+    if (g_capture_cooldown_remaining_ms >
+        0U)
+    {
+        if (g_capture_cooldown_remaining_ms >
+            10U)
+        {
+            g_capture_cooldown_remaining_ms -=
+                10U;
+        }
+        else
+        {
+            g_capture_cooldown_remaining_ms =
+                0U;
+        }
+    }
+
+
+    uartAgeMs =
+        g_system_ms -
+        g_k230_last_rx_ms;
+
+
+    g_debug_uart_age_ms =
+        uartAgeMs;
+
+
+    /*
+     * 通信未初始化或者超时。
+     */
+    if ((g_observer_initialized == 0U) ||
+        (uartAgeMs >
+         K230_TIMEOUT_MS))
+    {
+        g_balance_state =
+            BALL_STATE_WAITING;
+
+        g_center_confirm_count =
+            0U;
+
+        g_static_bias_angle_deg *=
+            0.90f;
+
+        g_progress_initialized =
+            0U;
+
+        g_breakaway_target_angle_deg =
+            0.0f;
+
+        g_capture_brake_angle_deg =
+            0.0f;
+
+        g_requested_motor_angle_deg =
+            0.0f;
+
+        g_applied_motor_angle_deg =
+            ApplyAngleSlewLimit(
+                g_applied_motor_angle_deg,
+                0.0f,
+                LEVEL_RETURN_SLEW_DEG_S);
+
+        UpdateControlDebug(
+            0.0f,
+            0.0f);
+
+        return;
+    }
+
+
+    /*
+     * 位置控制直接使用K230原始坐标。
+     */
+    controlPosition =
+        (float)g_k230_position_mm;
+
+
+    /*
+     * 速度使用滤波估计。
+     */
+    velocity =
+        g_filtered_velocity_mm_s;
+
+
+    absPosition =
+        FloatAbs(
+            controlPosition);
+
+
+    absVelocity =
+        FloatAbs(
+            velocity);
+
+
+    positionSign =
+        FloatSign(
+            controlPosition);
+
+
+    /*
+     * 位置和速度异号：
+     * 小球正在向0运动。
+     */
+    if ((controlPosition *
+         velocity) < 0.0f)
+    {
+        movingTowardCenter = 1U;
+    }
+    else
+    {
+        movingTowardCenter = 0U;
+    }
+
+
+    /*
+     * 判断是否穿过原点。
+     */
+    if ((controlPosition *
+         g_previous_control_position_mm) <
+        0.0f)
+    {
+        crossedCenter = 1U;
+    }
+    else
+    {
+        crossedCenter = 0U;
+    }
+
+
+    g_previous_control_position_mm =
+        controlPosition;
+
+
+    /*
+     * 穿过原点时清除旧方向补偿。
+     */
+    if (crossedCenter != 0U)
+    {
+        g_static_bias_angle_deg =
+            0.0f;
+
+        g_breakaway_level =
+            0U;
+
+        g_progress_initialized =
+            0U;
+    }
+
+
+    /*
+     * ==========================================================
+     * 原点锁定状态
+     * ==========================================================
+     */
+    if (g_balance_state ==
+        BALL_STATE_HOLDING)
+    {
+        if (absPosition <=
+            BALL_CENTER_EXIT_MM)
+        {
+            g_requested_motor_angle_deg =
+                0.0f;
+
+            g_applied_motor_angle_deg =
+                0.0f;
+
+            g_static_bias_angle_deg =
+                0.0f;
+
+            g_breakaway_target_angle_deg =
+                0.0f;
+
+            g_capture_brake_angle_deg =
+                0.0f;
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        /*
+         * 超过±7mm重新启动。
+         */
+        g_center_confirm_count =
+            0U;
+
+        g_progress_initialized =
+            0U;
+
+        g_balance_state =
+            BALL_STATE_PULLING;
+    }
+
+
+    /*
+     * ==========================================================
+     * 一次性捕获状态
+     * ==========================================================
+     */
+    if (g_balance_state ==
+        BALL_STATE_CAPTURE)
+    {
+        stateElapsedMs =
+            g_system_ms -
+            g_capture_start_ms;
+
+
+        g_debug_capture_elapsed_ms =
+            stateElapsedMs;
+
+
+        g_requested_motor_angle_deg =
+            g_capture_brake_angle_deg *
+            BALL_CONTROL_POLARITY;
+
+
+        g_applied_motor_angle_deg =
+            ApplyAngleSlewLimit(
+                g_applied_motor_angle_deg,
+                g_requested_motor_angle_deg,
+                BALL_CAPTURE_SLEW_DEG_S);
+
+
+        /*
+         * 已经接近原点、穿过原点，
+         * 或者速度明显降下来。
+         */
+        if (
+            (stateElapsedMs >=
+             BALL_CAPTURE_MIN_TIME_MS) &&
+            (
+                (absPosition <=
+                 BALL_CENTER_ENTER_MM) ||
+                (crossedCenter != 0U) ||
+                (
+                    (absPosition <=
+                     BALL_CENTER_EXIT_MM) &&
+                    (absVelocity <=
+                     BALL_CAPTURE_STOP_SPEED_MM_S)
+                )
+            )
+        )
+        {
+            EnterCenterHolding();
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        /*
+         * 捕获时间达到上限。
+         */
+        if (stateElapsedMs >=
+            BALL_CAPTURE_MAX_TIME_MS)
+        {
+            /*
+             * 已经进入允许范围，直接锁定。
+             */
+            if (absPosition <=
+                BALL_CENTER_EXIT_MM)
+            {
+                EnterCenterHolding();
+            }
+            else
+            {
+                /*
+                 * 仍离原点较远：
+                 * 返回拉回状态，不直接错误锁定。
+                 */
+                g_balance_state =
+                    BALL_STATE_PULLING;
+
+                g_capture_brake_angle_deg =
+                    0.0f;
+
+                g_capture_cooldown_remaining_ms =
+                    CAPTURE_COOLDOWN_MS;
+
+                g_progress_initialized =
+                    0U;
+            }
+
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        UpdateControlDebug(
+            controlPosition,
+            velocity);
+
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 破静摩擦脉冲状态
+     * ==========================================================
+     */
+    if (g_balance_state ==
+        BALL_STATE_BREAKAWAY)
+    {
+        stateElapsedMs =
+            g_system_ms -
+            g_breakaway_start_ms;
+
+
+        g_debug_breakaway_elapsed_ms =
+            stateElapsedMs;
+
+
+        g_requested_motor_angle_deg =
+            g_breakaway_target_angle_deg *
+            BALL_CONTROL_POLARITY;
+
+
+        g_applied_motor_angle_deg =
+            ApplyAngleSlewLimit(
+                g_applied_motor_angle_deg,
+                g_requested_motor_angle_deg,
+                BREAKAWAY_SLEW_DEG_S);
+
+
+        /*
+         * 小球已经明显向0运动：
+         * 提前结束冲击。
+         */
+        if (
+            (stateElapsedMs >=
+             BREAKAWAY_MIN_TIME_MS) &&
+            (movingTowardCenter != 0U) &&
+            (absVelocity >=
+             BREAKAWAY_RELEASE_SPEED_MM_S)
+        )
+        {
+            g_balance_state =
+                BALL_STATE_PULLING;
+
+            g_breakaway_target_angle_deg =
+                0.0f;
+
+            g_progress_reference_abs_mm =
+                absPosition;
+
+            g_progress_reference_ms =
+                g_system_ms;
+
+            g_progress_initialized =
+                1U;
+
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        /*
+         * 已经进入捕获范围：
+         * 结束破静摩擦冲击。
+         */
+        if (absPosition <=
+            BALL_CAPTURE_ENTER_MM)
+        {
+            g_balance_state =
+                BALL_STATE_PULLING;
+
+            g_breakaway_target_angle_deg =
+                0.0f;
+
+            g_progress_initialized =
+                0U;
+
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        /*
+         * 冲击达到最长时间。
+         */
+        if (stateElapsedMs >=
+            BREAKAWAY_MAX_TIME_MS)
+        {
+            g_balance_state =
+                BALL_STATE_PULLING;
+
+            g_breakaway_target_angle_deg =
+                0.0f;
+
+            g_progress_reference_abs_mm =
+                absPosition;
+
+            g_progress_reference_ms =
+                g_system_ms;
+
+            g_progress_initialized =
+                1U;
+
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+
+
+        UpdateControlDebug(
+            controlPosition,
+            velocity);
+
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 检测到±3mm立即锁定
+     * ==========================================================
+     */
+    if (receivedNewMeasurement != 0U)
+    {
+        if ((absPosition <=
+             BALL_CENTER_ENTER_MM) &&
+            (absVelocity <=
+             BALL_CENTER_ENTER_SPEED_MM_S))
+        {
+            g_center_confirm_count++;
+
+
+            if (g_center_confirm_count >=
+                BALL_CENTER_CONFIRM_FRAMES)
+            {
+                EnterCenterHolding();
+
+                UpdateControlDebug(
+                    controlPosition,
+                    velocity);
+
+                return;
+            }
+        }
+        else
+        {
+            g_center_confirm_count =
+                0U;
+        }
+    }
+
+
+    /*
+     * ==========================================================
+     * 启动更强的一次性捕获
+     * ==========================================================
+     */
+    if (
+        (receivedNewMeasurement != 0U) &&
+        (g_capture_cooldown_remaining_ms ==
+         0U) &&
+        (absPosition <=
+         BALL_CAPTURE_ENTER_MM) &&
+        (absPosition >
+         BALL_CENTER_ENTER_MM) &&
+        (movingTowardCenter != 0U) &&
+        (absVelocity >=
+         BALL_CAPTURE_MIN_SPEED_MM_S)
+    )
+    {
+        g_balance_state =
+            BALL_STATE_CAPTURE;
+
+
+        g_capture_start_ms =
+            g_system_ms;
+
+
+        /*
+         * 速度符号与位置符号相反，
+         * 因此这个角度会产生反向制动。
+         */
+        g_capture_brake_angle_deg =
+            BALL_CAPTURE_KD *
+            velocity;
+
+
+        /*
+         * 保证最小制动角度。
+         */
+        if (
+            (g_capture_brake_angle_deg >
+             0.0f) &&
+            (g_capture_brake_angle_deg <
+             BALL_CAPTURE_MIN_ANGLE_DEG)
+        )
+        {
+            g_capture_brake_angle_deg =
+                BALL_CAPTURE_MIN_ANGLE_DEG;
+        }
+
+
+        if (
+            (g_capture_brake_angle_deg <
+             0.0f) &&
+            (g_capture_brake_angle_deg >
+             -BALL_CAPTURE_MIN_ANGLE_DEG)
+        )
+        {
+            g_capture_brake_angle_deg =
+                -BALL_CAPTURE_MIN_ANGLE_DEG;
+        }
+
+
+        g_capture_brake_angle_deg =
+            FloatClamp(
+                g_capture_brake_angle_deg,
+                -BALL_CAPTURE_MAX_ANGLE_DEG,
+                BALL_CAPTURE_MAX_ANGLE_DEG);
+
+
+        g_static_bias_angle_deg =
+            0.0f;
+
+
+        g_breakaway_target_angle_deg =
+            0.0f;
+
+
+        g_progress_initialized =
+            0U;
+
+
+        g_requested_motor_angle_deg =
+            g_capture_brake_angle_deg *
+            BALL_CONTROL_POLARITY;
+
+
+        g_applied_motor_angle_deg =
+            ApplyAngleSlewLimit(
+                g_applied_motor_angle_deg,
+                g_requested_motor_angle_deg,
+                BALL_CAPTURE_SLEW_DEG_S);
+
+
+        g_debug_capture_elapsed_ms =
+            0U;
+
+
+        UpdateControlDebug(
+            controlPosition,
+            velocity);
+
+        return;
+    }
+
+
+    /*
+     * ==========================================================
+     * 回中进度检测及静摩擦处理
+     * ==========================================================
+     */
+    if (g_progress_initialized == 0U)
+    {
+        g_progress_reference_abs_mm =
+            absPosition;
+
+        g_progress_reference_ms =
+            g_system_ms;
+
+        g_progress_initialized =
+            1U;
+    }
+    else if ((uint32_t)(
+                 g_system_ms -
+                 g_progress_reference_ms) >=
+             BALL_PROGRESS_CHECK_MS)
+    {
+        progressMm =
+            g_progress_reference_abs_mm -
+            absPosition;
+
+
+        /*
+         * 没有取得足够回中进展。
+         */
+        if ((absPosition >
+             BALL_CENTER_EXIT_MM) &&
+            (progressMm <
+             BALL_MIN_PROGRESS_MM))
+        {
+            /*
+             * 小球换方向时清除旧补偿。
+             */
+            if ((g_static_bias_angle_deg *
+                 positionSign) < 0.0f)
+            {
+                g_static_bias_angle_deg =
+                    0.0f;
+
+                g_breakaway_level =
+                    0U;
+            }
+
+
+            /*
+             * 增加持续静摩擦补偿。
+             */
+            g_static_bias_angle_deg +=
+                positionSign *
+                STATIC_BIAS_STEP_DEG;
+
+
+            g_static_bias_angle_deg =
+                FloatClamp(
+                    g_static_bias_angle_deg,
+                    -STATIC_BIAS_MAX_DEG,
+                    STATIC_BIAS_MAX_DEG);
+
+
+            /*
+             * 提升下一次破静摩擦冲击等级。
+             */
+            if (g_breakaway_level <
+                BREAKAWAY_MAX_LEVEL)
+            {
+                g_breakaway_level++;
+            }
+
+
+            breakawayExtraAngle =
+                BREAKAWAY_BASE_ANGLE_DEG +
+                (
+                    (float)g_breakaway_level *
+                    BREAKAWAY_LEVEL_STEP_DEG
+                );
+
+
+            /*
+             * 破静摩擦目标：
+             *
+             * 正常位置坡度
+             * +
+             * 自适应静摩擦补偿
+             * +
+             * 短时冲击角度。
+             */
+            g_breakaway_target_angle_deg =
+                BALL_PULL_KP *
+                controlPosition +
+                g_static_bias_angle_deg +
+                positionSign *
+                breakawayExtraAngle;
+
+
+            g_breakaway_target_angle_deg =
+                FloatClamp(
+                    g_breakaway_target_angle_deg,
+                    -MAX_MOTOR_ANGLE_DEG,
+                    MAX_MOTOR_ANGLE_DEG);
+
+
+            g_breakaway_start_ms =
+                g_system_ms;
+
+
+            g_balance_state =
+                BALL_STATE_BREAKAWAY;
+
+
+            g_breakaway_count++;
+
+
+            g_progress_initialized =
+                0U;
+
+
+            UpdateControlDebug(
+                controlPosition,
+                velocity);
+
+            return;
+        }
+        else
+        {
+            /*
+             * 小球已经正常向0靠近。
+             *
+             * 逐渐减小静摩擦补偿。
+             */
+            if (progressMm >=
+                BALL_MIN_PROGRESS_MM)
+            {
+                g_static_bias_angle_deg *=
+                    STATIC_BIAS_DECAY;
+
+
+                if (g_breakaway_level >
+                    0U)
+                {
+                    g_breakaway_level--;
+                }
+            }
+        }
+
+
+        g_progress_reference_abs_mm =
+            absPosition;
+
+
+        g_progress_reference_ms =
+            g_system_ms;
+    }
+
+
+    /*
+     * ==========================================================
+     * 正常高速回中控制
+     * ==========================================================
+     */
+    positionTerm =
+        BALL_PULL_KP *
+        controlPosition;
+
+
+    velocityTerm =
+        BALL_PULL_KD *
+        velocity;
+
+
+    requestedBeforePolarity =
+        positionTerm +
+        velocityTerm +
+        g_static_bias_angle_deg;
+
+
+    /*
+     * 根据实际距离限制角度。
+     */
+    if (absPosition >
+        FAR_POSITION_MM)
+    {
+        angleLimit =
+            FAR_MAX_ANGLE_DEG;
+    }
+    else if (absPosition >
+             MIDDLE_POSITION_MM)
+    {
+        angleLimit =
+            MIDDLE_MAX_ANGLE_DEG;
+    }
+    else
+    {
+        angleLimit =
+            NEAR_MAX_ANGLE_DEG;
+    }
+
+
+    requestedBeforePolarity =
+        FloatClamp(
+            requestedBeforePolarity,
+            -angleLimit,
+            angleLimit);
+
+
+    g_requested_motor_angle_deg =
+        requestedBeforePolarity *
+        BALL_CONTROL_POLARITY;
+
+
+    g_applied_motor_angle_deg =
+        ApplyAngleSlewLimit(
+            g_applied_motor_angle_deg,
+            g_requested_motor_angle_deg,
+            NORMAL_TARGET_SLEW_DEG_S);
+
+
+    if (g_balance_state !=
+        BALL_STATE_STATIC_BIAS)
+    {
+        g_balance_state =
+            BALL_STATE_PULLING;
+    }
+
+
+    g_debug_capture_elapsed_ms =
+        0U;
+
+
+    g_debug_breakaway_elapsed_ms =
+        0U;
+
+
+    UpdateControlDebug(
+        controlPosition,
+        velocity);
+}
+
+
+/*==============================================================
+ * 34. 电机1kHz软件位置控制
+ *==============================================================*/
+
+static void MotorPositionControl1ms(
+    float targetAngleDeg)
+{
+    static float previousRate = 0.0f;
+
+    int32_t targetPulse;
+
+    int32_t positionError;
+
+    float requestedRate;
+
+    float maximumRateChange;
+
+
+    targetPulse =
+        MotorAngleToPulse(
+            targetAngleDeg);
+
+
+    if (targetPulse >
+        MotorAngleToPulse(
+            MAX_MOTOR_ANGLE_DEG))
+    {
+        targetPulse =
+            MotorAngleToPulse(
+                MAX_MOTOR_ANGLE_DEG);
+    }
+
+
+    if (targetPulse <
+        MotorAngleToPulse(
+            -MAX_MOTOR_ANGLE_DEG))
+    {
+        targetPulse =
+            MotorAngleToPulse(
+                -MAX_MOTOR_ANGLE_DEG);
+    }
+
+
+    g_motor_target_pulse =
+        targetPulse;
+
+
+    positionError =
+        targetPulse -
+        g_motor_current_pulse;
+
+
+    /*
+     * 到达目标位置后立即停止。
+     */
+    if (Int32Abs(positionError) <=
+        MOTOR_POSITION_DEADBAND_PULSE)
+    {
+        g_step_rate_sps = 0;
+
+        previousRate = 0.0f;
+
+
+        g_debug_motor_angle_x100 =
+            FloatToInt32(
+                MotorPulseToAngle(
+                    g_motor_current_pulse) *
+                100.0f);
+
+        return;
+    }
+
+
+    /*
+     * 目标方向反转时立即清除旧速度。
+     */
+    if (((positionError > 0) &&
+         (previousRate < 0.0f)) ||
+        ((positionError < 0) &&
+         (previousRate > 0.0f)))
+    {
+        previousRate = 0.0f;
+    }
+
+
+    requestedRate =
+        MOTOR_POSITION_KP *
+        (float)positionError;
+
+
+    /*
+     * 保证小误差时仍能快速动作。
+     */
+    if ((requestedRate > 0.0f) &&
+        (requestedRate <
+         MOTOR_MIN_STEP_RATE_SPS))
+    {
+        requestedRate =
+            MOTOR_MIN_STEP_RATE_SPS;
+    }
+
+
+    if ((requestedRate < 0.0f) &&
+        (requestedRate >
+         -MOTOR_MIN_STEP_RATE_SPS))
+    {
+        requestedRate =
+            -MOTOR_MIN_STEP_RATE_SPS;
+    }
+
+
+    requestedRate =
+        FloatClamp(
+            requestedRate,
+            -MOTOR_MAX_STEP_RATE_SPS,
+            MOTOR_MAX_STEP_RATE_SPS);
+
+
+    maximumRateChange =
+        MOTOR_MAX_ACCEL_SPS2 *
+        MOTOR_CONTROL_DT_S;
+
+
+    requestedRate =
+        FloatClamp(
+            requestedRate,
+            previousRate -
+            maximumRateChange,
+            previousRate +
+            maximumRateChange);
+
+
+    g_step_rate_sps =
+        FloatToInt32(
+            requestedRate);
+
+
+    previousRate =
+        requestedRate;
+
+
+    g_debug_motor_angle_x100 =
+        FloatToInt32(
+            MotorPulseToAngle(
+                g_motor_current_pulse) *
+            100.0f);
+}
+
+
+/*==============================================================
+ * 35. SysTick中断
+ *==============================================================*/
+
+void SysTick_Handler(void)
+{
+    static uint32_t millisecondDivider = 0U;
+
+    static uint32_t ballControlDivider = 0U;
+
+    static uint32_t motorControlDivider = 0U;
+
+
+    /*
+     * STEP脉冲服务10kHz。
+     */
+    StepPulseService100us();
+
+
+    /*
+     * 毫秒计时。
+     */
+    millisecondDivider++;
+
+
+    if (millisecondDivider >= 10U)
+    {
+        millisecondDivider = 0U;
+
+        g_system_ms++;
+    }
+
+
+    /*
+     * 钢球控制100Hz。
+     */
+    ballControlDivider++;
+
+
+    if (ballControlDivider >=
+        BALL_CONTROL_INTERVAL_TICKS)
+    {
+        ballControlDivider = 0U;
+
+        g_ball_control_due = 1U;
+    }
+
+
+    /*
+     * 电机控制1kHz。
+     */
+    motorControlDivider++;
+
+
+    if (motorControlDivider >=
+        MOTOR_CONTROL_INTERVAL_TICKS)
+    {
+        motorControlDivider = 0U;
+
+        g_motor_control_due = 1U;
+    }
+}
+
+
+/*==============================================================
+ * 36. 主函数
+ *==============================================================*/
+
+int main(void)
+{
+    uint8_t hasNewSample;
+
+    uint8_t ballControlDue;
+
+    uint8_t motorControlDue;
+
+    uint8_t measurementUpdated;
+
+    int32_t receivedPosition;
+
+    uint32_t receivedTime;
+
+
+    SYSCFG_DL_init();
+
+
+    StepperGPIOInit();
+
+
+    /*
+     * 上电先关闭驱动。
+     */
+    StepperEnable(0U);
+
+
+    /*
+     * 打开UART0接收中断。
+     */
+    DL_UART_Main_enableInterrupt(
+        K230_UART_INST,
+        DL_UART_MAIN_INTERRUPT_RX);
+
+
+    NVIC_ClearPendingIRQ(
+        K230_UART_INST_INT_IRQN);
+
+
+    NVIC_EnableIRQ(
+        K230_UART_INST_INT_IRQN);
+
+
+    /*
+     * 开启10kHz SysTick。
+     */
+    if (SysTick_Config(
+            CPUCLK_FREQ /
+            SYSTICK_FREQUENCY_HZ) != 0U)
+    {
+        while (1)
+        {
+            __WFI();
+        }
+    }
+
+
+    __enable_irq();
+
+
+    /*
+     * 等待2秒，手动调平轨道。
+     */
+    DelayMs(
+        START_DELAY_MS);
+
+
+    /*
+     * 将当前位置作为软件水平零点。
+     */
+    g_motor_current_pulse = 0;
+
+    g_motor_target_pulse = 0;
+
+    g_step_rate_sps = 0;
+
+
+    g_requested_motor_angle_deg =
+        0.0f;
+
+    g_applied_motor_angle_deg =
+        0.0f;
+
+
+    g_static_bias_angle_deg =
+        0.0f;
+
+    g_breakaway_target_angle_deg =
+        0.0f;
+
+    g_capture_brake_angle_deg =
+        0.0f;
+
+
+    g_filtered_position_mm =
+        0.0f;
+
+    g_previous_filtered_position_mm =
+        0.0f;
+
+    g_filtered_velocity_mm_s =
+        0.0f;
+
+
+    g_observer_initialized =
+        0U;
+
+
+    g_balance_state =
+        BALL_STATE_WAITING;
+
+
+    g_center_confirm_count =
+        0U;
+
+    g_progress_initialized =
+        0U;
+
+    g_previous_control_position_mm =
+        0.0f;
+
+
+    g_breakaway_level =
+        0U;
+
+    g_breakaway_count =
+        0U;
+
+    g_capture_cooldown_remaining_ms =
+        0U;
+
+
+    /*
+     * 清除启动等待期间的旧帧标志。
+     */
+    __disable_irq();
+
+
+    g_k230_new_sample =
+        0U;
+
+
+    __enable_irq();
+
+
+    /*
+     * 使能D36A并锁轴。
+     */
+    StepperEnable(1U);
+
+
+    DelayMs(
+        ENABLE_SETTLE_MS);
+
+
+    while (1)
+    {
+        /*
+         * ======================================================
+         * 读取K230坐标
+         * ======================================================
+         */
+        __disable_irq();
+
+
+        hasNewSample =
+            g_k230_new_sample;
+
+
+        receivedPosition =
+            g_k230_position_mm;
+
+
+        receivedTime =
+            g_k230_last_rx_ms;
+
+
+        if (hasNewSample != 0U)
+        {
+            g_k230_new_sample = 0U;
+        }
+
+
+        __enable_irq();
+
+
+        if (hasNewSample != 0U)
+        {
+            UpdateBallMeasurement(
+                (float)receivedPosition,
+                receivedTime);
+        }
+
+
+        /*
+         * ======================================================
+         * 读取100Hz钢球控制标志
+         * ======================================================
+         */
+        __disable_irq();
+
+
+        ballControlDue =
+            g_ball_control_due;
+
+
+        if (ballControlDue != 0U)
+        {
+            g_ball_control_due = 0U;
+        }
+
+
+        __enable_irq();
+
+
+        if (ballControlDue != 0U)
+        {
+            measurementUpdated =
+                g_measurement_updated_for_control;
+
+
+            g_measurement_updated_for_control =
+                0U;
+
+
+            BallPositionControl100Hz(
+                measurementUpdated);
+        }
+
+
+        /*
+         * ======================================================
+         * 读取1kHz电机控制标志
+         * ======================================================
+         */
+        __disable_irq();
+
+
+        motorControlDue =
+            g_motor_control_due;
+
+
+        if (motorControlDue != 0U)
+        {
+            g_motor_control_due = 0U;
+        }
+
+
+        __enable_irq();
+
+
+        if (motorControlDue != 0U)
+        {
+            MotorPositionControl1ms(
+                g_applied_motor_angle_deg);
+        }
+
+
+        __WFI();
+    }
+}
