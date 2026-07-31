@@ -1,0 +1,1599 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ * ================================================================
+ * MSPM0G3507 + D36A + MS42C + K230
+ * 小球中心位置稳定控制
+ *
+ * K230发送格式：
+ *
+ *      -5\n
+ *      0\n
+ *      12\n
+ *
+ * 单位：mm
+ *
+ * 例如：
+ *      -5 表示小球位于原点负方向5mm
+ *      20 表示小球位于原点正方向20mm
+ *
+ * 接线：
+ *
+ *      K230 TX -> PA1，MSPM0 UART0 RX
+ *      K230 RX <- PA0，MSPM0 UART0 TX
+ *      K230 GND与MSPM0 GND共地
+ *
+ *      PB1 -> D36A ST1
+ *      PB2 -> D36A DIR1
+ *      PB4 -> D36A EN1
+ *
+ * 控制方法：
+ *
+ *      K230位置
+ *          ↓
+ *      低通滤波和速度估计
+ *          ↓
+ *      位置PD + 小积分
+ *          ↓
+ *      电机目标角度
+ *          ↓
+ *      软件记录脉冲位置
+ *          ↓
+ *      STEP/DIR控制
+ *
+ * 当前版本不使用MS42C编码器，避免编码器方向、计数或接线
+ * 不正确时触发失速保护，导致电机完全不动作。
+ * ================================================================
+ */
+
+
+/*==============================================================
+ * 1. 系统时钟
+ *==============================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                         (32000000UL)
+#endif
+
+
+/*
+ * SysTick频率10kHz。
+ *
+ * 每100us进入一次中断。
+ */
+#define SYSTICK_FREQUENCY_HZ                (10000U)
+
+
+/*
+ * 小球平衡控制频率100Hz。
+ *
+ * 每10ms进行一次位置控制。
+ */
+#define CONTROL_FREQUENCY_HZ                (100U)
+
+#define CONTROL_INTERVAL_TICKS              \
+    (SYSTICK_FREQUENCY_HZ /                 \
+     CONTROL_FREQUENCY_HZ)
+
+#define CONTROL_DT_S                        (0.01f)
+
+
+/*==============================================================
+ * 2. D36A引脚
+ *==============================================================*/
+
+#define STEP_PORT                           (GPIOB)
+#define STEP_PIN                            (DL_GPIO_PIN_1)
+
+#define DIR_PORT                            (GPIOB)
+#define DIR_PIN                             (DL_GPIO_PIN_2)
+
+#define EN_PORT                             (GPIOB)
+#define EN_PIN                              (DL_GPIO_PIN_4)
+
+
+/*==============================================================
+ * 3. 电机基础参数
+ *==============================================================*/
+
+/*
+ * MS42C步距角1.8°：
+ *
+ * 一圈整步数 = 360 / 1.8 = 200
+ */
+#define MOTOR_FULL_STEPS_PER_REV            (200.0f)
+
+
+/*
+ * D36A为16细分。
+ */
+#define MOTOR_MICROSTEP                     (16.0f)
+
+
+/*
+ * 一圈脉冲数：
+ *
+ * 200 × 16 = 3200脉冲
+ */
+#define MOTOR_PULSES_PER_REV                \
+    (MOTOR_FULL_STEPS_PER_REV *             \
+     MOTOR_MICROSTEP)
+
+
+/*
+ * 每1°电机角度对应脉冲数：
+ *
+ * 3200 / 360 = 8.8889
+ */
+#define MOTOR_PULSES_PER_DEG                \
+    (MOTOR_PULSES_PER_REV / 360.0f)
+
+
+/*==============================================================
+ * 4. 电机方向和使能极性
+ *==============================================================*/
+
+/*
+ * PB4高电平使能D36A。
+ */
+#define ENABLE_ACTIVE_HIGH                  (1U)
+
+
+/*
+ * 正目标角度时，PB2输出的电平。
+ *
+ * 1：正角度时PB2高电平
+ * 0：正角度时PB2低电平
+ *
+ * 这个参数只决定电机转动方向。
+ */
+#define POSITIVE_DIRECTION_LEVEL            (1U)
+
+
+/*
+ * 小球坐标到电机方向的极性。
+ *
+ * 小球位于正方向时，轨道应产生让小球向负方向运动的坡度。
+ *
+ * 如果烧录后小球离原点越来越远：
+ *
+ * 把1改成-1。
+ */
+#define BALL_CONTROL_POLARITY               (-1.0f)
+
+
+/*==============================================================
+ * 5. K230通信参数
+ *==============================================================*/
+
+/*
+ * 25cm轨道中心两边约125mm。
+ */
+#define BALL_POSITION_LIMIT_MM              (125)
+
+
+/*
+ * 超过300ms没收到K230坐标：
+ *
+ * 认为K230通信掉线，轨道逐渐回到初始水平位置。
+ */
+#define K230_TIMEOUT_MS                     (300U)
+
+
+/*==============================================================
+ * 6. 小球滤波参数
+ *==============================================================*/
+
+/*
+ * 坐标低通滤波系数。
+ *
+ * 越大：
+ *      越跟随K230坐标，响应快，但容易抖。
+ *
+ * 越小：
+ *      越平滑，但响应慢。
+ */
+#define POSITION_FILTER_ALPHA               (0.35f)
+
+
+/*
+ * 速度低通滤波系数。
+ */
+#define VELOCITY_FILTER_ALPHA               (0.15f)
+
+
+/*
+ * 最大允许速度估计。
+ *
+ * 防止K230坐标偶发跳变产生很大速度。
+ */
+#define MAX_BALL_SPEED_MM_S                 (500.0f)
+
+
+/*==============================================================
+ * 7. 原点保持范围
+ *==============================================================*/
+
+/*
+ * 控制死区3mm。
+ *
+ * 小球偏差超过3mm就会进行位置调整。
+ *
+ * 题目要求±10mm，这里控制得更严格。
+ */
+#define BALL_CENTER_DEADBAND_MM             (5.0f)
+
+
+/*
+ * 判断小球已经基本稳定的速度范围。
+ */
+#define BALL_STABLE_SPEED_MM_S              (10.0f)
+
+
+/*==============================================================
+ * 8. 小球位置控制参数
+ *==============================================================*/
+
+/*
+ * 位置比例参数：
+ *
+ * 每偏离1mm，产生0.50°电机目标角度。
+ *
+ * 例如：
+ *
+ * 10mm  -> 5°
+ * 20mm  -> 10°
+ * 50mm  -> 25°
+ *
+ * 这个范围参考了你正负5cm测试中使用的
+ * 10°、30°、45°等电机角度。
+ */
+#define BALL_POSITION_KP                    (0.10f)
+
+
+/*
+ * 小球速度反馈参数。
+ *
+ * 用于提前制动，避免小球高速穿过原点。
+ */
+#define BALL_VELOCITY_KD                    (0.008f)
+
+
+/*
+ * 小积分参数。
+ *
+ * 用于补偿轨道不完全水平、小车加速等持续扰动。
+ */
+#define BALL_POSITION_KI                    (0.0f)
+
+
+/*
+ * 积分最大值。
+ */
+#define BALL_INTEGRAL_LIMIT_MM_S            (30.0f)
+
+
+/*
+ * 积分最大产生的电机角度。
+ */
+#define MAX_INTEGRAL_ANGLE_DEG              (0.5f)
+
+
+/*==============================================================
+ * 9. 电机角度限制
+ *==============================================================*/
+
+/*
+ * 最大电机相对转角。
+ *
+ * 你的测试程序中已经使用过45°动作，
+ * 因此这里限制为45°。
+ */
+#define MAX_MOTOR_ANGLE_DEG                 (8.0f)
+
+
+/*
+ * 目标角度最大变化速度。
+ *
+ * 100°/s意味着10ms最多改变1°，
+ * 防止电机目标突然跳变。
+ */
+#define MAX_TARGET_SLEW_DEG_S               (20.0f)
+
+
+/*==============================================================
+ * 10. 电机位置控制参数
+ *==============================================================*/
+
+/*
+ * 软件脉冲位置误差转STEP频率。
+ *
+ * 每差1个脉冲，增加8脉冲/秒的速度。
+ */
+#define MOTOR_POSITION_KP                   (8.0f)
+
+
+/*
+ * 最大STEP频率。
+ *
+ * 你的45°/400ms测试约为1000脉冲/秒，
+ * 这里设置为1300脉冲/秒。
+ */
+#define MOTOR_MAX_STEP_RATE_SPS             (450.0f)
+
+
+/*
+ * 最低有效STEP速度。
+ *
+ * 避免目标很近时电机长时间不动。
+ */
+#define MOTOR_MIN_STEP_RATE_SPS             (100.0f)
+
+
+/*
+ * STEP速度加速度限制。
+ */
+#define MOTOR_MAX_ACCEL_SPS2                (1000.0f)
+
+
+/*
+ * 目标脉冲误差小于等于1时停止。
+ */
+#define MOTOR_POSITION_DEADBAND_PULSE       (1)
+
+
+/*==============================================================
+ * 11. 上电参数
+ *==============================================================*/
+
+/*
+ * 上电后先关闭驱动2秒。
+ *
+ * 这2秒内手动把轨道调到水平位置。
+ * 2秒后把当前位置作为电机0°。
+ */
+#define START_DELAY_MS                      (2000U)
+
+
+/*
+ * D36A使能后等待时间。
+ */
+#define ENABLE_SETTLE_MS                    (100U)
+
+
+/*==============================================================
+ * 12. 全局调试变量
+ *==============================================================*/
+
+/*
+ * 系统运行时间。
+ */
+volatile uint32_t g_system_ms = 0U;
+
+
+/*
+ * K230最新原始坐标，单位mm。
+ */
+volatile int32_t g_k230_position_mm = 0;
+
+
+/*
+ * K230有效坐标接收次数。
+ *
+ * 这个变量必须不断增加。
+ *
+ * 如果一直为0，说明UART没有收到数据。
+ */
+volatile uint32_t g_k230_valid_count = 0U;
+
+
+/*
+ * 最近一次收到坐标的时间。
+ */
+volatile uint32_t g_k230_last_rx_ms = 0U;
+
+
+/*
+ * 收到新坐标标志。
+ */
+volatile uint8_t g_k230_new_sample = 0U;
+
+
+/*
+ * 当前滤波后的位置，单位0.1mm。
+ *
+ * 例如：
+ *
+ * -53表示-5.3mm。
+ */
+volatile int32_t g_debug_position_x10 = 0;
+
+
+/*
+ * 小球估计速度，单位0.1mm/s。
+ */
+volatile int32_t g_debug_velocity_x10 = 0;
+
+
+/*
+ * 最终目标电机角度，单位0.01°。
+ */
+volatile int32_t g_debug_target_angle_x100 = 0;
+
+
+/*
+ * 当前软件记录电机角度，单位0.01°。
+ */
+volatile int32_t g_debug_motor_angle_x100 = 0;
+
+
+/*
+ * 电机目标脉冲位置。
+ */
+volatile int32_t g_motor_target_pulse = 0;
+
+
+/*
+ * 已经输出的累计脉冲位置。
+ *
+ * 正方向增加，负方向减少。
+ */
+volatile int32_t g_motor_current_pulse = 0;
+
+
+/*
+ * 当前STEP脉冲频率。
+ *
+ * 正数：一个方向
+ * 负数：另一个方向
+ */
+volatile int32_t g_step_rate_sps = 0;
+
+
+/*
+ * K230通信距离最近一帧的时间。
+ */
+volatile uint32_t g_debug_uart_age_ms = 0U;
+
+
+/*
+ * 平衡控制状态：
+ *
+ * 0：等待K230
+ * 1：正常控制
+ * 2：通信超时，回到水平
+ */
+volatile uint32_t g_balance_state = 0U;
+
+
+/*
+ * 控制周期标志。
+ */
+volatile uint8_t g_control_due = 0U;
+
+
+/*
+ * STEP和DIR输出状态。
+ */
+volatile uint32_t g_step_output_level = 0U;
+volatile uint32_t g_direction_output_level = 0U;
+volatile uint32_t g_enable_output_level = 0U;
+
+
+/*==============================================================
+ * 13. 控制内部变量
+ *==============================================================*/
+
+static float g_filtered_position_mm = 0.0f;
+static float g_filtered_velocity_mm_s = 0.0f;
+
+static float g_previous_filtered_position_mm = 0.0f;
+
+static float g_ball_integral_mm_s = 0.0f;
+
+static float g_requested_motor_angle_deg = 0.0f;
+static float g_applied_motor_angle_deg = 0.0f;
+
+static uint32_t g_last_observer_time_ms = 0U;
+static uint8_t g_observer_initialized = 0U;
+
+
+/*==============================================================
+ * 14. 基础数学函数
+ *==============================================================*/
+
+static float FloatAbs(float value)
+{
+    if (value < 0.0f)
+    {
+        return -value;
+    }
+
+    return value;
+}
+
+
+static float FloatClamp(
+    float value,
+    float minimum,
+    float maximum)
+{
+    if (value > maximum)
+    {
+        return maximum;
+    }
+
+    if (value < minimum)
+    {
+        return minimum;
+    }
+
+    return value;
+}
+
+
+static int32_t Int32Abs(int32_t value)
+{
+    if (value < 0)
+    {
+        return -value;
+    }
+
+    return value;
+}
+
+
+static int32_t FloatToInt32(float value)
+{
+    if (value >= 0.0f)
+    {
+        return (int32_t)(value + 0.5f);
+    }
+
+    return (int32_t)(value - 0.5f);
+}
+
+
+/*==============================================================
+ * 15. 延时函数
+ *==============================================================*/
+
+static void DelayMs(uint32_t milliseconds)
+{
+    while (milliseconds > 0U)
+    {
+        DL_Common_delayCycles(
+            CPUCLK_FREQ / 1000U);
+
+        milliseconds--;
+    }
+}
+
+
+/*==============================================================
+ * 16. 电机GPIO
+ *==============================================================*/
+
+static void StepperGPIOInit(void)
+{
+    DL_GPIO_enableOutput(
+        GPIOB,
+        STEP_PIN |
+        DIR_PIN |
+        EN_PIN);
+
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN);
+
+    DL_GPIO_clearPins(
+        DIR_PORT,
+        DIR_PIN);
+
+    g_step_output_level = 0U;
+    g_direction_output_level = 0U;
+}
+
+
+static void StepperEnable(uint32_t enable)
+{
+#if ENABLE_ACTIVE_HIGH == 1U
+
+    if (enable != 0U)
+    {
+        DL_GPIO_setPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 1U;
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 0U;
+    }
+
+#else
+
+    if (enable != 0U)
+    {
+        DL_GPIO_clearPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 0U;
+    }
+    else
+    {
+        DL_GPIO_setPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 1U;
+    }
+
+#endif
+}
+
+
+static void SetMotorDirection(int32_t direction)
+{
+    uint32_t outputLevel;
+
+    if (direction > 0)
+    {
+        outputLevel =
+            POSITIVE_DIRECTION_LEVEL;
+    }
+    else
+    {
+        outputLevel =
+            (POSITIVE_DIRECTION_LEVEL == 0U) ?
+            1U : 0U;
+    }
+
+    if (outputLevel != 0U)
+    {
+        DL_GPIO_setPins(
+            DIR_PORT,
+            DIR_PIN);
+
+        g_direction_output_level = 1U;
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            DIR_PORT,
+            DIR_PIN);
+
+        g_direction_output_level = 0U;
+    }
+}
+
+
+/*==============================================================
+ * 17. 角度与脉冲换算
+ *==============================================================*/
+
+static int32_t MotorAngleToPulse(
+    float angleDeg)
+{
+    float pulse;
+
+    pulse =
+        angleDeg *
+        MOTOR_PULSES_PER_DEG;
+
+    return FloatToInt32(pulse);
+}
+
+
+static float MotorPulseToAngle(
+    int32_t pulse)
+{
+    return
+        (float)pulse /
+        MOTOR_PULSES_PER_DEG;
+}
+
+
+/*==============================================================
+ * 18. STEP脉冲发生器
+ *==============================================================*/
+
+static void StepPulseService100us(void)
+{
+    static uint32_t phaseAccumulator = 0U;
+    static uint8_t stepPinHigh = 0U;
+    static int32_t appliedDirection = 0;
+
+    int32_t requestedRate;
+    int32_t direction;
+    uint32_t magnitude;
+
+    /*
+     * 上一次STEP高电平先拉低。
+     *
+     * STEP高电平宽度为100us。
+     */
+    if (stepPinHigh != 0U)
+    {
+        DL_GPIO_clearPins(
+            STEP_PORT,
+            STEP_PIN);
+
+        stepPinHigh = 0U;
+        g_step_output_level = 0U;
+    }
+
+    requestedRate =
+        g_step_rate_sps;
+
+    if (requestedRate == 0)
+    {
+        phaseAccumulator = 0U;
+        return;
+    }
+
+    if (requestedRate > 0)
+    {
+        direction = 1;
+        magnitude =
+            (uint32_t)requestedRate;
+    }
+    else
+    {
+        direction = -1;
+        magnitude =
+            (uint32_t)(-requestedRate);
+    }
+
+    /*
+     * 方向变化时先设置DIR。
+     *
+     * 本周期不发STEP，给DIR留100us建立时间。
+     */
+    if (direction != appliedDirection)
+    {
+        SetMotorDirection(direction);
+
+        appliedDirection = direction;
+        phaseAccumulator = 0U;
+        return;
+    }
+
+    /*
+     * 防止越过软件位置限制。
+     */
+    if ((direction > 0) &&
+        (g_motor_current_pulse >=
+         MotorAngleToPulse(
+             MAX_MOTOR_ANGLE_DEG)))
+    {
+        return;
+    }
+
+    if ((direction < 0) &&
+        (g_motor_current_pulse <=
+         MotorAngleToPulse(
+             -MAX_MOTOR_ANGLE_DEG)))
+    {
+        return;
+    }
+
+    phaseAccumulator += magnitude;
+
+    if (phaseAccumulator >=
+        SYSTICK_FREQUENCY_HZ)
+    {
+        phaseAccumulator -=
+            SYSTICK_FREQUENCY_HZ;
+
+        DL_GPIO_setPins(
+            STEP_PORT,
+            STEP_PIN);
+
+        stepPinHigh = 1U;
+        g_step_output_level = 1U;
+
+        g_motor_current_pulse +=
+            direction;
+    }
+}
+
+
+/*==============================================================
+ * 19. K230坐标提交
+ *==============================================================*/
+
+static void CommitK230Coordinate(
+    int32_t coordinateMm)
+{
+    if (coordinateMm >
+        BALL_POSITION_LIMIT_MM)
+    {
+        coordinateMm =
+            BALL_POSITION_LIMIT_MM;
+    }
+
+    if (coordinateMm <
+        -BALL_POSITION_LIMIT_MM)
+    {
+        coordinateMm =
+            -BALL_POSITION_LIMIT_MM;
+    }
+
+    g_k230_position_mm =
+        coordinateMm;
+
+    g_k230_last_rx_ms =
+        g_system_ms;
+
+    g_k230_new_sample = 1U;
+
+    g_k230_valid_count++;
+}
+
+
+/*==============================================================
+ * 20. K230字符解析
+ *==============================================================*/
+
+static void ParseK230Byte(uint8_t data)
+{
+    static int32_t value = 0;
+    static int32_t sign = 1;
+
+    static uint8_t receivingNumber = 0U;
+    static uint8_t hasDigit = 0U;
+
+    /*
+     * 收到正负号，开始一帧新坐标。
+     */
+    if (data == '-')
+    {
+        value = 0;
+        sign = -1;
+
+        receivingNumber = 1U;
+        hasDigit = 0U;
+
+        return;
+    }
+
+    if (data == '+')
+    {
+        value = 0;
+        sign = 1;
+
+        receivingNumber = 1U;
+        hasDigit = 0U;
+
+        return;
+    }
+
+    /*
+     * 收到数字。
+     */
+    if ((data >= '0') &&
+        (data <= '9'))
+    {
+        if (receivingNumber == 0U)
+        {
+            value = 0;
+            sign = 1;
+
+            receivingNumber = 1U;
+            hasDigit = 0U;
+        }
+
+        value =
+            value * 10 +
+            (int32_t)(data - '0');
+
+        if (value > 999)
+        {
+            value = 999;
+        }
+
+        hasDigit = 1U;
+
+        return;
+    }
+
+    /*
+     * 收到换行、回车、空格、逗号或分号：
+     *
+     * 提交当前坐标。
+     */
+    if ((data == '\r') ||
+        (data == '\n') ||
+        (data == ' ')  ||
+        (data == ',')  ||
+        (data == ';'))
+    {
+        if ((receivingNumber != 0U) &&
+            (hasDigit != 0U))
+        {
+            CommitK230Coordinate(
+                sign * value);
+        }
+
+        value = 0;
+        sign = 1;
+
+        receivingNumber = 0U;
+        hasDigit = 0U;
+    }
+}
+
+
+/*==============================================================
+ * 21. UART0接收中断
+ *==============================================================*/
+
+/*
+ * 这里必须叫UART0_IRQHandler。
+ *
+ * 你的SysConfig中K230_UART实际使用UART0。
+ *
+ * 不能写成：
+ *
+ * void K230_UART_INST_IRQHandler(void)
+ *
+ * 否则启动文件找不到该中断函数。
+ */
+void UART0_IRQHandler(void)
+{
+    uint32_t pendingInterrupt;
+
+    pendingInterrupt =
+        DL_UART_Main_getPendingInterrupt(
+            K230_UART_INST);
+
+    switch (pendingInterrupt)
+    {
+        case DL_UART_MAIN_IIDX_RX:
+
+            while (!DL_UART_Main_isRXFIFOEmpty(
+                        K230_UART_INST))
+            {
+                uint8_t receivedByte;
+
+                receivedByte =
+                    (uint8_t)
+                    DL_UART_Main_receiveData(
+                        K230_UART_INST);
+
+                ParseK230Byte(
+                    receivedByte);
+            }
+
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+/*==============================================================
+ * 22. 更新小球位置和速度
+ *==============================================================*/
+
+static void UpdateBallObserver(
+    uint8_t hasNewSample,
+    float measurementMm,
+    uint32_t sampleTimeMs)
+{
+    float dt;
+    float newVelocity;
+
+    if (hasNewSample == 0U)
+    {
+        return;
+    }
+
+    /*
+     * 第一次收到坐标：
+     *
+     * 直接使用该位置，速度设置为0。
+     */
+    if (g_observer_initialized == 0U)
+    {
+        g_filtered_position_mm =
+            measurementMm;
+
+        g_previous_filtered_position_mm =
+            measurementMm;
+
+        g_filtered_velocity_mm_s =
+            0.0f;
+
+        g_last_observer_time_ms =
+            sampleTimeMs;
+
+        g_observer_initialized = 1U;
+
+        return;
+    }
+
+    dt =
+        (float)(
+            sampleTimeMs -
+            g_last_observer_time_ms) /
+        1000.0f;
+
+    /*
+     * 限制时间范围，避免除0或通信停顿。
+     */
+    if (dt < 0.010f)
+    {
+        dt = 0.010f;
+    }
+
+    if (dt > 0.100f)
+    {
+        dt = 0.100f;
+    }
+
+    /*
+     * 对位置低通滤波。
+     */
+    g_filtered_position_mm +=
+        POSITION_FILTER_ALPHA *
+        (measurementMm -
+         g_filtered_position_mm);
+
+    /*
+     * 根据滤波后坐标计算速度。
+     */
+    newVelocity =
+        (g_filtered_position_mm -
+         g_previous_filtered_position_mm) /
+        dt;
+
+    newVelocity =
+        FloatClamp(
+            newVelocity,
+            -MAX_BALL_SPEED_MM_S,
+            MAX_BALL_SPEED_MM_S);
+
+    /*
+     * 对速度再次滤波。
+     */
+    g_filtered_velocity_mm_s +=
+        VELOCITY_FILTER_ALPHA *
+        (newVelocity -
+         g_filtered_velocity_mm_s);
+
+    g_previous_filtered_position_mm =
+        g_filtered_position_mm;
+
+    g_last_observer_time_ms =
+        sampleTimeMs;
+}
+
+
+/*==============================================================
+ * 23. 计算电机目标角度
+ *==============================================================*/
+
+static float CalculateMotorTargetAngle(void)
+{
+    float position;
+    float velocity;
+    float absPosition;
+
+    float effectivePosition;
+    float positionAngle;
+    float velocityAngle;
+    float integralAngle;
+
+    float targetAngle;
+
+    position =
+        g_filtered_position_mm;
+
+    velocity =
+        g_filtered_velocity_mm_s;
+
+    absPosition =
+        FloatAbs(position);
+
+    /*
+     * 平滑死区。
+     *
+     * 例如位置为+8mm、死区3mm：
+     *
+     * 有效误差 = +5mm。
+     *
+     * 这样越过3mm边界时不会突然跳变。
+     */
+    if (position >
+        BALL_CENTER_DEADBAND_MM)
+    {
+        effectivePosition =
+            position -
+            BALL_CENTER_DEADBAND_MM;
+    }
+    else if (position <
+             -BALL_CENTER_DEADBAND_MM)
+    {
+        effectivePosition =
+            position +
+            BALL_CENTER_DEADBAND_MM;
+    }
+    else
+    {
+        effectivePosition = 0.0f;
+    }
+
+    /*
+     * 积分只在偏差不太大时启用。
+     *
+     * 偏差太大时逐渐释放积分。
+     */
+    if ((absPosition < 30.0f) &&
+        (FloatAbs(velocity) < 150.0f))
+    {
+        g_ball_integral_mm_s +=
+            position *
+            CONTROL_DT_S;
+
+        g_ball_integral_mm_s =
+            FloatClamp(
+                g_ball_integral_mm_s,
+                -BALL_INTEGRAL_LIMIT_MM_S,
+                BALL_INTEGRAL_LIMIT_MM_S);
+    }
+    else
+    {
+        g_ball_integral_mm_s *=
+            0.98f;
+    }
+
+    /*
+     * 小球已经在原点附近且速度很低：
+     *
+     * 缓慢释放积分，轨道逐渐回水平。
+     */
+    if ((absPosition <=
+         BALL_CENTER_DEADBAND_MM) &&
+        (FloatAbs(velocity) <=
+         BALL_STABLE_SPEED_MM_S))
+    {
+        g_ball_integral_mm_s *=
+            0.95f;
+    }
+
+    positionAngle =
+        BALL_POSITION_KP *
+        effectivePosition;
+
+    velocityAngle =
+        BALL_VELOCITY_KD *
+        velocity;
+
+    integralAngle =
+        BALL_POSITION_KI *
+        g_ball_integral_mm_s;
+
+    integralAngle =
+        FloatClamp(
+            integralAngle,
+            -MAX_INTEGRAL_ANGLE_DEG,
+            MAX_INTEGRAL_ANGLE_DEG);
+
+    targetAngle =
+        positionAngle +
+        velocityAngle +
+        integralAngle;
+
+    /*
+     * 根据机械方向修正。
+     */
+    targetAngle *=
+        BALL_CONTROL_POLARITY;
+
+    targetAngle =
+        FloatClamp(
+            targetAngle,
+            -MAX_MOTOR_ANGLE_DEG,
+            MAX_MOTOR_ANGLE_DEG);
+
+    return targetAngle;
+}
+
+
+/*==============================================================
+ * 24. 限制目标角度变化速度
+ *==============================================================*/
+
+static float ApplyTargetAngleSlewLimit(
+    float currentAngle,
+    float requestedAngle)
+{
+    float maximumChange;
+    float difference;
+
+    maximumChange =
+        MAX_TARGET_SLEW_DEG_S *
+        CONTROL_DT_S;
+
+    difference =
+        requestedAngle -
+        currentAngle;
+
+    difference =
+        FloatClamp(
+            difference,
+            -maximumChange,
+            maximumChange);
+
+    return
+        currentAngle +
+        difference;
+}
+
+
+/*==============================================================
+ * 25. 电机软件位置控制
+ *==============================================================*/
+
+static void MotorPositionControl10ms(
+    float targetAngleDeg)
+{
+    static float previousRate = 0.0f;
+
+    int32_t targetPulse;
+    int32_t positionError;
+
+    float requestedRate;
+    float maximumRateChange;
+
+    targetPulse =
+        MotorAngleToPulse(
+            targetAngleDeg);
+
+    targetPulse =
+        (int32_t)FloatClamp(
+            (float)targetPulse,
+            (float)MotorAngleToPulse(
+                -MAX_MOTOR_ANGLE_DEG),
+            (float)MotorAngleToPulse(
+                MAX_MOTOR_ANGLE_DEG));
+
+    g_motor_target_pulse =
+        targetPulse;
+
+    positionError =
+        targetPulse -
+        g_motor_current_pulse;
+
+    /*
+     * 到达目标位置附近，停止发脉冲。
+     */
+    if (Int32Abs(positionError) <=
+        MOTOR_POSITION_DEADBAND_PULSE)
+    {
+        requestedRate = 0.0f;
+    }
+    else
+    {
+        requestedRate =
+            MOTOR_POSITION_KP *
+            (float)positionError;
+
+        /*
+         * 保证还有位置误差时具有最低速度。
+         */
+        if ((requestedRate > 0.0f) &&
+            (requestedRate <
+             MOTOR_MIN_STEP_RATE_SPS))
+        {
+            requestedRate =
+                MOTOR_MIN_STEP_RATE_SPS;
+        }
+
+        if ((requestedRate < 0.0f) &&
+            (requestedRate >
+             -MOTOR_MIN_STEP_RATE_SPS))
+        {
+            requestedRate =
+                -MOTOR_MIN_STEP_RATE_SPS;
+        }
+    }
+
+    requestedRate =
+        FloatClamp(
+            requestedRate,
+            -MOTOR_MAX_STEP_RATE_SPS,
+            MOTOR_MAX_STEP_RATE_SPS);
+
+    /*
+     * 加速度限制。
+     */
+    maximumRateChange =
+        MOTOR_MAX_ACCEL_SPS2 *
+        CONTROL_DT_S;
+
+    requestedRate =
+        FloatClamp(
+            requestedRate,
+            previousRate -
+            maximumRateChange,
+            previousRate +
+            maximumRateChange);
+
+    g_step_rate_sps =
+        FloatToInt32(
+            requestedRate);
+
+    previousRate =
+        requestedRate;
+
+    g_debug_motor_angle_x100 =
+        FloatToInt32(
+            MotorPulseToAngle(
+                g_motor_current_pulse) *
+            100.0f);
+}
+
+
+/*==============================================================
+ * 26. 10ms总控制
+ *==============================================================*/
+
+static void BalanceControl10ms(void)
+{
+    uint8_t hasNewSample;
+
+    int32_t receivedPosition;
+    uint32_t receivedTime;
+
+    uint32_t uartAgeMs;
+
+    float requestedAngle;
+
+    /*
+     * 原子读取中断中更新的UART变量。
+     */
+    __disable_irq();
+
+    hasNewSample =
+        g_k230_new_sample;
+
+    receivedPosition =
+        g_k230_position_mm;
+
+    receivedTime =
+        g_k230_last_rx_ms;
+
+    g_k230_new_sample = 0U;
+
+    __enable_irq();
+
+    UpdateBallObserver(
+        hasNewSample,
+        (float)receivedPosition,
+        receivedTime);
+
+    uartAgeMs =
+        g_system_ms -
+        g_k230_last_rx_ms;
+
+    g_debug_uart_age_ms =
+        uartAgeMs;
+
+    /*
+     * 没收到第一帧数据。
+     */
+    if (g_observer_initialized == 0U)
+    {
+        g_balance_state = 0U;
+
+        requestedAngle = 0.0f;
+    }
+    /*
+     * K230通信超时。
+     */
+    else if (uartAgeMs >
+             K230_TIMEOUT_MS)
+    {
+        g_balance_state = 2U;
+
+        requestedAngle = 0.0f;
+
+        g_filtered_velocity_mm_s *=
+            0.90f;
+
+        g_ball_integral_mm_s *=
+            0.95f;
+    }
+    /*
+     * 正常平衡控制。
+     */
+    else
+    {
+        g_balance_state = 1U;
+
+        requestedAngle =
+            CalculateMotorTargetAngle();
+    }
+
+    g_requested_motor_angle_deg =
+        requestedAngle;
+
+    g_applied_motor_angle_deg =
+        ApplyTargetAngleSlewLimit(
+            g_applied_motor_angle_deg,
+            g_requested_motor_angle_deg);
+
+    MotorPositionControl10ms(
+        g_applied_motor_angle_deg);
+
+    /*
+     * 更新CCS调试变量。
+     */
+    g_debug_position_x10 =
+        FloatToInt32(
+            g_filtered_position_mm *
+            10.0f);
+
+    g_debug_velocity_x10 =
+        FloatToInt32(
+            g_filtered_velocity_mm_s *
+            10.0f);
+
+    g_debug_target_angle_x100 =
+        FloatToInt32(
+            g_applied_motor_angle_deg *
+            100.0f);
+}
+
+
+/*==============================================================
+ * 27. SysTick中断
+ *==============================================================*/
+
+void SysTick_Handler(void)
+{
+    static uint32_t millisecondDivider = 0U;
+    static uint32_t controlDivider = 0U;
+
+    /*
+     * 每100us更新STEP脉冲。
+     */
+    StepPulseService100us();
+
+    /*
+     * 计算系统毫秒时间。
+     */
+    millisecondDivider++;
+
+    if (millisecondDivider >= 10U)
+    {
+        millisecondDivider = 0U;
+
+        g_system_ms++;
+    }
+
+    /*
+     * 每10ms启动一次平衡控制。
+     */
+    controlDivider++;
+
+    if (controlDivider >=
+        CONTROL_INTERVAL_TICKS)
+    {
+        controlDivider = 0U;
+
+        g_control_due = 1U;
+    }
+}
+
+
+/*==============================================================
+ * 28. 主函数
+ *==============================================================*/
+
+int main(void)
+{
+    /*
+     * SysConfig初始化。
+     */
+    SYSCFG_DL_init();
+
+
+    /*
+     * 步进电机GPIO初始化。
+     */
+    StepperGPIOInit();
+
+
+    /*
+     * 上电先关闭D36A。
+     *
+     * 此时手动把轨道调整到水平位置。
+     */
+    StepperEnable(0U);
+
+
+    /*
+     * 打开UART0接收中断。
+     */
+    DL_UART_Main_enableInterrupt(
+        K230_UART_INST,
+        DL_UART_MAIN_INTERRUPT_RX);
+
+    NVIC_ClearPendingIRQ(
+        K230_UART_INST_INT_IRQN);
+
+    NVIC_EnableIRQ(
+        K230_UART_INST_INT_IRQN);
+
+
+    /*
+     * 开启10kHz SysTick。
+     */
+    if (SysTick_Config(
+            CPUCLK_FREQ /
+            SYSTICK_FREQUENCY_HZ) != 0U)
+    {
+        while (1)
+        {
+            __WFI();
+        }
+    }
+
+
+    __enable_irq();
+
+
+    /*
+     * 等待2秒，手动调平轨道。
+     */
+    DelayMs(
+        START_DELAY_MS);
+
+
+    /*
+     * 当前软件脉冲位置作为0°。
+     */
+    g_motor_current_pulse = 0;
+    g_motor_target_pulse = 0;
+
+    g_requested_motor_angle_deg = 0.0f;
+    g_applied_motor_angle_deg = 0.0f;
+
+
+    /*
+     * 使能D36A并锁轴。
+     */
+    StepperEnable(1U);
+
+    DelayMs(
+        ENABLE_SETTLE_MS);
+
+
+    while (1)
+    {
+        if (g_control_due != 0U)
+        {
+            __disable_irq();
+
+            g_control_due = 0U;
+
+            __enable_irq();
+
+            BalanceControl10ms();
+        }
+
+        __WFI();
+    }
+}
