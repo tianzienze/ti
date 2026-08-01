@@ -1,0 +1,2056 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+#include <stdbool.h>
+
+/*
+ * MSPM0G3507 六路循迹 + SSD1306 OLED
+ *
+ * 电机：
+ *   左：PB2(IN1)、PA7(IN2)、PB8(ENA)
+ *   右：PB9(IN3)、PB14(IN4)、PB7(ENB)
+ *
+ * 六路传感器：
+ *   PA23(SDA)、PB24(SCL)
+ *
+ * OLED：
+ *   PA0(SDA)、PA1(SCL)
+ *
+ * 工作流程：
+ *   1. 通电等待 POWER_ON_START_DELAY_MS；
+ *   2. 起步先施加低PWM预紧，消除传动间隙；
+ *   3. 用短时、平滑的破静摩擦脉冲可靠起步；
+ *   4. 脉冲后柔和回落，再用S形曲线升到正常循迹速度；
+ *   5. 起步阶段逐渐放开转向修正，避免轨道小球被突然横向甩动；
+ *   6. 5秒后基础PWM缓慢降低，检测B点后平滑停车；
+ *   7. OLED显示实际运动总时间，停车后保持。
+ */
+
+
+/*======================== 系统参数 ========================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                         (32000000UL)
+#endif
+
+#define SYSTICK_FREQUENCY_HZ                (10000U)
+#define PWM_PERIOD_COUNT                    (100U)
+#define CONTROL_INTERVAL_TICKS              (50U)      /* 5ms */
+
+#define POWER_ON_START_DELAY_MS             (1000U)
+#define ORIGINAL_RUN_TIME_MS                (5000U)
+#define APPROACH_DECEL_TIME_MS              (2500U)
+#define FINAL_SOFT_STOP_TIME_MS             (900U)
+#define MISSION_MAX_RUN_TIME_MS             (15000U)
+#define OLED_REFRESH_INTERVAL_MS            (50U)
+
+
+/*======================== 电机参数 ========================*/
+
+#define LEFT_MOTOR_REVERSE                  (0)
+#define RIGHT_MOTOR_REVERSE                 (0)
+
+#define MOTOR_BASE_PWM                      (17)
+#define APPROACH_LOW_PWM                    (12)
+#define MOTOR_MAX_PWM                       (23)
+#define MOTOR_MIN_EFFECTIVE_PWM             (8)
+
+#define PWM_SLEW_STEP                       (6)
+
+
+/*======================== 柔和起步参数 ========================*/
+
+/*
+ * 起步思路：
+ *   低PWM预紧 -> S形升到破静摩擦PWM -> 短暂保持 ->
+ *   S形回落到低速 -> S形升到正常速度 -> 逐渐放开转向。
+ *
+ * 这样不会长时间卡在“电机有声音但车不动”的静摩擦区，
+ * 也不会从0直接跳到很高PWM而猛推轨道上的小球。
+ */
+#define STARTUP_PRELOAD_PWM                 (8)
+#define STARTUP_BREAKAWAY_PWM               (21)
+#define STARTUP_LOW_RUN_PWM                 (12)
+
+#define STARTUP_PRELOAD_TIME_MS             (120U)
+#define STARTUP_BREAKAWAY_RAMP_MS            (160U)
+#define STARTUP_BREAKAWAY_HOLD_MS            (80U)
+#define STARTUP_RELEASE_TIME_MS              (260U)
+#define STARTUP_SOFT_ACCEL_TIME_MS           (1000U)
+#define STARTUP_STEERING_BLEND_TIME_MS       (600U)
+
+#define STARTUP_BASE_PROFILE_TIME_MS         \
+    (STARTUP_PRELOAD_TIME_MS +                \
+     STARTUP_BREAKAWAY_RAMP_MS +              \
+     STARTUP_BREAKAWAY_HOLD_MS +              \
+     STARTUP_RELEASE_TIME_MS +                \
+     STARTUP_SOFT_ACCEL_TIME_MS)
+
+#define STARTUP_CONTROL_TIME_MS              \
+    (STARTUP_BASE_PROFILE_TIME_MS +           \
+     STARTUP_STEERING_BLEND_TIME_MS)
+
+/* 起步时每5ms最多改变1个PWM，避免Motor_RampTo原来的快速跳变。 */
+#define STARTUP_PWM_SLEW_STEP                (1)
+
+/* 起步转向修正逐渐由0放开到18，防止刚起步左右轮差速过大。 */
+#define STARTUP_RELEASE_CORRECTION_MAX       (4)
+#define STARTUP_ACCEL_CORRECTION_MAX         (10)
+#define STARTUP_FINAL_CORRECTION_MAX         (18)
+#define STARTUP_LOST_TURN_MAX                (3)
+
+/* 两侧电机静摩擦不一致时，只需微调这两个量，通常保持0。 */
+#define STARTUP_LEFT_PWM_TRIM                (0)
+#define STARTUP_RIGHT_PWM_TRIM               (0)
+
+
+/*======================== 六路传感器参数 ========================*/
+
+#define LINE_DETECTED_IS_1                  (1)
+#define SENSOR_INSTALL_REVERSE              (1)
+#define STOP_ON_ALL_BLACK                   (0)
+
+#define LINE_SENSOR_I2C_ADDRESS             (0x5CU)
+#define LINE_SENSOR_DIGITAL_REGISTER        (0x05U)
+#define LINE_I2C_DELAY_LOOPS                 (36U)
+#define LINE_I2C_CLOCK_STRETCH_TIMEOUT       (3000U)
+#define SENSOR_FAIL_STOP_COUNT              (20U)
+
+
+/*======================== 原循迹参数 ========================*/
+
+#define LOST_LINE_OUTER_PWM                 (30)
+#define LOST_LINE_INNER_PWM                 (5)
+#define LOST_LINE_STRAIGHT_PWM              (32)
+
+#define LINE_KP_NUM                         (4)
+#define LINE_KP_DEN                         (120)
+#define LINE_KD_NUM                         (5)
+#define LINE_KD_DEN                         (100)
+#define MAX_STEERING_CORRECTION             (45)
+
+
+/*======================== 减速阶段参数 ========================*/
+
+#define DECEL_CORRECTION_MAX                (9)
+#define DECEL_LOST_TURN_DELTA_PWM           (3)
+
+
+/*======================== B点识别参数 ========================*/
+
+#define B_DETECT_ARM_DELAY_MS               (5000U)
+#define B_DETECT_ERROR_THRESHOLD            (150)
+#define B_DETECT_CONFIRM_COUNT              (18U)      /* 18×5ms=90ms */
+
+
+/*======================== OLED参数 ========================*/
+
+#define OLED_I2C_ADDRESS                    (0x3CU)
+#define OLED_I2C_DELAY_LOOPS                (24U)
+#define OLED_WIDTH                          (128U)
+#define OLED_PAGE_COUNT                     (8U)
+
+
+/*======================== 引脚定义 ========================*/
+
+#define LEFT_IN1_PORT                       (GPIOB)
+#define LEFT_IN1_PIN                        (DL_GPIO_PIN_2)
+#define LEFT_IN2_PORT                       (GPIOA)
+#define LEFT_IN2_PIN                        (DL_GPIO_PIN_7)
+#define LEFT_EN_PORT                        (GPIOB)
+#define LEFT_EN_PIN                         (DL_GPIO_PIN_8)
+
+#define RIGHT_IN3_PORT                      (GPIOB)
+#define RIGHT_IN3_PIN                       (DL_GPIO_PIN_9)
+#define RIGHT_IN4_PORT                      (GPIOB)
+#define RIGHT_IN4_PIN                       (DL_GPIO_PIN_14)
+#define RIGHT_EN_PORT                       (GPIOB)
+#define RIGHT_EN_PIN                        (DL_GPIO_PIN_7)
+
+#define STATUS_LED_PORT                     (GPIOA)
+#define STATUS_LED_PIN                      (DL_GPIO_PIN_5)
+
+#define LINE_SDA_PORT                       (GPIOA)
+#define LINE_SDA_PIN                        (DL_GPIO_PIN_23)
+#define LINE_SCL_PORT                       (GPIOB)
+#define LINE_SCL_PIN                        (DL_GPIO_PIN_24)
+
+#define OLED_SDA_PORT                       (GPIOA)
+#define OLED_SDA_PIN                        (DL_GPIO_PIN_0)
+#define OLED_SCL_PORT                       (GPIOA)
+#define OLED_SCL_PIN                        (DL_GPIO_PIN_1)
+
+
+/*======================== 全局变量 ========================*/
+
+static volatile uint8_t  g_pwm_phase = 0U;
+static volatile uint8_t  g_left_pwm = 0U;
+static volatile uint8_t  g_right_pwm = 0U;
+static volatile uint16_t g_control_tick = 0U;
+static volatile uint8_t  g_control_due = 0U;
+static volatile uint8_t  g_ms_divider = 0U;
+static volatile uint32_t g_system_ms = 0U;
+
+static int16_t g_left_current_cmd = 0;
+static int16_t g_right_current_cmd = 0;
+
+static int16_t g_last_valid_error = 0;
+static int16_t g_filtered_error = 0;
+static int16_t g_previous_filtered_error = 0;
+
+static uint8_t g_sensor_fail_count = 0U;
+static uint8_t g_last_line_bits = 0U;
+
+static uint32_t g_mission_start_ms = 0U;
+static uint32_t g_final_stop_start_ms = 0U;
+static uint32_t g_final_elapsed_ms = 0U;
+static uint32_t g_last_oled_refresh_ms = 0U;
+
+static int16_t g_final_stop_start_pwm = APPROACH_LOW_PWM;
+
+static uint8_t g_b_detect_count = 0U;
+static uint8_t g_center_line_seen = 0U;
+
+
+/*======================== 任务状态 ========================*/
+
+typedef enum
+{
+    MISSION_WAITING = 0,
+    MISSION_ORIGINAL_RUNNING,
+    MISSION_APPROACH_DECEL,
+    MISSION_FINAL_SOFT_STOP,
+    MISSION_FINISHED
+} MissionState;
+
+static MissionState g_mission_state = MISSION_WAITING;
+
+
+/*======================== 基础工具 ========================*/
+
+static int16_t ClampI16(int16_t value, int16_t minimum, int16_t maximum)
+{
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
+static uint8_t AbsToU8(int16_t value)
+{
+    if (value < 0) value = (int16_t)(-value);
+    if (value > 100) value = 100;
+    return (uint8_t)value;
+}
+
+static int16_t ApproachI16(int16_t current, int16_t target, int16_t step)
+{
+    if (current < target)
+    {
+        current = (int16_t)(current + step);
+        if (current > target) current = target;
+    }
+    else if (current > target)
+    {
+        current = (int16_t)(current - step);
+        if (current < target) current = target;
+    }
+
+    return current;
+}
+
+static void ShortDelay(volatile uint32_t loops)
+{
+    while (loops > 0U)
+    {
+        __NOP();
+        loops--;
+    }
+}
+
+
+/*======================== 电机控制 ========================*/
+
+static void LeftMotor_SetDirection(int16_t command)
+{
+#if LEFT_MOTOR_REVERSE
+    command = (int16_t)(-command);
+#endif
+
+    if (command > 0)
+    {
+        DL_GPIO_setPins(LEFT_IN1_PORT, LEFT_IN1_PIN);
+        DL_GPIO_clearPins(LEFT_IN2_PORT, LEFT_IN2_PIN);
+    }
+    else if (command < 0)
+    {
+        DL_GPIO_clearPins(LEFT_IN1_PORT, LEFT_IN1_PIN);
+        DL_GPIO_setPins(LEFT_IN2_PORT, LEFT_IN2_PIN);
+    }
+    else
+    {
+        DL_GPIO_clearPins(LEFT_IN1_PORT, LEFT_IN1_PIN);
+        DL_GPIO_clearPins(LEFT_IN2_PORT, LEFT_IN2_PIN);
+    }
+}
+
+static void RightMotor_SetDirection(int16_t command)
+{
+#if RIGHT_MOTOR_REVERSE
+    command = (int16_t)(-command);
+#endif
+
+    if (command > 0)
+    {
+        DL_GPIO_setPins(RIGHT_IN3_PORT, RIGHT_IN3_PIN);
+        DL_GPIO_clearPins(RIGHT_IN4_PORT, RIGHT_IN4_PIN);
+    }
+    else if (command < 0)
+    {
+        DL_GPIO_clearPins(RIGHT_IN3_PORT, RIGHT_IN3_PIN);
+        DL_GPIO_setPins(RIGHT_IN4_PORT, RIGHT_IN4_PIN);
+    }
+    else
+    {
+        DL_GPIO_clearPins(RIGHT_IN3_PORT, RIGHT_IN3_PIN);
+        DL_GPIO_clearPins(RIGHT_IN4_PORT, RIGHT_IN4_PIN);
+    }
+}
+
+static void Motor_CommitCommand(int16_t left_command, int16_t right_command)
+{
+    uint8_t left_pwm;
+    uint8_t right_pwm;
+
+    left_command = ClampI16(left_command, -100, 100);
+    right_command = ClampI16(right_command, -100, 100);
+
+    left_pwm = AbsToU8(left_command);
+    right_pwm = AbsToU8(right_command);
+
+    if ((left_pwm > 0U) && (left_pwm < MOTOR_MIN_EFFECTIVE_PWM))
+    {
+        left_pwm = 0U;
+        left_command = 0;
+    }
+
+    if ((right_pwm > 0U) && (right_pwm < MOTOR_MIN_EFFECTIVE_PWM))
+    {
+        right_pwm = 0U;
+        right_command = 0;
+    }
+
+    __disable_irq();
+
+    DL_GPIO_clearPins(LEFT_EN_PORT, LEFT_EN_PIN);
+    DL_GPIO_clearPins(RIGHT_EN_PORT, RIGHT_EN_PIN);
+
+    LeftMotor_SetDirection(left_command);
+    RightMotor_SetDirection(right_command);
+
+    g_left_pwm = left_pwm;
+    g_right_pwm = right_pwm;
+
+    __enable_irq();
+}
+
+static void Motor_RampToWithStep(
+    int16_t left_target,
+    int16_t right_target,
+    int16_t step)
+{
+    if (step < 1) step = 1;
+
+    g_left_current_cmd =
+        ApproachI16(g_left_current_cmd, left_target, step);
+
+    g_right_current_cmd =
+        ApproachI16(g_right_current_cmd, right_target, step);
+
+    Motor_CommitCommand(g_left_current_cmd, g_right_current_cmd);
+}
+
+static void Motor_RampTo(int16_t left_target, int16_t right_target)
+{
+    Motor_RampToWithStep(
+        left_target,
+        right_target,
+        PWM_SLEW_STEP);
+}
+
+static void Motor_StopImmediately(void)
+{
+    g_left_current_cmd = 0;
+    g_right_current_cmd = 0;
+    Motor_CommitCommand(0, 0);
+}
+
+
+/*======================== 平滑速度曲线 ========================*/
+
+/*
+ * S形曲线：y=3x²-2x³
+ * 输入、输出范围均为0～1000。
+ */
+static uint16_t SmoothStepPermille(uint32_t elapsed_ms, uint32_t duration_ms)
+{
+    uint32_t x;
+    uint32_t x2;
+    uint32_t x3;
+    uint32_t result;
+
+    if (duration_ms == 0U) return 1000U;
+    if (elapsed_ms >= duration_ms) return 1000U;
+
+    x = (elapsed_ms * 1000U) / duration_ms;
+    x2 = (x * x) / 1000U;
+    x3 = (x2 * x) / 1000U;
+
+    result = 3U * x2 - 2U * x3;
+    if (result > 1000U) result = 1000U;
+
+    return (uint16_t)result;
+}
+
+static int16_t GetApproachBasePWM(uint32_t run_time_ms)
+{
+    uint32_t decel_elapsed_ms;
+    uint16_t progress;
+    int32_t pwm_range;
+
+    if (run_time_ms <= ORIGINAL_RUN_TIME_MS)
+    {
+        return MOTOR_BASE_PWM;
+    }
+
+    decel_elapsed_ms = run_time_ms - ORIGINAL_RUN_TIME_MS;
+
+    if (decel_elapsed_ms >= APPROACH_DECEL_TIME_MS)
+    {
+        return APPROACH_LOW_PWM;
+    }
+
+    progress =
+        SmoothStepPermille(decel_elapsed_ms, APPROACH_DECEL_TIME_MS);
+
+    pwm_range =
+        (int32_t)MOTOR_BASE_PWM - (int32_t)APPROACH_LOW_PWM;
+
+    return (int16_t)(
+        (int32_t)MOTOR_BASE_PWM -
+        (pwm_range * (int32_t)progress) / 1000);
+}
+
+static int16_t GetFinalStopBasePWM(uint32_t stop_elapsed_ms)
+{
+    uint16_t progress;
+    int32_t pwm_range;
+    int32_t pwm;
+
+    if (stop_elapsed_ms >= FINAL_SOFT_STOP_TIME_MS)
+    {
+        return 0;
+    }
+
+    progress =
+        SmoothStepPermille(stop_elapsed_ms, FINAL_SOFT_STOP_TIME_MS);
+
+    pwm_range =
+        (int32_t)g_final_stop_start_pwm -
+        (int32_t)MOTOR_MIN_EFFECTIVE_PWM;
+
+    if (pwm_range < 0) pwm_range = 0;
+
+    pwm =
+        (int32_t)g_final_stop_start_pwm -
+        (pwm_range * (int32_t)progress) / 1000;
+
+    if (pwm < MOTOR_MIN_EFFECTIVE_PWM)
+    {
+        pwm = MOTOR_MIN_EFFECTIVE_PWM;
+    }
+
+    return (int16_t)pwm;
+}
+
+static int16_t GetDecelCorrectionLimit(int16_t base_pwm)
+{
+    int16_t limit =
+        (int16_t)(base_pwm - MOTOR_MIN_EFFECTIVE_PWM);
+
+    if (limit < 0) limit = 0;
+    if (limit > DECEL_CORRECTION_MAX)
+    {
+        limit = DECEL_CORRECTION_MAX;
+    }
+
+    return limit;
+}
+
+
+/*======================== 起步S形速度曲线 ========================*/
+
+static int16_t SmoothLerpI16(
+    int16_t start_value,
+    int16_t end_value,
+    uint32_t elapsed_ms,
+    uint32_t duration_ms)
+{
+    uint16_t progress =
+        SmoothStepPermille(elapsed_ms, duration_ms);
+
+    return (int16_t)(
+        (int32_t)start_value +
+        (((int32_t)end_value - (int32_t)start_value) *
+         (int32_t)progress) / 1000);
+}
+
+static int16_t GetStartupBasePWM(uint32_t run_time_ms)
+{
+    uint32_t t = run_time_ms;
+
+    if (t < STARTUP_PRELOAD_TIME_MS)
+    {
+        return STARTUP_PRELOAD_PWM;
+    }
+    t -= STARTUP_PRELOAD_TIME_MS;
+
+    if (t < STARTUP_BREAKAWAY_RAMP_MS)
+    {
+        return SmoothLerpI16(
+            STARTUP_PRELOAD_PWM,
+            STARTUP_BREAKAWAY_PWM,
+            t,
+            STARTUP_BREAKAWAY_RAMP_MS);
+    }
+    t -= STARTUP_BREAKAWAY_RAMP_MS;
+
+    if (t < STARTUP_BREAKAWAY_HOLD_MS)
+    {
+        return STARTUP_BREAKAWAY_PWM;
+    }
+    t -= STARTUP_BREAKAWAY_HOLD_MS;
+
+    if (t < STARTUP_RELEASE_TIME_MS)
+    {
+        return SmoothLerpI16(
+            STARTUP_BREAKAWAY_PWM,
+            STARTUP_LOW_RUN_PWM,
+            t,
+            STARTUP_RELEASE_TIME_MS);
+    }
+    t -= STARTUP_RELEASE_TIME_MS;
+
+    if (t < STARTUP_SOFT_ACCEL_TIME_MS)
+    {
+        return SmoothLerpI16(
+            STARTUP_LOW_RUN_PWM,
+            MOTOR_BASE_PWM,
+            t,
+            STARTUP_SOFT_ACCEL_TIME_MS);
+    }
+
+    return MOTOR_BASE_PWM;
+}
+
+static int16_t GetStartupRequestedCorrectionLimit(
+    uint32_t run_time_ms)
+{
+    uint32_t steering_begin_ms =
+        STARTUP_PRELOAD_TIME_MS +
+        STARTUP_BREAKAWAY_RAMP_MS;
+
+    uint32_t release_end_ms =
+        steering_begin_ms +
+        STARTUP_BREAKAWAY_HOLD_MS +
+        STARTUP_RELEASE_TIME_MS;
+
+    uint32_t accel_end_ms =
+        STARTUP_BASE_PROFILE_TIME_MS;
+
+    if (run_time_ms < steering_begin_ms)
+    {
+        /* 破静摩擦上升段左右轮保持一致，避免突然横摆。 */
+        return 0;
+    }
+
+    if (run_time_ms < release_end_ms)
+    {
+        return SmoothLerpI16(
+            0,
+            STARTUP_RELEASE_CORRECTION_MAX,
+            run_time_ms - steering_begin_ms,
+            release_end_ms - steering_begin_ms);
+    }
+
+    if (run_time_ms < accel_end_ms)
+    {
+        return SmoothLerpI16(
+            STARTUP_RELEASE_CORRECTION_MAX,
+            STARTUP_ACCEL_CORRECTION_MAX,
+            run_time_ms - release_end_ms,
+            accel_end_ms - release_end_ms);
+    }
+
+    if (run_time_ms < STARTUP_CONTROL_TIME_MS)
+    {
+        return SmoothLerpI16(
+            STARTUP_ACCEL_CORRECTION_MAX,
+            STARTUP_FINAL_CORRECTION_MAX,
+            run_time_ms - accel_end_ms,
+            STARTUP_STEERING_BLEND_TIME_MS);
+    }
+
+    return STARTUP_FINAL_CORRECTION_MAX;
+}
+
+static int16_t GetStartupCorrectionLimit(
+    uint32_t run_time_ms,
+    int16_t base_pwm)
+{
+    int16_t requested =
+        GetStartupRequestedCorrectionLimit(run_time_ms);
+
+    /*
+     * 保证较慢一侧不会低于有效PWM，防止一侧突然停转，
+     * 从而在起步时产生明显偏航和横向加速度。
+     */
+    int16_t available =
+        (int16_t)(base_pwm - MOTOR_MIN_EFFECTIVE_PWM);
+
+    if (available < 0) available = 0;
+    if (requested > available) requested = available;
+
+    return requested;
+}
+
+
+/*======================== 六路传感器软件I2C ========================*/
+
+static void LineI2C_Delay(void)
+{
+    ShortDelay(LINE_I2C_DELAY_LOOPS);
+}
+
+static void LineSDA_DriveLow(void)
+{
+    DL_GPIO_clearPins(LINE_SDA_PORT, LINE_SDA_PIN);
+    DL_GPIO_enableOutput(LINE_SDA_PORT, LINE_SDA_PIN);
+}
+
+static void LineSDA_Release(void)
+{
+    DL_GPIO_disableOutput(LINE_SDA_PORT, LINE_SDA_PIN);
+}
+
+static bool LineSDA_Read(void)
+{
+    return ((DL_GPIO_readPins(LINE_SDA_PORT, LINE_SDA_PIN) &
+             LINE_SDA_PIN) != 0U);
+}
+
+static void LineSCL_DriveLow(void)
+{
+    DL_GPIO_clearPins(LINE_SCL_PORT, LINE_SCL_PIN);
+    DL_GPIO_enableOutput(LINE_SCL_PORT, LINE_SCL_PIN);
+}
+
+static void LineSCL_Release(void)
+{
+    DL_GPIO_disableOutput(LINE_SCL_PORT, LINE_SCL_PIN);
+}
+
+static bool LineSCL_Read(void)
+{
+    return ((DL_GPIO_readPins(LINE_SCL_PORT, LINE_SCL_PIN) &
+             LINE_SCL_PIN) != 0U);
+}
+
+static bool LineSCL_ReleaseAndWaitHigh(void)
+{
+    uint32_t timeout = LINE_I2C_CLOCK_STRETCH_TIMEOUT;
+
+    LineSCL_Release();
+
+    while (timeout > 0U)
+    {
+        if (LineSCL_Read()) return true;
+        timeout--;
+    }
+
+    return false;
+}
+
+static void LineI2C_Stop(void)
+{
+    LineSDA_DriveLow();
+    LineI2C_Delay();
+
+    (void)LineSCL_ReleaseAndWaitHigh();
+    LineI2C_Delay();
+
+    LineSDA_Release();
+    LineI2C_Delay();
+}
+
+static bool LineI2C_Start(void)
+{
+    LineSDA_Release();
+
+    if (!LineSCL_ReleaseAndWaitHigh()) return false;
+
+    LineI2C_Delay();
+
+    if (!LineSDA_Read()) return false;
+
+    LineSDA_DriveLow();
+    LineI2C_Delay();
+
+    LineSCL_DriveLow();
+    LineI2C_Delay();
+
+    return true;
+}
+
+static bool LineI2C_WriteByte(uint8_t data)
+{
+    uint8_t i;
+    bool ack;
+
+    for (i = 0U; i < 8U; i++)
+    {
+        if ((data & 0x80U) != 0U)
+            LineSDA_Release();
+        else
+            LineSDA_DriveLow();
+
+        LineI2C_Delay();
+
+        if (!LineSCL_ReleaseAndWaitHigh())
+        {
+            LineSCL_DriveLow();
+            LineSDA_Release();
+            return false;
+        }
+
+        LineI2C_Delay();
+        LineSCL_DriveLow();
+        LineI2C_Delay();
+
+        data <<= 1U;
+    }
+
+    LineSDA_Release();
+    LineI2C_Delay();
+
+    if (!LineSCL_ReleaseAndWaitHigh())
+    {
+        LineSCL_DriveLow();
+        return false;
+    }
+
+    LineI2C_Delay();
+    ack = !LineSDA_Read();
+
+    LineSCL_DriveLow();
+    LineI2C_Delay();
+
+    return ack;
+}
+
+static bool LineI2C_ReadByte(uint8_t *data, bool send_ack)
+{
+    uint8_t i;
+    uint8_t value = 0U;
+
+    if (data == (void *)0) return false;
+
+    LineSDA_Release();
+
+    for (i = 0U; i < 8U; i++)
+    {
+        value <<= 1U;
+        LineI2C_Delay();
+
+        if (!LineSCL_ReleaseAndWaitHigh())
+        {
+            LineSCL_DriveLow();
+            return false;
+        }
+
+        LineI2C_Delay();
+
+        if (LineSDA_Read()) value |= 0x01U;
+
+        LineSCL_DriveLow();
+        LineI2C_Delay();
+    }
+
+    if (send_ack)
+        LineSDA_DriveLow();
+    else
+        LineSDA_Release();
+
+    LineI2C_Delay();
+
+    if (!LineSCL_ReleaseAndWaitHigh())
+    {
+        LineSCL_DriveLow();
+        LineSDA_Release();
+        return false;
+    }
+
+    LineI2C_Delay();
+
+    LineSCL_DriveLow();
+    LineSDA_Release();
+    LineI2C_Delay();
+
+    *data = value;
+    return true;
+}
+
+static void LineI2C_BusRecover(void)
+{
+    uint8_t i;
+
+    LineSDA_Release();
+    LineSCL_Release();
+    LineI2C_Delay();
+
+    for (i = 0U; i < 9U; i++)
+    {
+        LineSCL_DriveLow();
+        LineI2C_Delay();
+
+        LineSCL_Release();
+        LineI2C_Delay();
+    }
+
+    LineI2C_Stop();
+}
+
+static bool LineSensor_ReadDigital(uint8_t *digital_result)
+{
+    uint8_t attempt;
+    uint8_t value = 0U;
+
+    if (digital_result == (void *)0) return false;
+
+    for (attempt = 0U; attempt < 3U; attempt++)
+    {
+        if (!LineI2C_Start())
+        {
+            LineI2C_BusRecover();
+            continue;
+        }
+
+        if (!LineI2C_WriteByte(
+                (uint8_t)(LINE_SENSOR_I2C_ADDRESS << 1U)))
+        {
+            LineI2C_Stop();
+            continue;
+        }
+
+        if (!LineI2C_WriteByte(LINE_SENSOR_DIGITAL_REGISTER))
+        {
+            LineI2C_Stop();
+            continue;
+        }
+
+        if (!LineI2C_Start())
+        {
+            LineI2C_Stop();
+            continue;
+        }
+
+        if (!LineI2C_WriteByte(
+                (uint8_t)((LINE_SENSOR_I2C_ADDRESS << 1U) | 0x01U)))
+        {
+            LineI2C_Stop();
+            continue;
+        }
+
+        if (!LineI2C_ReadByte(&value, false))
+        {
+            LineI2C_Stop();
+            continue;
+        }
+
+        LineI2C_Stop();
+
+        *digital_result = (uint8_t)(value & 0x3FU);
+        return true;
+    }
+
+    LineI2C_BusRecover();
+    return false;
+}
+
+
+/*======================== 六路数据处理 ========================*/
+
+static uint8_t Reverse6Bits(uint8_t value)
+{
+    uint8_t result = 0U;
+    uint8_t i;
+
+    value &= 0x3FU;
+
+    for (i = 0U; i < 6U; i++)
+    {
+        if ((value & (uint8_t)(1U << i)) != 0U)
+        {
+            result |= (uint8_t)(1U << (5U - i));
+        }
+    }
+
+    return result;
+}
+
+static uint8_t NormalizeLineBits(uint8_t raw_bits)
+{
+    uint8_t bits = (uint8_t)(raw_bits & 0x3FU);
+
+#if (LINE_DETECTED_IS_1 == 0)
+    bits = (uint8_t)((~bits) & 0x3FU);
+#endif
+
+    bits = Reverse6Bits(bits);
+
+#if SENSOR_INSTALL_REVERSE
+    bits = Reverse6Bits(bits);
+#endif
+
+    return bits;
+}
+
+static bool CalculateLineError(uint8_t line_bits, int16_t *error)
+{
+    static const int16_t weights[6] =
+    {
+        -500, -300, -100, 100, 300, 500
+    };
+
+    int32_t weighted_sum = 0;
+    uint8_t active_count = 0U;
+    uint8_t i;
+
+    if (error == (void *)0) return false;
+
+    for (i = 0U; i < 6U; i++)
+    {
+        if ((line_bits & (uint8_t)(1U << i)) != 0U)
+        {
+            weighted_sum += weights[i];
+            active_count++;
+        }
+    }
+
+    if (active_count == 0U) return false;
+
+    *error =
+        (int16_t)(weighted_sum / (int32_t)active_count);
+
+    return true;
+}
+
+
+/*======================== 柔和起步循迹控制 ========================*/
+
+static void StartupLineLost_Control(
+    uint32_t run_time_ms,
+    int16_t base_pwm,
+    int16_t correction_limit)
+{
+    int16_t turn_delta = correction_limit;
+    int16_t left_target = base_pwm;
+    int16_t right_target = base_pwm;
+
+    if (turn_delta > STARTUP_LOST_TURN_MAX)
+    {
+        turn_delta = STARTUP_LOST_TURN_MAX;
+    }
+
+    if (g_last_valid_error < -60)
+    {
+        left_target = (int16_t)(base_pwm - turn_delta);
+        right_target = (int16_t)(base_pwm + turn_delta);
+    }
+    else if (g_last_valid_error > 60)
+    {
+        left_target = (int16_t)(base_pwm + turn_delta);
+        right_target = (int16_t)(base_pwm - turn_delta);
+    }
+
+    left_target = (int16_t)(left_target + STARTUP_LEFT_PWM_TRIM);
+    right_target = (int16_t)(right_target + STARTUP_RIGHT_PWM_TRIM);
+
+    left_target = ClampI16(left_target, 0, MOTOR_MAX_PWM);
+    right_target = ClampI16(right_target, 0, MOTOR_MAX_PWM);
+
+    (void)run_time_ms;
+
+    Motor_RampToWithStep(
+        left_target,
+        right_target,
+        STARTUP_PWM_SLEW_STEP);
+}
+
+static void StartupLineFollow_Control(
+    uint8_t raw_bits,
+    uint32_t run_time_ms)
+{
+    uint8_t line_bits;
+    int16_t base_pwm;
+    int16_t correction_limit;
+    int16_t current_error;
+    int16_t delta_error;
+    int32_t correction_32;
+    int16_t correction;
+    int16_t left_target;
+    int16_t right_target;
+
+    base_pwm = GetStartupBasePWM(run_time_ms);
+    correction_limit =
+        GetStartupCorrectionLimit(run_time_ms, base_pwm);
+
+    line_bits = NormalizeLineBits(raw_bits);
+    g_last_line_bits = line_bits;
+
+    if (line_bits == 0U)
+    {
+        StartupLineLost_Control(
+            run_time_ms,
+            base_pwm,
+            correction_limit);
+        return;
+    }
+
+    if (line_bits == 0x3FU)
+    {
+#if STOP_ON_ALL_BLACK
+        Motor_StopImmediately();
+        return;
+#else
+        current_error = 0;
+#endif
+    }
+    else if (!CalculateLineError(line_bits, &current_error))
+    {
+        StartupLineLost_Control(
+            run_time_ms,
+            base_pwm,
+            correction_limit);
+        return;
+    }
+
+    g_last_valid_error = current_error;
+
+    g_filtered_error =
+        (int16_t)(((int32_t)g_filtered_error * 2 +
+                   current_error) / 3);
+
+    delta_error =
+        (int16_t)(g_filtered_error -
+                  g_previous_filtered_error);
+
+    g_previous_filtered_error = g_filtered_error;
+
+    correction_32 =
+        ((int32_t)g_filtered_error * LINE_KP_NUM) /
+        LINE_KP_DEN +
+        ((int32_t)delta_error * LINE_KD_NUM) /
+        LINE_KD_DEN;
+
+    correction = ClampI16(
+        (int16_t)correction_32,
+        (int16_t)(-correction_limit),
+        correction_limit);
+
+    left_target =
+        (int16_t)(base_pwm + correction +
+                  STARTUP_LEFT_PWM_TRIM);
+
+    right_target =
+        (int16_t)(base_pwm - correction +
+                  STARTUP_RIGHT_PWM_TRIM);
+
+    left_target = ClampI16(left_target, 0, MOTOR_MAX_PWM);
+    right_target = ClampI16(right_target, 0, MOTOR_MAX_PWM);
+
+    Motor_RampToWithStep(
+        left_target,
+        right_target,
+        STARTUP_PWM_SLEW_STEP);
+}
+
+
+/*======================== 前5秒：原丢线控制 ========================*/
+
+static void LineLost_Control(void)
+{
+    int16_t left_target;
+    int16_t right_target;
+
+    if (g_last_valid_error < -60)
+    {
+        left_target = LOST_LINE_INNER_PWM;
+        right_target = LOST_LINE_OUTER_PWM;
+    }
+    else if (g_last_valid_error > 60)
+    {
+        left_target = LOST_LINE_OUTER_PWM;
+        right_target = LOST_LINE_INNER_PWM;
+    }
+    else
+    {
+        left_target = LOST_LINE_STRAIGHT_PWM;
+        right_target = LOST_LINE_STRAIGHT_PWM;
+    }
+
+    Motor_RampTo(left_target, right_target);
+}
+
+
+/*======================== 前5秒：原PD循迹 ========================*/
+
+static void LineFollow_Control(uint8_t raw_bits)
+{
+    uint8_t line_bits;
+    int16_t current_error;
+    int16_t delta_error;
+    int32_t correction_32;
+    int16_t correction;
+    int16_t left_target;
+    int16_t right_target;
+
+    line_bits = NormalizeLineBits(raw_bits);
+    g_last_line_bits = line_bits;
+
+    if (line_bits == 0U)
+    {
+        LineLost_Control();
+        return;
+    }
+
+    if (line_bits == 0x3FU)
+    {
+#if STOP_ON_ALL_BLACK
+        Motor_StopImmediately();
+        return;
+#else
+        current_error = 0;
+#endif
+    }
+    else if (!CalculateLineError(line_bits, &current_error))
+    {
+        LineLost_Control();
+        return;
+    }
+
+    g_last_valid_error = current_error;
+
+    g_filtered_error =
+        (int16_t)(((int32_t)g_filtered_error * 2 +
+                   current_error) / 3);
+
+    delta_error =
+        (int16_t)(g_filtered_error -
+                  g_previous_filtered_error);
+
+    g_previous_filtered_error = g_filtered_error;
+
+    correction_32 =
+        ((int32_t)g_filtered_error * LINE_KP_NUM) /
+        LINE_KP_DEN +
+        ((int32_t)delta_error * LINE_KD_NUM) /
+        LINE_KD_DEN;
+
+    correction =
+        ClampI16(
+            (int16_t)correction_32,
+            -MAX_STEERING_CORRECTION,
+            MAX_STEERING_CORRECTION);
+
+    left_target =
+        (int16_t)(MOTOR_BASE_PWM + correction);
+
+    right_target =
+        (int16_t)(MOTOR_BASE_PWM - correction);
+
+    left_target =
+        ClampI16(left_target, 0, MOTOR_MAX_PWM);
+
+    right_target =
+        ClampI16(right_target, 0, MOTOR_MAX_PWM);
+
+    Motor_RampTo(left_target, right_target);
+}
+
+
+/*======================== 5秒后：减速丢线控制 ========================*/
+
+static void DecelLineLost_Control(int16_t base_pwm)
+{
+    int16_t turn_delta;
+    int16_t left_target;
+    int16_t right_target;
+
+    turn_delta = GetDecelCorrectionLimit(base_pwm);
+
+    if (turn_delta > DECEL_LOST_TURN_DELTA_PWM)
+    {
+        turn_delta = DECEL_LOST_TURN_DELTA_PWM;
+    }
+
+    if (g_last_valid_error < -60)
+    {
+        left_target = (int16_t)(base_pwm - turn_delta);
+        right_target = (int16_t)(base_pwm + turn_delta);
+    }
+    else if (g_last_valid_error > 60)
+    {
+        left_target = (int16_t)(base_pwm + turn_delta);
+        right_target = (int16_t)(base_pwm - turn_delta);
+    }
+    else
+    {
+        left_target = base_pwm;
+        right_target = base_pwm;
+    }
+
+    left_target =
+        ClampI16(left_target, 0, MOTOR_MAX_PWM);
+
+    right_target =
+        ClampI16(right_target, 0, MOTOR_MAX_PWM);
+
+    Motor_RampTo(left_target, right_target);
+}
+
+
+/*======================== 5秒后：减速PD循迹 ========================*/
+
+static void DecelLineFollow_Control(
+    uint8_t raw_bits,
+    int16_t base_pwm)
+{
+    uint8_t line_bits;
+    int16_t current_error;
+    int16_t delta_error;
+    int32_t correction_32;
+    int16_t correction;
+    int16_t correction_limit;
+    int16_t left_target;
+    int16_t right_target;
+
+    if (base_pwm <= 0)
+    {
+        Motor_StopImmediately();
+        return;
+    }
+
+    line_bits = NormalizeLineBits(raw_bits);
+    g_last_line_bits = line_bits;
+
+    if (line_bits == 0U)
+    {
+        DecelLineLost_Control(base_pwm);
+        return;
+    }
+
+    if (line_bits == 0x3FU)
+    {
+#if STOP_ON_ALL_BLACK
+        Motor_StopImmediately();
+        return;
+#else
+        current_error = 0;
+#endif
+    }
+    else if (!CalculateLineError(line_bits, &current_error))
+    {
+        DecelLineLost_Control(base_pwm);
+        return;
+    }
+
+    g_last_valid_error = current_error;
+
+    g_filtered_error =
+        (int16_t)(((int32_t)g_filtered_error * 2 +
+                   current_error) / 3);
+
+    delta_error =
+        (int16_t)(g_filtered_error -
+                  g_previous_filtered_error);
+
+    g_previous_filtered_error = g_filtered_error;
+
+    correction_32 =
+        ((int32_t)g_filtered_error * LINE_KP_NUM) /
+        LINE_KP_DEN +
+        ((int32_t)delta_error * LINE_KD_NUM) /
+        LINE_KD_DEN;
+
+    correction =
+        ClampI16(
+            (int16_t)correction_32,
+            -MAX_STEERING_CORRECTION,
+            MAX_STEERING_CORRECTION);
+
+    correction_limit =
+        GetDecelCorrectionLimit(base_pwm);
+
+    correction =
+        ClampI16(
+            correction,
+            (int16_t)(-correction_limit),
+            correction_limit);
+
+    left_target =
+        ClampI16(
+            (int16_t)(base_pwm + correction),
+            0,
+            MOTOR_MAX_PWM);
+
+    right_target =
+        ClampI16(
+            (int16_t)(base_pwm - correction),
+            0,
+            MOTOR_MAX_PWM);
+
+    Motor_RampTo(left_target, right_target);
+}
+
+
+/*======================== B点检测 ========================*/
+
+static void Mission_UpdateCenterLineSeen(uint8_t raw_bits)
+{
+    uint8_t line_bits = NormalizeLineBits(raw_bits);
+
+    if ((line_bits & 0x0CU) != 0U)
+    {
+        g_center_line_seen = 1U;
+    }
+}
+
+static bool Mission_DetectBPoint(
+    uint8_t raw_bits,
+    uint32_t run_time_ms)
+{
+    uint8_t line_bits;
+    int16_t line_error;
+    bool right_curve_condition;
+
+    if (run_time_ms < B_DETECT_ARM_DELAY_MS)
+    {
+        g_b_detect_count = 0U;
+        return false;
+    }
+
+    if (g_center_line_seen == 0U)
+    {
+        g_b_detect_count = 0U;
+        return false;
+    }
+
+    line_bits = NormalizeLineBits(raw_bits);
+
+    if ((line_bits == 0U) ||
+        (line_bits == 0x3FU) ||
+        (!CalculateLineError(line_bits, &line_error)))
+    {
+        g_b_detect_count = 0U;
+        return false;
+    }
+
+    /*
+     * 黑线明显位于右侧：
+     *   误差>=150；
+     *   右侧bit3～bit5至少有一路；
+     *   左外侧bit0、bit1均没有。
+     */
+    right_curve_condition =
+        (line_error >= B_DETECT_ERROR_THRESHOLD) &&
+        ((line_bits & 0x38U) != 0U) &&
+        ((line_bits & 0x03U) == 0U);
+
+    if (right_curve_condition)
+    {
+        if (g_b_detect_count < B_DETECT_CONFIRM_COUNT)
+        {
+            g_b_detect_count++;
+        }
+    }
+    else
+    {
+        g_b_detect_count = 0U;
+    }
+
+    return (g_b_detect_count >= B_DETECT_CONFIRM_COUNT);
+}
+
+
+/*======================== OLED软件I2C ========================*/
+
+static void OLED_I2C_Delay(void)
+{
+    ShortDelay(OLED_I2C_DELAY_LOOPS);
+}
+
+static void OLED_SDA_DriveLow(void)
+{
+    DL_GPIO_clearPins(OLED_SDA_PORT, OLED_SDA_PIN);
+    DL_GPIO_enableOutput(OLED_SDA_PORT, OLED_SDA_PIN);
+}
+
+static void OLED_SDA_Release(void)
+{
+    DL_GPIO_disableOutput(OLED_SDA_PORT, OLED_SDA_PIN);
+}
+
+static bool OLED_SDA_Read(void)
+{
+    return ((DL_GPIO_readPins(OLED_SDA_PORT, OLED_SDA_PIN) &
+             OLED_SDA_PIN) != 0U);
+}
+
+static void OLED_SCL_DriveLow(void)
+{
+    DL_GPIO_clearPins(OLED_SCL_PORT, OLED_SCL_PIN);
+    DL_GPIO_enableOutput(OLED_SCL_PORT, OLED_SCL_PIN);
+}
+
+static void OLED_SCL_Release(void)
+{
+    DL_GPIO_disableOutput(OLED_SCL_PORT, OLED_SCL_PIN);
+}
+
+static void OLED_I2C_Start(void)
+{
+    OLED_SDA_Release();
+    OLED_SCL_Release();
+    OLED_I2C_Delay();
+
+    OLED_SDA_DriveLow();
+    OLED_I2C_Delay();
+
+    OLED_SCL_DriveLow();
+    OLED_I2C_Delay();
+}
+
+static void OLED_I2C_Stop(void)
+{
+    OLED_SDA_DriveLow();
+    OLED_I2C_Delay();
+
+    OLED_SCL_Release();
+    OLED_I2C_Delay();
+
+    OLED_SDA_Release();
+    OLED_I2C_Delay();
+}
+
+static bool OLED_I2C_WriteByte(uint8_t data)
+{
+    uint8_t i;
+    bool ack;
+
+    for (i = 0U; i < 8U; i++)
+    {
+        if ((data & 0x80U) != 0U)
+            OLED_SDA_Release();
+        else
+            OLED_SDA_DriveLow();
+
+        OLED_I2C_Delay();
+
+        OLED_SCL_Release();
+        OLED_I2C_Delay();
+
+        OLED_SCL_DriveLow();
+        OLED_I2C_Delay();
+
+        data <<= 1U;
+    }
+
+    OLED_SDA_Release();
+    OLED_I2C_Delay();
+
+    OLED_SCL_Release();
+    OLED_I2C_Delay();
+
+    ack = !OLED_SDA_Read();
+
+    OLED_SCL_DriveLow();
+    OLED_I2C_Delay();
+
+    return ack;
+}
+
+static void OLED_WriteCommand(uint8_t command)
+{
+    OLED_I2C_Start();
+
+    (void)OLED_I2C_WriteByte(
+        (uint8_t)(OLED_I2C_ADDRESS << 1U));
+
+    (void)OLED_I2C_WriteByte(0x00U);
+    (void)OLED_I2C_WriteByte(command);
+
+    OLED_I2C_Stop();
+}
+
+static void OLED_WriteDataBuffer(
+    const uint8_t *data,
+    uint16_t length)
+{
+    uint16_t i;
+
+    if (data == (void *)0) return;
+
+    OLED_I2C_Start();
+
+    (void)OLED_I2C_WriteByte(
+        (uint8_t)(OLED_I2C_ADDRESS << 1U));
+
+    (void)OLED_I2C_WriteByte(0x40U);
+
+    for (i = 0U; i < length; i++)
+    {
+        (void)OLED_I2C_WriteByte(data[i]);
+    }
+
+    OLED_I2C_Stop();
+}
+
+static void OLED_SetCursor(uint8_t page, uint8_t column)
+{
+    OLED_WriteCommand(
+        (uint8_t)(0xB0U | (page & 0x07U)));
+
+    OLED_WriteCommand(
+        (uint8_t)(0x00U | (column & 0x0FU)));
+
+    OLED_WriteCommand(
+        (uint8_t)(0x10U |
+                  ((column >> 4U) & 0x0FU)));
+}
+
+
+/*======================== OLED字模 ========================*/
+
+static void OLED_GetGlyph(char c, uint8_t g[5])
+{
+    uint8_t i;
+
+    for (i = 0U; i < 5U; i++) g[i] = 0U;
+
+    switch (c)
+    {
+        case '0': g[0]=0x3E; g[1]=0x51; g[2]=0x49; g[3]=0x45; g[4]=0x3E; break;
+        case '1': g[0]=0x00; g[1]=0x42; g[2]=0x7F; g[3]=0x40; g[4]=0x00; break;
+        case '2': g[0]=0x42; g[1]=0x61; g[2]=0x51; g[3]=0x49; g[4]=0x46; break;
+        case '3': g[0]=0x21; g[1]=0x41; g[2]=0x45; g[3]=0x4B; g[4]=0x31; break;
+        case '4': g[0]=0x18; g[1]=0x14; g[2]=0x12; g[3]=0x7F; g[4]=0x10; break;
+        case '5': g[0]=0x27; g[1]=0x45; g[2]=0x45; g[3]=0x45; g[4]=0x39; break;
+        case '6': g[0]=0x3C; g[1]=0x4A; g[2]=0x49; g[3]=0x49; g[4]=0x30; break;
+        case '7': g[0]=0x01; g[1]=0x71; g[2]=0x09; g[3]=0x05; g[4]=0x03; break;
+        case '8': g[0]=0x36; g[1]=0x49; g[2]=0x49; g[3]=0x49; g[4]=0x36; break;
+        case '9': g[0]=0x06; g[1]=0x49; g[2]=0x49; g[3]=0x29; g[4]=0x1E; break;
+
+        case ':': g[0]=0x00; g[1]=0x36; g[2]=0x36; g[3]=0x00; g[4]=0x00; break;
+        case '.': g[0]=0x00; g[1]=0x60; g[2]=0x60; g[3]=0x00; g[4]=0x00; break;
+
+        case 'R': g[0]=0x7F; g[1]=0x09; g[2]=0x19; g[3]=0x29; g[4]=0x46; break;
+        case 'U': g[0]=0x3F; g[1]=0x40; g[2]=0x40; g[3]=0x40; g[4]=0x3F; break;
+        case 'N': g[0]=0x7F; g[1]=0x02; g[2]=0x0C; g[3]=0x10; g[4]=0x7F; break;
+        case 'T': g[0]=0x01; g[1]=0x01; g[2]=0x7F; g[3]=0x01; g[4]=0x01; break;
+        case 'I': g[0]=0x00; g[1]=0x41; g[2]=0x7F; g[3]=0x41; g[4]=0x00; break;
+        case 'M': g[0]=0x7F; g[1]=0x02; g[2]=0x0C; g[3]=0x02; g[4]=0x7F; break;
+        case 'E': g[0]=0x7F; g[1]=0x49; g[2]=0x49; g[3]=0x49; g[4]=0x41; break;
+
+        default: break;
+    }
+}
+
+static void OLED_WriteFixedText(
+    uint8_t page,
+    uint8_t column,
+    const char *text,
+    uint8_t count)
+{
+    uint8_t buffer[96];
+    uint8_t glyph[5];
+    uint8_t out = 0U;
+    uint8_t c;
+    uint8_t i;
+
+    if (text == (void *)0) return;
+    if (count > 16U) count = 16U;
+
+    for (c = 0U; c < count; c++)
+    {
+        OLED_GetGlyph(text[c], glyph);
+
+        for (i = 0U; i < 5U; i++)
+        {
+            buffer[out++] = glyph[i];
+        }
+
+        buffer[out++] = 0x00U;
+    }
+
+    OLED_SetCursor(page, column);
+    OLED_WriteDataBuffer(buffer, out);
+}
+
+static void OLED_Clear(void)
+{
+    static const uint8_t zeros[OLED_WIDTH] = {0};
+    uint8_t page;
+
+    for (page = 0U; page < OLED_PAGE_COUNT; page++)
+    {
+        OLED_SetCursor(page, 0U);
+        OLED_WriteDataBuffer(zeros, OLED_WIDTH);
+    }
+}
+
+static void OLED_Init(void)
+{
+    ShortDelay(200000U);
+
+    OLED_WriteCommand(0xAEU);
+    OLED_WriteCommand(0x20U);
+    OLED_WriteCommand(0x02U);
+    OLED_WriteCommand(0xB0U);
+    OLED_WriteCommand(0xC8U);
+    OLED_WriteCommand(0x00U);
+    OLED_WriteCommand(0x10U);
+    OLED_WriteCommand(0x40U);
+    OLED_WriteCommand(0x81U);
+    OLED_WriteCommand(0x7FU);
+    OLED_WriteCommand(0xA1U);
+    OLED_WriteCommand(0xA6U);
+    OLED_WriteCommand(0xA8U);
+    OLED_WriteCommand(0x3FU);
+    OLED_WriteCommand(0xA4U);
+    OLED_WriteCommand(0xD3U);
+    OLED_WriteCommand(0x00U);
+    OLED_WriteCommand(0xD5U);
+    OLED_WriteCommand(0x80U);
+    OLED_WriteCommand(0xD9U);
+    OLED_WriteCommand(0xF1U);
+    OLED_WriteCommand(0xDAU);
+    OLED_WriteCommand(0x12U);
+    OLED_WriteCommand(0xDBU);
+    OLED_WriteCommand(0x40U);
+    OLED_WriteCommand(0x8DU);
+    OLED_WriteCommand(0x14U);
+    OLED_WriteCommand(0xAFU);
+
+    OLED_Clear();
+
+    OLED_WriteFixedText(
+        2U,
+        40U,
+        "RUN TIME",
+        8U);
+}
+
+static void OLED_ShowElapsedTime(uint32_t elapsed_ms)
+{
+    char text[8];
+
+    uint32_t total_centiseconds =
+        elapsed_ms / 10U;
+
+    uint32_t minutes =
+        total_centiseconds / 6000U;
+
+    uint32_t seconds =
+        (total_centiseconds / 100U) % 60U;
+
+    uint32_t centiseconds =
+        total_centiseconds % 100U;
+
+    if (minutes > 99U) minutes = 99U;
+
+    text[0] = (char)('0' + minutes / 10U);
+    text[1] = (char)('0' + minutes % 10U);
+    text[2] = ':';
+    text[3] = (char)('0' + seconds / 10U);
+    text[4] = (char)('0' + seconds % 10U);
+    text[5] = '.';
+    text[6] = (char)('0' + centiseconds / 10U);
+    text[7] = (char)('0' + centiseconds % 10U);
+
+    OLED_WriteFixedText(
+        4U,
+        40U,
+        text,
+        8U);
+}
+
+
+/*======================== 任务控制 ========================*/
+
+static void Mission_StartFromA(void)
+{
+    Motor_StopImmediately();
+
+    g_last_valid_error = 0;
+    g_filtered_error = 0;
+    g_previous_filtered_error = 0;
+
+    g_sensor_fail_count = 0U;
+    g_b_detect_count = 0U;
+    g_center_line_seen = 0U;
+    g_final_elapsed_ms = 0U;
+
+    OLED_ShowElapsedTime(0U);
+
+    g_mission_start_ms = g_system_ms;
+    g_last_oled_refresh_ms = g_system_ms;
+
+    g_mission_state = MISSION_ORIGINAL_RUNNING;
+
+    DL_GPIO_setPins(
+        STATUS_LED_PORT,
+        STATUS_LED_PIN);
+}
+
+static void Mission_BeginFinalSoftStop(int16_t current_base_pwm)
+{
+    if (g_mission_state == MISSION_FINAL_SOFT_STOP)
+    {
+        return;
+    }
+
+    current_base_pwm =
+        ClampI16(
+            current_base_pwm,
+            MOTOR_MIN_EFFECTIVE_PWM,
+            MOTOR_BASE_PWM);
+
+    g_final_stop_start_pwm = current_base_pwm;
+    g_final_stop_start_ms = g_system_ms;
+    g_mission_state = MISSION_FINAL_SOFT_STOP;
+}
+
+static void Mission_Finish(void)
+{
+    if (g_mission_state != MISSION_WAITING)
+    {
+        g_final_elapsed_ms =
+            g_system_ms - g_mission_start_ms;
+    }
+    else
+    {
+        g_final_elapsed_ms = 0U;
+    }
+
+    g_mission_state = MISSION_FINISHED;
+
+    Motor_StopImmediately();
+
+    DL_GPIO_clearPins(
+        STATUS_LED_PORT,
+        STATUS_LED_PIN);
+
+    OLED_ShowElapsedTime(g_final_elapsed_ms);
+}
+
+static void Mission_Control(uint8_t raw_bits)
+{
+    uint32_t run_time_ms =
+        g_system_ms - g_mission_start_ms;
+
+    int16_t approach_base_pwm;
+
+    Mission_UpdateCenterLineSeen(raw_bits);
+
+    if (g_mission_state == MISSION_FINISHED)
+    {
+        Motor_StopImmediately();
+        return;
+    }
+
+    /*
+     * 起步阶段：预紧、破静摩擦、回落、S形加速，
+     * 同时逐渐放开循迹修正，降低小球受到的冲击。
+     */
+    if (run_time_ms < STARTUP_CONTROL_TIME_MS)
+    {
+        g_mission_state = MISSION_ORIGINAL_RUNNING;
+        g_b_detect_count = 0U;
+
+        StartupLineFollow_Control(
+            raw_bits,
+            run_time_ms);
+        return;
+    }
+
+    /* 起步结束到5秒之间，恢复原来的正常PD循迹。 */
+    if (run_time_ms < ORIGINAL_RUN_TIME_MS)
+    {
+        g_mission_state = MISSION_ORIGINAL_RUNNING;
+        g_b_detect_count = 0U;
+
+        LineFollow_Control(raw_bits);
+        return;
+    }
+
+    /*
+     * 5秒以后逐渐减速并检测右弯。
+     */
+    if ((g_mission_state == MISSION_ORIGINAL_RUNNING) ||
+        (g_mission_state == MISSION_APPROACH_DECEL))
+    {
+        g_mission_state = MISSION_APPROACH_DECEL;
+
+        approach_base_pwm =
+            GetApproachBasePWM(run_time_ms);
+
+        if (run_time_ms >= MISSION_MAX_RUN_TIME_MS)
+        {
+            Mission_BeginFinalSoftStop(
+                approach_base_pwm);
+        }
+        else if (Mission_DetectBPoint(
+                     raw_bits,
+                     run_time_ms))
+        {
+            Mission_BeginFinalSoftStop(
+                approach_base_pwm);
+        }
+        else
+        {
+            DecelLineFollow_Control(
+                raw_bits,
+                approach_base_pwm);
+
+            return;
+        }
+    }
+
+    /*
+     * 检测到右弯以后再用900ms平滑停车。
+     */
+    if (g_mission_state == MISSION_FINAL_SOFT_STOP)
+    {
+        uint32_t stop_elapsed_ms =
+            g_system_ms - g_final_stop_start_ms;
+
+        if (stop_elapsed_ms >= FINAL_SOFT_STOP_TIME_MS)
+        {
+            Mission_Finish();
+            return;
+        }
+
+        DecelLineFollow_Control(
+            raw_bits,
+            GetFinalStopBasePWM(
+                stop_elapsed_ms));
+    }
+}
+
+
+/*======================== GPIO初始化 ========================*/
+
+static void ApplicationGPIO_Init(void)
+{
+    DL_GPIO_clearPins(
+        GPIOB,
+        LEFT_IN1_PIN |
+        RIGHT_IN3_PIN |
+        RIGHT_IN4_PIN |
+        LEFT_EN_PIN |
+        RIGHT_EN_PIN);
+
+    DL_GPIO_clearPins(
+        GPIOA,
+        LEFT_IN2_PIN |
+        STATUS_LED_PIN |
+        OLED_SDA_PIN |
+        OLED_SCL_PIN);
+
+    DL_GPIO_enableOutput(
+        GPIOB,
+        LEFT_IN1_PIN |
+        RIGHT_IN3_PIN |
+        RIGHT_IN4_PIN |
+        LEFT_EN_PIN |
+        RIGHT_EN_PIN);
+
+    DL_GPIO_enableOutput(
+        GPIOA,
+        LEFT_IN2_PIN |
+        STATUS_LED_PIN);
+
+    DL_GPIO_clearPins(
+        LINE_SDA_PORT,
+        LINE_SDA_PIN);
+
+    DL_GPIO_clearPins(
+        LINE_SCL_PORT,
+        LINE_SCL_PIN);
+
+    LineSDA_Release();
+    LineSCL_Release();
+
+    DL_GPIO_clearPins(
+        OLED_SDA_PORT,
+        OLED_SDA_PIN);
+
+    DL_GPIO_clearPins(
+        OLED_SCL_PORT,
+        OLED_SCL_PIN);
+
+    OLED_SDA_Release();
+    OLED_SCL_Release();
+
+    Motor_StopImmediately();
+    LineI2C_BusRecover();
+}
+
+
+/*======================== SysTick中断 ========================*/
+
+void SysTick_Handler(void)
+{
+    if (g_left_pwm > g_pwm_phase)
+        DL_GPIO_setPins(LEFT_EN_PORT, LEFT_EN_PIN);
+    else
+        DL_GPIO_clearPins(LEFT_EN_PORT, LEFT_EN_PIN);
+
+    if (g_right_pwm > g_pwm_phase)
+        DL_GPIO_setPins(RIGHT_EN_PORT, RIGHT_EN_PIN);
+    else
+        DL_GPIO_clearPins(RIGHT_EN_PORT, RIGHT_EN_PIN);
+
+    g_pwm_phase++;
+
+    if (g_pwm_phase >= PWM_PERIOD_COUNT)
+    {
+        g_pwm_phase = 0U;
+    }
+
+    g_control_tick++;
+
+    if (g_control_tick >= CONTROL_INTERVAL_TICKS)
+    {
+        g_control_tick = 0U;
+        g_control_due = 1U;
+    }
+
+    g_ms_divider++;
+
+    if (g_ms_divider >= 10U)
+    {
+        g_ms_divider = 0U;
+        g_system_ms++;
+    }
+}
+
+
+/*======================== 主函数 ========================*/
+
+int main(void)
+{
+    uint8_t raw_line_bits = 0U;
+    uint32_t display_elapsed_ms;
+
+    SYSCFG_DL_init();
+    ApplicationGPIO_Init();
+
+    DL_SYSTICK_config(
+        CPUCLK_FREQ /
+        SYSTICK_FREQUENCY_HZ);
+
+    DL_SYSTICK_enable();
+
+    OLED_Init();
+    OLED_ShowElapsedTime(0U);
+
+    /*
+     * 通电后先等待 POWER_ON_START_DELAY_MS。
+     * 当前宏定义为1000ms；若要13秒，改成13000U。
+     * 等待时间不计入运动时间。
+     */
+    Motor_StopImmediately();
+    g_mission_state = MISSION_WAITING;
+
+    while (g_system_ms < POWER_ON_START_DELAY_MS)
+    {
+        __WFI();
+    }
+
+    Mission_StartFromA();
+
+    while (1)
+    {
+        /*
+         * OLED显示实际运动时间。
+         */
+        if ((g_mission_state != MISSION_WAITING) &&
+            (g_mission_state != MISSION_FINISHED) &&
+            ((uint32_t)(g_system_ms -
+                        g_last_oled_refresh_ms) >=
+             OLED_REFRESH_INTERVAL_MS))
+        {
+            g_last_oled_refresh_ms = g_system_ms;
+
+            display_elapsed_ms =
+                g_system_ms - g_mission_start_ms;
+
+            OLED_ShowElapsedTime(
+                display_elapsed_ms);
+        }
+
+        if (g_control_due != 0U)
+        {
+            g_control_due = 0U;
+
+            if (g_mission_state == MISSION_FINISHED)
+            {
+                Motor_StopImmediately();
+            }
+            else if (LineSensor_ReadDigital(
+                         &raw_line_bits))
+            {
+                g_sensor_fail_count = 0U;
+
+                DL_GPIO_setPins(
+                    STATUS_LED_PORT,
+                    STATUS_LED_PIN);
+
+                Mission_Control(
+                    raw_line_bits);
+            }
+            else
+            {
+                DL_GPIO_clearPins(
+                    STATUS_LED_PORT,
+                    STATUS_LED_PIN);
+
+                if (g_sensor_fail_count < 255U)
+                {
+                    g_sensor_fail_count++;
+                }
+
+                /*
+                 * 连续约100ms通信失败时安全停车。
+                 */
+                if (g_sensor_fail_count >=
+                    SENSOR_FAIL_STOP_COUNT)
+                {
+                    Mission_Finish();
+                }
+            }
+        }
+
+        __WFI();
+    }
+}
