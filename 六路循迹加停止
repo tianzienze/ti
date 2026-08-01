@@ -1,0 +1,2515 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+#include <stdbool.h>
+
+/*
+ * MSPM0G3507 + Hiwonder 六路巡线传感器
+ *
+ * ============================================================
+ * 当前 SysConfig 引脚
+ * ============================================================
+ *
+ * 左电机：
+ *   IN1 -> PB2
+ *   IN2 -> PA7
+ *   ENA -> PB8
+ *
+ * 右电机：
+ *   IN3 -> PB9
+ *   IN4 -> PB14
+ *   ENB -> PB7
+ *
+ * 六路巡线传感器：
+ *   SDA -> PA23
+ *   SCL -> PB24
+ *
+ * 传感器：
+ *   I2C地址             = 0x5C
+ *   六路数字结果寄存器 = 0x05
+ *
+ * 状态LED：
+ *   LED -> PA5
+ *
+ * ============================================================
+ * 六路传感器方向
+ * ============================================================
+ *
+ * 按照传感器正面文字正常的安装方向：
+ *
+ * 小车左侧                              小车右侧
+ *
+ * 通道6   通道5   通道4   通道3   通道2   通道1
+ *
+ * 本代码假定：
+ *   原始 bit0 = 通道1
+ *   原始 bit1 = 通道2
+ *   ...
+ *   原始 bit5 = 通道6
+ *
+ * 软件会转换为：
+ *   bit0 = 最左
+ *   bit5 = 最右
+ *
+ * ============================================================
+ * 工作方式
+ * ============================================================
+ *
+ * 1. 读取六路数字结果。
+ * 2. 使用加权误差进行PD循迹。
+ * 3. 中间两路压线时小幅调整。
+ * 4. 外侧传感器压线时大幅转向。
+ * 5. 短暂丢线时按照最后方向继续找线。
+ * 6. I2C连续读取失败约100ms后停车。
+ * 7. 软件PWM频率为100Hz，速度范围0~100。
+ */
+
+
+/*============================================================
+ * 系统时钟
+ *============================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                         (32000000UL)
+#endif
+/* 打开电源后等待15秒再开始循迹。 */
+#define POWER_ON_START_DELAY_MS              (15000U)
+
+/*============================================================
+ * SysTick与软件PWM
+ *============================================================*/
+
+/* SysTick每100us进入一次中断。 */
+#define SYSTICK_FREQUENCY_HZ                (10000U)
+
+/* PWM分成100级，因此PWM频率为100Hz。 */
+#define PWM_PERIOD_COUNT                    (100U)
+
+/* 每50个SysTick执行一次循迹，即5ms。 */
+#define CONTROL_INTERVAL_TICKS              (50U)
+
+
+/*============================================================
+ * 电机方向配置
+ *============================================================*/
+
+/*
+ * 烧录后先把车轮架空测试。
+ *
+ * 如果左轮“前进”方向反了：
+ * LEFT_MOTOR_REVERSE 改成1。
+ *
+ * 如果右轮“前进”方向反了：
+ * RIGHT_MOTOR_REVERSE 改成1。
+ */
+
+#define LEFT_MOTOR_REVERSE                  (0)
+#define RIGHT_MOTOR_REVERSE                 (0)
+
+
+/*============================================================
+ * 六路巡线传感器配置
+ *============================================================*/
+
+/*
+ * 默认认为：
+ *
+ * 检测到学习过的目标颜色，也就是黑线时，对应位为1。
+ *
+ * 如果实际测试发现：
+ *   全部放在白色区域时返回63；
+ *   放到黑线上对应位反而变成0；
+ *
+ * 就把这个宏改成0。
+ */
+#define LINE_DETECTED_IS_1                  (1)
+
+
+/*
+ * 传感器板正面朝前，并且文字方向正常时保持为0。
+ *
+ * 如果传感器左右装反，小车左边变成通道1，
+ * 就把此宏改成1。
+ */
+#define SENSOR_INSTALL_REVERSE              (1)
+
+
+/*
+ * 六路全部检测到黑线时：
+ *
+ * 0：当作十字线或较粗黑线，继续直行。
+ * 1：立即停车。
+ */
+#define STOP_ON_ALL_BLACK                   (0)
+
+
+/*============================================================
+ * 循迹速度参数
+ *============================================================*/
+
+/*
+ * 所有PWM范围均为0~100。
+ *
+ * 车速太快：
+ *   减小 MOTOR_BASE_PWM。
+ *
+ * 车速太慢：
+ *   增大 MOTOR_BASE_PWM。
+ */
+
+#define MOTOR_BASE_PWM                      (17)
+#define MOTOR_MAX_PWM                       (28)
+
+/*
+ * 小于这个PWM时电机通常无法启动。
+ * 因此低于该值时直接按0处理。
+ */
+#define MOTOR_MIN_EFFECTIVE_PWM             (8)
+
+
+/*============================================================
+ * 丢线后的找线速度
+ *============================================================*/
+
+/*
+ * 黑线最后在左侧：
+ *   左轮慢、右轮快，继续向左找线。
+ *
+ * 黑线最后在右侧：
+ *   左轮快、右轮慢，继续向右找线。
+ */
+
+#define LOST_LINE_OUTER_PWM                 (30)
+#define LOST_LINE_INNER_PWM                 (5)
+/* 直线状态短暂丢线时继续慢速直行。 */
+#define LOST_LINE_STRAIGHT_PWM              (32)
+
+
+/*============================================================
+ * PWM平滑参数
+ *============================================================*/
+
+/*
+ * 每5ms速度最多变化多少。
+ *
+ * 数值小：
+ *   更平滑，但转弯反应稍慢。
+ *
+ * 数值大：
+ *   转弯灵敏，但可能摇头。
+ */
+#define PWM_SLEW_STEP                       (3)
+#define STARTUP_SLEW_STEP                   (1)
+
+
+/*============================================================
+ * PD循迹参数
+ *============================================================*/
+
+/*
+ * 六路传感器位置权重：
+ *
+ * 最左     左中     左内     右内     右中     最右
+ * -500     -300     -100     +100     +300     +500
+ *
+ * correction =
+ *     error × 7 / 100
+ *   + error变化量 × 4 / 100
+ *
+ * 左右摇晃较大：
+ *   减小 LINE_KP_NUM；
+ *   或者减小 LINE_KD_NUM。
+ *
+ * 转弯不够灵敏：
+ *   增大 LINE_KP_NUM；
+ *   或者增大 MAX_STEERING_CORRECTION。
+ */
+
+#define LINE_KP_NUM                         (4)
+#define LINE_KP_DEN                         (120)
+
+#define LINE_KD_NUM                         (5)
+#define LINE_KD_DEN                         (100)
+
+#define MAX_STEERING_CORRECTION             (45)
+
+
+/*============================================================
+ * I2C错误保护
+ *============================================================*/
+
+/*
+ * 5ms读取一次。
+ * 连续20次失败约等于100ms，随后停车。
+ */
+#define SENSOR_FAIL_STOP_COUNT              (20U)
+
+
+/*============================================================
+ * 六路传感器I2C参数
+ *============================================================*/
+
+#define LINE_SENSOR_I2C_ADDRESS             (0x5CU)
+#define LINE_SENSOR_DIGITAL_REGISTER        (0x05U)
+
+/*
+ * 软件I2C延时。
+ *
+ * CPU为32MHz时，实际通信速率大约50~100kHz。
+ */
+#define SOFT_I2C_DELAY_LOOPS                 (36U)
+
+#define SOFT_I2C_CLOCK_STRETCH_TIMEOUT       (3000U)
+
+
+/*============================================================
+ * 起步、停车与OLED参数
+ *============================================================*/
+
+/* 起步前段限制最大PWM，先克服静摩擦，再逐渐放开速度。 */
+#define STARTUP_INITIAL_PWM_LIMIT            (13)
+#define STARTUP_HOLD_TIME_MS                 (150U)
+#define STARTUP_RAMP_TIME_MS                 (1050U)
+
+/* 至少4路持续检测到黑线约30ms后锁定停车。 */
+#define STOP_BLACK_MIN_COUNT                 (4U)
+#define STOP_CONFIRM_COUNT                   (6U)
+
+/* SSD1306 OLED：128x64，常见I2C地址0x3C。 */
+#define OLED_I2C_ADDRESS                     (0x3CU)
+#define OLED_REFRESH_INTERVAL_MS             (100U)
+#define OLED_SOFT_I2C_DELAY_LOOPS             (8U)
+#define OLED_CLOCK_STRETCH_TIMEOUT            (3000U)
+
+
+/*============================================================
+ * 引脚定义
+ *============================================================*/
+
+/*---------------- 左电机 ----------------*/
+
+#define LEFT_IN1_PORT                       (GPIOB)
+#define LEFT_IN1_PIN                        (DL_GPIO_PIN_2)
+
+#define LEFT_IN2_PORT                       (GPIOA)
+#define LEFT_IN2_PIN                        (DL_GPIO_PIN_7)
+
+#define LEFT_EN_PORT                        (GPIOB)
+#define LEFT_EN_PIN                         (DL_GPIO_PIN_8)
+
+
+/*---------------- 右电机 ----------------*/
+
+#define RIGHT_IN3_PORT                      (GPIOB)
+#define RIGHT_IN3_PIN                       (DL_GPIO_PIN_9)
+
+#define RIGHT_IN4_PORT                      (GPIOB)
+#define RIGHT_IN4_PIN                       (DL_GPIO_PIN_14)
+
+#define RIGHT_EN_PORT                       (GPIOB)
+#define RIGHT_EN_PIN                        (DL_GPIO_PIN_7)
+
+
+/*---------------- 状态LED ----------------*/
+
+#define STATUS_LED_PORT                     (GPIOA)
+#define STATUS_LED_PIN                      (DL_GPIO_PIN_5)
+
+
+/*---------------- 六路传感器 ----------------*/
+
+#define LINE_SDA_PORT                       (GPIOA)
+#define LINE_SDA_PIN                        (DL_GPIO_PIN_23)
+
+#define LINE_SCL_PORT                       (GPIOB)
+#define LINE_SCL_PIN                        (DL_GPIO_PIN_24)
+
+
+/*---------------- OLED软件I2C ----------------*/
+
+#define OLED_SDA_PORT                       (GPIOA)
+#define OLED_SDA_PIN                        (DL_GPIO_PIN_0)
+
+#define OLED_SCL_PORT                       (GPIOA)
+#define OLED_SCL_PIN                        (DL_GPIO_PIN_1)
+
+
+/*============================================================
+ * 全局变量
+ *============================================================*/
+
+/* 软件PWM相位，范围0~99。 */
+static volatile uint8_t g_pwm_phase = 0U;
+
+/* 当前真正输出的左右PWM。 */
+static volatile uint8_t g_left_pwm = 0U;
+static volatile uint8_t g_right_pwm = 0U;
+
+/* 循迹控制周期计数。 */
+static volatile uint16_t g_control_tick = 0U;
+static volatile uint8_t g_control_due = 0U;
+
+/* 系统毫秒计时。 */
+static volatile uint8_t g_ms_divider = 0U;
+static volatile uint32_t g_system_ms = 0U;
+
+
+/* 当前平滑后的左右电机指令。 */
+static int16_t g_left_current_cmd = 0;
+static int16_t g_right_current_cmd = 0;
+
+/* 最后一次有效循迹误差。 */
+static int16_t g_last_valid_error = 0;
+
+/* 滤波后的误差。 */
+static int16_t g_filtered_error = 0;
+
+/* 上一次滤波误差，用于D项。 */
+static int16_t g_previous_filtered_error = 0;
+
+/* 连续通信失败次数。 */
+static uint8_t g_sensor_fail_count = 0U;
+
+/* 最近一次六路检测结果，调试时可观察。 */
+static uint8_t g_last_line_bits = 0U;
+
+
+/* 当前检测到黑线的路数。 */
+static volatile uint8_t g_black_sensor_count = 0U;
+
+/* 停车线连续确认次数。 */
+static uint8_t g_stop_confirm_count = 0U;
+
+/* 停车锁存，置1后不会再次启动。 */
+static volatile bool g_stop_latched = false;
+
+/* 运行计时。 */
+static volatile bool g_run_started = false;
+static volatile uint32_t g_run_elapsed_ms = 0U;
+static uint32_t g_run_start_ms = 0U;
+
+/* OLED刷新控制。 */
+static uint32_t g_last_oled_refresh_ms = 0U;
+static volatile bool g_oled_force_refresh = true;
+
+/* OLED显存：128列×8页。 */
+static uint8_t g_oled_buffer[1024];
+
+
+/*============================================================
+ * 基础工具函数
+ *============================================================*/
+
+static int16_t ClampI16(
+    int16_t value,
+    int16_t minimum,
+    int16_t maximum)
+{
+    if (value < minimum)
+    {
+        return minimum;
+    }
+
+    if (value > maximum)
+    {
+        return maximum;
+    }
+
+    return value;
+}
+
+
+static uint8_t AbsToU8(int16_t value)
+{
+    if (value < 0)
+    {
+        value = (int16_t)(-value);
+    }
+
+    if (value > 100)
+    {
+        value = 100;
+    }
+
+    return (uint8_t)value;
+}
+
+
+static int16_t ApproachI16(
+    int16_t current,
+    int16_t target,
+    int16_t step)
+{
+    if (current < target)
+    {
+        current = (int16_t)(current + step);
+
+        if (current > target)
+        {
+            current = target;
+        }
+    }
+    else if (current > target)
+    {
+        current = (int16_t)(current - step);
+
+        if (current < target)
+        {
+            current = target;
+        }
+    }
+
+    return current;
+}
+
+
+static void ShortDelay(volatile uint32_t loops)
+{
+    while (loops > 0U)
+    {
+        __NOP();
+        loops--;
+    }
+}
+
+
+/*============================================================
+ * 左电机方向控制
+ *============================================================*/
+
+static void LeftMotor_SetDirection(int16_t command)
+{
+#if LEFT_MOTOR_REVERSE
+    command = (int16_t)(-command);
+#endif
+
+    if (command > 0)
+    {
+        /* 左电机前进。 */
+        DL_GPIO_setPins(
+            LEFT_IN1_PORT,
+            LEFT_IN1_PIN);
+
+        DL_GPIO_clearPins(
+            LEFT_IN2_PORT,
+            LEFT_IN2_PIN);
+    }
+    else if (command < 0)
+    {
+        /* 左电机后退。 */
+        DL_GPIO_clearPins(
+            LEFT_IN1_PORT,
+            LEFT_IN1_PIN);
+
+        DL_GPIO_setPins(
+            LEFT_IN2_PORT,
+            LEFT_IN2_PIN);
+    }
+    else
+    {
+        /* 左电机停止。 */
+        DL_GPIO_clearPins(
+            LEFT_IN1_PORT,
+            LEFT_IN1_PIN);
+
+        DL_GPIO_clearPins(
+            LEFT_IN2_PORT,
+            LEFT_IN2_PIN);
+    }
+}
+
+
+/*============================================================
+ * 右电机方向控制
+ *============================================================*/
+
+static void RightMotor_SetDirection(int16_t command)
+{
+#if RIGHT_MOTOR_REVERSE
+    command = (int16_t)(-command);
+#endif
+
+    if (command > 0)
+    {
+        /* 右电机前进。 */
+        DL_GPIO_setPins(
+            RIGHT_IN3_PORT,
+            RIGHT_IN3_PIN);
+
+        DL_GPIO_clearPins(
+            RIGHT_IN4_PORT,
+            RIGHT_IN4_PIN);
+    }
+    else if (command < 0)
+    {
+        /* 右电机后退。 */
+        DL_GPIO_clearPins(
+            RIGHT_IN3_PORT,
+            RIGHT_IN3_PIN);
+
+        DL_GPIO_setPins(
+            RIGHT_IN4_PORT,
+            RIGHT_IN4_PIN);
+    }
+    else
+    {
+        /* 右电机停止。 */
+        DL_GPIO_clearPins(
+            RIGHT_IN3_PORT,
+            RIGHT_IN3_PIN);
+
+        DL_GPIO_clearPins(
+            RIGHT_IN4_PORT,
+            RIGHT_IN4_PIN);
+    }
+}
+
+
+/*============================================================
+ * 提交电机指令
+ *============================================================*/
+
+static void Motor_CommitCommand(
+    int16_t left_command,
+    int16_t right_command)
+{
+    uint8_t left_pwm;
+    uint8_t right_pwm;
+
+    left_command = ClampI16(
+        left_command,
+        -100,
+        100);
+
+    right_command = ClampI16(
+        right_command,
+        -100,
+        100);
+
+    left_pwm = AbsToU8(left_command);
+    right_pwm = AbsToU8(right_command);
+
+    /*
+     * PWM太小时电机无法克服静摩擦，
+     * 直接按照0处理。
+     */
+    if ((left_pwm > 0U) &&
+        (left_pwm < MOTOR_MIN_EFFECTIVE_PWM))
+    {
+        left_pwm = 0U;
+        left_command = 0;
+    }
+
+    if ((right_pwm > 0U) &&
+        (right_pwm < MOTOR_MIN_EFFECTIVE_PWM))
+    {
+        right_pwm = 0U;
+        right_command = 0;
+    }
+
+    /*
+     * 切换方向之前先关闭使能，
+     * 防止电机切换时突然冲击。
+     */
+    __disable_irq();
+
+    DL_GPIO_clearPins(
+        LEFT_EN_PORT,
+        LEFT_EN_PIN);
+
+    DL_GPIO_clearPins(
+        RIGHT_EN_PORT,
+        RIGHT_EN_PIN);
+
+    LeftMotor_SetDirection(left_command);
+    RightMotor_SetDirection(right_command);
+
+    g_left_pwm = left_pwm;
+    g_right_pwm = right_pwm;
+
+    __enable_irq();
+}
+
+
+/*============================================================
+ * 平滑改变电机速度
+ *============================================================*/
+
+static void Motor_RampTo(
+    int16_t left_target,
+    int16_t right_target)
+{
+    uint32_t startup_elapsed;
+    int16_t pwm_limit = 100;
+    int16_t slew_step = PWM_SLEW_STEP;
+
+    /*
+     * 停车线触发后锁存，后续任何循迹指令都不能重新启动。
+     */
+    if (g_stop_latched)
+    {
+        g_left_current_cmd = 0;
+        g_right_current_cmd = 0;
+        Motor_CommitCommand(0, 0);
+        return;
+    }
+
+    /*
+     * 第一次出现非零目标速度时开始计时。
+     */
+    if ((!g_run_started) &&
+        ((left_target != 0) ||
+         (right_target != 0)))
+    {
+        g_run_started = true;
+        g_run_elapsed_ms = 0U;
+        g_run_start_ms = g_system_ms;
+        g_oled_force_refresh = true;
+    }
+
+    /*
+     * 起步阶段：
+     * 1. 前150ms把最大PWM限制在13，避免突然冲出；
+     * 2. 随后1050ms线性放开到MOTOR_MAX_PWM；
+     * 3. 起步阶段每5ms只改变1个PWM，进一步减小冲击。
+     */
+    if (g_run_started)
+    {
+        startup_elapsed =
+            g_system_ms - g_run_start_ms;
+
+        if (startup_elapsed <
+            STARTUP_HOLD_TIME_MS)
+        {
+            pwm_limit =
+                STARTUP_INITIAL_PWM_LIMIT;
+
+            slew_step =
+                STARTUP_SLEW_STEP;
+        }
+        else if (startup_elapsed <
+                 (STARTUP_HOLD_TIME_MS +
+                  STARTUP_RAMP_TIME_MS))
+        {
+            uint32_t ramp_elapsed =
+                startup_elapsed -
+                STARTUP_HOLD_TIME_MS;
+
+            pwm_limit =
+                (int16_t)(
+                    STARTUP_INITIAL_PWM_LIMIT +
+                    ((uint32_t)(
+                        MOTOR_MAX_PWM -
+                        STARTUP_INITIAL_PWM_LIMIT) *
+                     ramp_elapsed) /
+                    STARTUP_RAMP_TIME_MS);
+
+            slew_step =
+                STARTUP_SLEW_STEP;
+        }
+    }
+
+    left_target =
+        ClampI16(
+            left_target,
+            (int16_t)(-pwm_limit),
+            pwm_limit);
+
+    right_target =
+        ClampI16(
+            right_target,
+            (int16_t)(-pwm_limit),
+            pwm_limit);
+
+    g_left_current_cmd = ApproachI16(
+        g_left_current_cmd,
+        left_target,
+        slew_step);
+
+    g_right_current_cmd = ApproachI16(
+        g_right_current_cmd,
+        right_target,
+        slew_step);
+
+    Motor_CommitCommand(
+        g_left_current_cmd,
+        g_right_current_cmd);
+}
+
+
+/*============================================================
+ * 立即停车
+ *============================================================*/
+
+static void Motor_StopImmediately(void)
+{
+    g_left_current_cmd = 0;
+    g_right_current_cmd = 0;
+
+    Motor_CommitCommand(0, 0);
+}
+
+
+/*============================================================
+ * 软件I2C
+ *
+ * I2C要求开漏输出：
+ *
+ * 输出低电平：
+ *   将GPIO设置为输出，并输出0。
+ *
+ * 输出高电平：
+ *   将GPIO切换为输入，释放总线，
+ *   由外部上拉电阻拉高。
+ *============================================================*/
+
+static void I2C_Delay(void)
+{
+    ShortDelay(SOFT_I2C_DELAY_LOOPS);
+}
+
+
+/*---------------- SDA控制 ----------------*/
+
+static void SDA_DriveLow(void)
+{
+    DL_GPIO_clearPins(
+        LINE_SDA_PORT,
+        LINE_SDA_PIN);
+
+    DL_GPIO_enableOutput(
+        LINE_SDA_PORT,
+        LINE_SDA_PIN);
+}
+
+
+static void SDA_Release(void)
+{
+    DL_GPIO_disableOutput(
+        LINE_SDA_PORT,
+        LINE_SDA_PIN);
+}
+
+
+static bool SDA_Read(void)
+{
+    return (
+        (DL_GPIO_readPins(
+            LINE_SDA_PORT,
+            LINE_SDA_PIN) &
+         LINE_SDA_PIN) != 0U);
+}
+
+
+/*---------------- SCL控制 ----------------*/
+
+static void SCL_DriveLow(void)
+{
+    DL_GPIO_clearPins(
+        LINE_SCL_PORT,
+        LINE_SCL_PIN);
+
+    DL_GPIO_enableOutput(
+        LINE_SCL_PORT,
+        LINE_SCL_PIN);
+}
+
+
+static void SCL_Release(void)
+{
+    DL_GPIO_disableOutput(
+        LINE_SCL_PORT,
+        LINE_SCL_PIN);
+}
+
+
+static bool SCL_Read(void)
+{
+    return (
+        (DL_GPIO_readPins(
+            LINE_SCL_PORT,
+            LINE_SCL_PIN) &
+         LINE_SCL_PIN) != 0U);
+}
+
+
+/*============================================================
+ * 释放SCL并等待其真正变成高电平
+ *============================================================*/
+
+static bool SCL_ReleaseAndWaitHigh(void)
+{
+    uint32_t timeout =
+        SOFT_I2C_CLOCK_STRETCH_TIMEOUT;
+
+    SCL_Release();
+
+    while (timeout > 0U)
+    {
+        if (SCL_Read())
+        {
+            return true;
+        }
+
+        timeout--;
+    }
+
+    return false;
+}
+
+
+/*============================================================
+ * I2C停止信号
+ *============================================================*/
+
+static void SoftI2C_Stop(void)
+{
+    SDA_DriveLow();
+    I2C_Delay();
+
+    (void)SCL_ReleaseAndWaitHigh();
+    I2C_Delay();
+
+    SDA_Release();
+    I2C_Delay();
+}
+
+
+/*============================================================
+ * I2C起始或重复起始信号
+ *============================================================*/
+
+static bool SoftI2C_Start(void)
+{
+    SDA_Release();
+
+    if (!SCL_ReleaseAndWaitHigh())
+    {
+        return false;
+    }
+
+    I2C_Delay();
+
+    /*
+     * SCL和SDA均应该为高电平。
+     * 如果SDA仍然是低电平，说明总线被占用。
+     */
+    if (!SDA_Read())
+    {
+        return false;
+    }
+
+    SDA_DriveLow();
+    I2C_Delay();
+
+    SCL_DriveLow();
+    I2C_Delay();
+
+    return true;
+}
+
+
+/*============================================================
+ * I2C发送一个字节
+ *============================================================*/
+
+static bool SoftI2C_WriteByte(uint8_t data)
+{
+    uint8_t i;
+    bool ack;
+
+    for (i = 0U; i < 8U; i++)
+    {
+        if ((data & 0x80U) != 0U)
+        {
+            SDA_Release();
+        }
+        else
+        {
+            SDA_DriveLow();
+        }
+
+        I2C_Delay();
+
+        if (!SCL_ReleaseAndWaitHigh())
+        {
+            SCL_DriveLow();
+            SDA_Release();
+
+            return false;
+        }
+
+        I2C_Delay();
+
+        SCL_DriveLow();
+        I2C_Delay();
+
+        data <<= 1U;
+    }
+
+    /*
+     * 第9个时钟读取ACK。
+     * 从机拉低SDA代表应答。
+     */
+    SDA_Release();
+    I2C_Delay();
+
+    if (!SCL_ReleaseAndWaitHigh())
+    {
+        SCL_DriveLow();
+
+        return false;
+    }
+
+    I2C_Delay();
+
+    ack = !SDA_Read();
+
+    SCL_DriveLow();
+    I2C_Delay();
+
+    return ack;
+}
+
+
+/*============================================================
+ * I2C读取一个字节
+ *============================================================*/
+
+static bool SoftI2C_ReadByte(
+    uint8_t *data,
+    bool send_ack)
+{
+    uint8_t i;
+    uint8_t value = 0U;
+
+    if (data == (void *)0)
+    {
+        return false;
+    }
+
+    SDA_Release();
+
+    for (i = 0U; i < 8U; i++)
+    {
+        value <<= 1U;
+
+        I2C_Delay();
+
+        if (!SCL_ReleaseAndWaitHigh())
+        {
+            SCL_DriveLow();
+
+            return false;
+        }
+
+        I2C_Delay();
+
+        if (SDA_Read())
+        {
+            value |= 0x01U;
+        }
+
+        SCL_DriveLow();
+        I2C_Delay();
+    }
+
+    /*
+     * 继续读取时发送ACK；
+     * 最后一个字节发送NACK。
+     */
+    if (send_ack)
+    {
+        SDA_DriveLow();
+    }
+    else
+    {
+        SDA_Release();
+    }
+
+    I2C_Delay();
+
+    if (!SCL_ReleaseAndWaitHigh())
+    {
+        SCL_DriveLow();
+        SDA_Release();
+
+        return false;
+    }
+
+    I2C_Delay();
+
+    SCL_DriveLow();
+    SDA_Release();
+    I2C_Delay();
+
+    *data = value;
+
+    return true;
+}
+
+
+/*============================================================
+ * I2C总线恢复
+ *============================================================*/
+
+static void SoftI2C_BusRecover(void)
+{
+    uint8_t i;
+
+    SDA_Release();
+    SCL_Release();
+
+    I2C_Delay();
+
+    /*
+     * SDA被从机一直拉低时，
+     * 发送9个恢复时钟。
+     */
+    for (i = 0U; i < 9U; i++)
+    {
+        SCL_DriveLow();
+        I2C_Delay();
+
+        SCL_Release();
+        I2C_Delay();
+    }
+
+    SoftI2C_Stop();
+}
+
+
+/*============================================================
+ * 读取六路巡线数字结果
+ *============================================================*/
+
+static bool LineSensor_ReadDigital(
+    uint8_t *digital_result)
+{
+    uint8_t attempt;
+    uint8_t value = 0U;
+
+    if (digital_result == (void *)0)
+    {
+        return false;
+    }
+
+    /*
+     * 每次最多尝试3次，
+     * 增强I2C通信稳定性。
+     */
+    for (attempt = 0U;
+         attempt < 3U;
+         attempt++)
+    {
+        /*
+         * 起始信号。
+         */
+        if (!SoftI2C_Start())
+        {
+            SoftI2C_BusRecover();
+            continue;
+        }
+
+        /*
+         * 发送从机地址，写方向：
+         *
+         * 0x5C << 1 = 0xB8。
+         */
+        if (!SoftI2C_WriteByte(
+                (uint8_t)(
+                    LINE_SENSOR_I2C_ADDRESS
+                    << 1U)))
+        {
+            SoftI2C_Stop();
+            continue;
+        }
+
+        /*
+         * 发送需要读取的寄存器地址0x05。
+         */
+        if (!SoftI2C_WriteByte(
+                LINE_SENSOR_DIGITAL_REGISTER))
+        {
+            SoftI2C_Stop();
+            continue;
+        }
+
+        /*
+         * 重复起始信号。
+         */
+        if (!SoftI2C_Start())
+        {
+            SoftI2C_Stop();
+            continue;
+        }
+
+        /*
+         * 发送从机地址，读方向：
+         *
+         * 0xB8 | 1 = 0xB9。
+         */
+        if (!SoftI2C_WriteByte(
+                (uint8_t)(
+                    (LINE_SENSOR_I2C_ADDRESS
+                     << 1U) |
+                    0x01U)))
+        {
+            SoftI2C_Stop();
+            continue;
+        }
+
+        /*
+         * 只读取1字节。
+         * 最后一个字节发送NACK。
+         */
+        if (!SoftI2C_ReadByte(
+                &value,
+                false))
+        {
+            SoftI2C_Stop();
+            continue;
+        }
+
+        SoftI2C_Stop();
+
+        /*
+         * 只保留低6位。
+         */
+        *digital_result =
+            (uint8_t)(value & 0x3FU);
+
+        return true;
+    }
+
+    SoftI2C_BusRecover();
+
+    return false;
+}
+
+
+/*============================================================
+ * 反转六个bit
+ *============================================================*/
+
+static uint8_t Reverse6Bits(uint8_t value)
+{
+    uint8_t result = 0U;
+    uint8_t i;
+
+    value &= 0x3FU;
+
+    for (i = 0U; i < 6U; i++)
+    {
+        if ((value &
+             (uint8_t)(1U << i)) != 0U)
+        {
+            result |=
+                (uint8_t)(
+                    1U << (5U - i));
+        }
+    }
+
+    return result;
+}
+
+
+/*============================================================
+ * 将传感器结果统一为：
+ *
+ * bit0 = 小车最左侧
+ * bit1 = 左中
+ * bit2 = 左内
+ * bit3 = 右内
+ * bit4 = 右中
+ * bit5 = 小车最右侧
+ *============================================================*/
+
+static uint8_t NormalizeLineBits(
+    uint8_t raw_bits)
+{
+    uint8_t bits =
+        (uint8_t)(raw_bits & 0x3FU);
+
+#if (LINE_DETECTED_IS_1 == 0)
+
+    bits =
+        (uint8_t)((~bits) & 0x3FU);
+
+#endif
+
+    /*
+     * 手册中通道1在物理最右边，
+     * 通道6在物理最左边。
+     *
+     * 所以先将6bit反转。
+     */
+    bits = Reverse6Bits(bits);
+
+#if SENSOR_INSTALL_REVERSE
+
+    /*
+     * 如果传感器在车上左右装反，
+     * 再反转一次。
+     */
+    bits = Reverse6Bits(bits);
+
+#endif
+
+    return bits;
+}
+
+
+/*============================================================
+ * 计算六路巡线误差
+ *============================================================*/
+
+static bool CalculateLineError(
+    uint8_t line_bits,
+    int16_t *error)
+{
+    /*
+     * 从小车左侧到右侧：
+     *
+     * bit0  bit1  bit2  bit3  bit4  bit5
+     * -500  -300  -100  +100  +300  +500
+     */
+    static const int16_t weights[6] =
+    {
+        -500,
+        -300,
+        -100,
+         100,
+         300,
+         500
+    };
+
+    int32_t weighted_sum = 0;
+    uint8_t active_count = 0U;
+    uint8_t i;
+
+    if (error == (void *)0)
+    {
+        return false;
+    }
+
+    for (i = 0U; i < 6U; i++)
+    {
+        if ((line_bits &
+             (uint8_t)(1U << i)) != 0U)
+        {
+            weighted_sum += weights[i];
+            active_count++;
+        }
+    }
+
+    if (active_count == 0U)
+    {
+        return false;
+    }
+
+    /*
+     * 多路同时压线时取平均位置。
+     */
+    *error =
+        (int16_t)(
+            weighted_sum /
+            (int32_t)active_count);
+
+    return true;
+}
+
+
+/*============================================================
+ * 丢线处理
+ *============================================================*/
+
+static void LineLost_Control(void)
+{
+    int16_t left_target;
+    int16_t right_target;
+
+    if (g_last_valid_error < -60)
+    {
+        /*
+         * 黑线最后出现在左侧：
+         * 左轮慢、右轮快。
+         */
+        left_target =
+            LOST_LINE_INNER_PWM;
+
+        right_target =
+            LOST_LINE_OUTER_PWM;
+    }
+    else if (g_last_valid_error > 60)
+    {
+        /*
+         * 黑线最后出现在右侧：
+         * 左轮快、右轮慢。
+         */
+        left_target =
+            LOST_LINE_OUTER_PWM;
+
+        right_target =
+            LOST_LINE_INNER_PWM;
+    }
+    else
+    {
+        /*
+         * 直线状态下短暂丢线：
+         * 继续缓慢直行。
+         */
+        left_target =
+            LOST_LINE_STRAIGHT_PWM;
+
+        right_target =
+            LOST_LINE_STRAIGHT_PWM;
+    }
+
+    Motor_RampTo(
+        left_target,
+        right_target);
+}
+
+
+/*============================================================
+ * 统计六路中检测到黑线的数量
+ *============================================================*/
+
+static uint8_t CountBlackBits(uint8_t line_bits)
+{
+    uint8_t count = 0U;
+    uint8_t i;
+
+    line_bits &= 0x3FU;
+
+    for (i = 0U; i < 6U; i++)
+    {
+        if ((line_bits &
+             (uint8_t)(1U << i)) != 0U)
+        {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+
+/*============================================================
+ * 锁存停车
+ *============================================================*/
+
+static void StopSystem_Latch(void)
+{
+    if (!g_stop_latched)
+    {
+        g_stop_latched = true;
+        g_stop_confirm_count = 0U;
+
+        Motor_StopImmediately();
+
+        DL_GPIO_clearPins(
+            STATUS_LED_PORT,
+            STATUS_LED_PIN);
+
+        g_oled_force_refresh = true;
+    }
+}
+
+
+/*============================================================
+ * 六路循迹控制
+ *============================================================*/
+
+static void LineFollow_Control(
+    uint8_t raw_bits)
+{
+    uint8_t line_bits;
+
+    int16_t current_error;
+    int16_t delta_error;
+
+    int32_t correction_32;
+    int16_t correction;
+
+    int16_t left_target;
+    int16_t right_target;
+
+    line_bits =
+        NormalizeLineBits(raw_bits);
+
+    g_last_line_bits = line_bits;
+
+    /*
+     * 停止系统：
+     * 连续检测到至少4路黑线约30ms后锁定停车。
+     */
+    g_black_sensor_count =
+        CountBlackBits(line_bits);
+
+    if (g_black_sensor_count >=
+        STOP_BLACK_MIN_COUNT)
+    {
+        if (g_stop_confirm_count <
+            STOP_CONFIRM_COUNT)
+        {
+            g_stop_confirm_count++;
+        }
+
+        if (g_stop_confirm_count >=
+            STOP_CONFIRM_COUNT)
+        {
+            StopSystem_Latch();
+            return;
+        }
+    }
+    else
+    {
+        g_stop_confirm_count = 0U;
+    }
+
+    /*
+     * 六路全部没有检测到黑线。
+     */
+    if (line_bits == 0U)
+    {
+        LineLost_Control();
+
+        return;
+    }
+
+    /*
+     * 六路全部检测到黑线。
+     */
+    if (line_bits == 0x3FU)
+    {
+#if STOP_ON_ALL_BLACK
+
+        Motor_StopImmediately();
+
+        return;
+
+#else
+
+        /*
+         * 当作十字线或宽黑线，
+         * 保持直行。
+         */
+        current_error = 0;
+
+#endif
+    }
+    else if (!CalculateLineError(
+                 line_bits,
+                 &current_error))
+    {
+        LineLost_Control();
+
+        return;
+    }
+
+    /*
+     * 保存最后一次有效误差，
+     * 丢线时按照这个方向找线。
+     */
+    g_last_valid_error =
+        current_error;
+
+    /*
+     * 一阶低通滤波：
+     *
+     * 新误差 =
+     *   2/3旧误差 + 1/3当前误差。
+     *
+     * 可以减小左右摇头。
+     */
+    g_filtered_error =
+        (int16_t)(
+            ((int32_t)g_filtered_error * 2 +
+             current_error) /
+            3);
+
+    /*
+     * 计算误差变化量。
+     */
+    delta_error =
+        (int16_t)(
+            g_filtered_error -
+            g_previous_filtered_error);
+
+    g_previous_filtered_error =
+        g_filtered_error;
+
+    /*
+     * PD控制。
+     */
+    correction_32 =
+        ((int32_t)g_filtered_error *
+         LINE_KP_NUM) /
+        LINE_KP_DEN +
+
+        ((int32_t)delta_error *
+         LINE_KD_NUM) /
+        LINE_KD_DEN;
+
+    correction =
+        ClampI16(
+            (int16_t)correction_32,
+            -MAX_STEERING_CORRECTION,
+            MAX_STEERING_CORRECTION);
+
+    /*
+     * error > 0：
+     *   黑线在右侧。
+     *   左轮加速、右轮减速，向右转。
+     *
+     * error < 0：
+     *   黑线在左侧。
+     *   左轮减速、右轮加速，向左转。
+     */
+    left_target =
+        (int16_t)(
+            MOTOR_BASE_PWM +
+            correction);
+
+    right_target =
+        (int16_t)(
+            MOTOR_BASE_PWM -
+            correction);
+
+    /*
+     * 限制左右轮速度。
+     */
+    left_target =
+        ClampI16(
+            left_target,
+            0,
+            MOTOR_MAX_PWM);
+
+    right_target =
+        ClampI16(
+            right_target,
+            0,
+            MOTOR_MAX_PWM);
+
+    /*
+     * 平滑更新电机速度。
+     */
+    Motor_RampTo(
+        left_target,
+        right_target);
+}
+
+
+/*============================================================
+ * OLED软件I2C与显示
+ * PA0=SDA，PA1=SCL，SSD1306 128x64
+ *============================================================*/
+
+static void OLED_Delay(void)
+{
+    ShortDelay(OLED_SOFT_I2C_DELAY_LOOPS);
+}
+
+static void OLED_SDA_DriveLow(void)
+{
+    DL_GPIO_clearPins(
+        OLED_SDA_PORT,
+        OLED_SDA_PIN);
+
+    DL_GPIO_enableOutput(
+        OLED_SDA_PORT,
+        OLED_SDA_PIN);
+}
+
+static void OLED_SDA_Release(void)
+{
+    DL_GPIO_disableOutput(
+        OLED_SDA_PORT,
+        OLED_SDA_PIN);
+}
+
+static bool OLED_SDA_Read(void)
+{
+    return (
+        (DL_GPIO_readPins(
+            OLED_SDA_PORT,
+            OLED_SDA_PIN) &
+         OLED_SDA_PIN) != 0U);
+}
+
+static void OLED_SCL_DriveLow(void)
+{
+    DL_GPIO_clearPins(
+        OLED_SCL_PORT,
+        OLED_SCL_PIN);
+
+    DL_GPIO_enableOutput(
+        OLED_SCL_PORT,
+        OLED_SCL_PIN);
+}
+
+static void OLED_SCL_Release(void)
+{
+    DL_GPIO_disableOutput(
+        OLED_SCL_PORT,
+        OLED_SCL_PIN);
+}
+
+static bool OLED_SCL_Read(void)
+{
+    return (
+        (DL_GPIO_readPins(
+            OLED_SCL_PORT,
+            OLED_SCL_PIN) &
+         OLED_SCL_PIN) != 0U);
+}
+
+static bool OLED_SCL_ReleaseAndWaitHigh(void)
+{
+    uint32_t timeout =
+        OLED_CLOCK_STRETCH_TIMEOUT;
+
+    OLED_SCL_Release();
+
+    while (timeout > 0U)
+    {
+        if (OLED_SCL_Read())
+        {
+            return true;
+        }
+
+        timeout--;
+    }
+
+    return false;
+}
+
+static bool OLED_I2C_Start(void)
+{
+    OLED_SDA_Release();
+
+    if (!OLED_SCL_ReleaseAndWaitHigh())
+    {
+        return false;
+    }
+
+    OLED_Delay();
+
+    OLED_SDA_DriveLow();
+    OLED_Delay();
+
+    OLED_SCL_DriveLow();
+    OLED_Delay();
+
+    return true;
+}
+
+static void OLED_I2C_Stop(void)
+{
+    OLED_SDA_DriveLow();
+    OLED_Delay();
+
+    (void)OLED_SCL_ReleaseAndWaitHigh();
+    OLED_Delay();
+
+    OLED_SDA_Release();
+    OLED_Delay();
+}
+
+static bool OLED_I2C_WriteByte(uint8_t data)
+{
+    uint8_t i;
+    bool ack;
+
+    for (i = 0U; i < 8U; i++)
+    {
+        if ((data & 0x80U) != 0U)
+        {
+            OLED_SDA_Release();
+        }
+        else
+        {
+            OLED_SDA_DriveLow();
+        }
+
+        OLED_Delay();
+
+        if (!OLED_SCL_ReleaseAndWaitHigh())
+        {
+            OLED_SCL_DriveLow();
+            OLED_SDA_Release();
+            return false;
+        }
+
+        OLED_Delay();
+        OLED_SCL_DriveLow();
+        OLED_Delay();
+
+        data <<= 1U;
+    }
+
+    OLED_SDA_Release();
+    OLED_Delay();
+
+    if (!OLED_SCL_ReleaseAndWaitHigh())
+    {
+        OLED_SCL_DriveLow();
+        return false;
+    }
+
+    OLED_Delay();
+    ack = !OLED_SDA_Read();
+
+    OLED_SCL_DriveLow();
+    OLED_Delay();
+
+    return ack;
+}
+
+static bool OLED_WriteCommandList(
+    const uint8_t *commands,
+    uint16_t length)
+{
+    uint16_t i;
+
+    if ((commands == (void *)0) ||
+        (length == 0U))
+    {
+        return false;
+    }
+
+    if (!OLED_I2C_Start())
+    {
+        return false;
+    }
+
+    if (!OLED_I2C_WriteByte(
+            (uint8_t)(
+                OLED_I2C_ADDRESS << 1U)))
+    {
+        OLED_I2C_Stop();
+        return false;
+    }
+
+    /* 0x00表示后面是命令。 */
+    if (!OLED_I2C_WriteByte(0x00U))
+    {
+        OLED_I2C_Stop();
+        return false;
+    }
+
+    for (i = 0U; i < length; i++)
+    {
+        if (!OLED_I2C_WriteByte(
+                commands[i]))
+        {
+            OLED_I2C_Stop();
+            return false;
+        }
+    }
+
+    OLED_I2C_Stop();
+    return true;
+}
+
+static bool OLED_UpdatePage(uint8_t page)
+{
+    uint8_t commands[3];
+    uint16_t x;
+    uint16_t offset;
+
+    if (page >= 8U)
+    {
+        return false;
+    }
+
+    commands[0] =
+        (uint8_t)(0xB0U | page);
+
+    commands[1] = 0x00U;
+    commands[2] = 0x10U;
+
+    if (!OLED_WriteCommandList(
+            commands,
+            3U))
+    {
+        return false;
+    }
+
+    if (!OLED_I2C_Start())
+    {
+        return false;
+    }
+
+    if (!OLED_I2C_WriteByte(
+            (uint8_t)(
+                OLED_I2C_ADDRESS << 1U)))
+    {
+        OLED_I2C_Stop();
+        return false;
+    }
+
+    /* 0x40表示后面是显示数据。 */
+    if (!OLED_I2C_WriteByte(0x40U))
+    {
+        OLED_I2C_Stop();
+        return false;
+    }
+
+    offset =
+        (uint16_t)page * 128U;
+
+    for (x = 0U; x < 128U; x++)
+    {
+        if (!OLED_I2C_WriteByte(
+                g_oled_buffer[
+                    offset + x]))
+        {
+            OLED_I2C_Stop();
+            return false;
+        }
+    }
+
+    OLED_I2C_Stop();
+    return true;
+}
+
+static void OLED_ClearBuffer(void)
+{
+    uint16_t i;
+
+    for (i = 0U;
+         i < sizeof(g_oled_buffer);
+         i++)
+    {
+        g_oled_buffer[i] = 0U;
+    }
+}
+
+static void OLED_SetPixel(
+    int16_t x,
+    int16_t y)
+{
+    uint16_t index;
+    uint8_t mask;
+
+    if ((x < 0) ||
+        (x >= 128) ||
+        (y < 0) ||
+        (y >= 64))
+    {
+        return;
+    }
+
+    index =
+        (uint16_t)(
+            (uint16_t)x +
+            ((uint16_t)y / 8U) *
+            128U);
+
+    mask =
+        (uint8_t)(
+            1U <<
+            ((uint16_t)y & 0x07U));
+
+    g_oled_buffer[index] |= mask;
+}
+
+/* 5x7字模，仅包含本程序需要的字符。 */
+static const uint8_t OLED_GLYPH_SPACE[5] =
+    {0x00U, 0x00U, 0x00U, 0x00U, 0x00U};
+static const uint8_t OLED_GLYPH_0[5] =
+    {0x3EU, 0x51U, 0x49U, 0x45U, 0x3EU};
+static const uint8_t OLED_GLYPH_1[5] =
+    {0x00U, 0x42U, 0x7FU, 0x40U, 0x00U};
+static const uint8_t OLED_GLYPH_2[5] =
+    {0x42U, 0x61U, 0x51U, 0x49U, 0x46U};
+static const uint8_t OLED_GLYPH_3[5] =
+    {0x21U, 0x41U, 0x45U, 0x4BU, 0x31U};
+static const uint8_t OLED_GLYPH_4[5] =
+    {0x18U, 0x14U, 0x12U, 0x7FU, 0x10U};
+static const uint8_t OLED_GLYPH_5[5] =
+    {0x27U, 0x45U, 0x45U, 0x45U, 0x39U};
+static const uint8_t OLED_GLYPH_6[5] =
+    {0x3CU, 0x4AU, 0x49U, 0x49U, 0x30U};
+static const uint8_t OLED_GLYPH_7[5] =
+    {0x01U, 0x71U, 0x09U, 0x05U, 0x03U};
+static const uint8_t OLED_GLYPH_8[5] =
+    {0x36U, 0x49U, 0x49U, 0x49U, 0x36U};
+static const uint8_t OLED_GLYPH_9[5] =
+    {0x06U, 0x49U, 0x49U, 0x29U, 0x1EU};
+static const uint8_t OLED_GLYPH_COLON[5] =
+    {0x00U, 0x36U, 0x36U, 0x00U, 0x00U};
+static const uint8_t OLED_GLYPH_DOT[5] =
+    {0x00U, 0x60U, 0x60U, 0x00U, 0x00U};
+static const uint8_t OLED_GLYPH_R[5] =
+    {0x7FU, 0x09U, 0x19U, 0x29U, 0x46U};
+static const uint8_t OLED_GLYPH_U[5] =
+    {0x3FU, 0x40U, 0x40U, 0x40U, 0x3FU};
+static const uint8_t OLED_GLYPH_N[5] =
+    {0x7FU, 0x02U, 0x0CU, 0x10U, 0x7FU};
+static const uint8_t OLED_GLYPH_T[5] =
+    {0x01U, 0x01U, 0x7FU, 0x01U, 0x01U};
+static const uint8_t OLED_GLYPH_I[5] =
+    {0x00U, 0x41U, 0x7FU, 0x41U, 0x00U};
+static const uint8_t OLED_GLYPH_M[5] =
+    {0x7FU, 0x02U, 0x0CU, 0x02U, 0x7FU};
+static const uint8_t OLED_GLYPH_E[5] =
+    {0x7FU, 0x49U, 0x49U, 0x49U, 0x41U};
+
+static const uint8_t *OLED_GetGlyph(char character)
+{
+    switch (character)
+    {
+        case '0': return OLED_GLYPH_0;
+        case '1': return OLED_GLYPH_1;
+        case '2': return OLED_GLYPH_2;
+        case '3': return OLED_GLYPH_3;
+        case '4': return OLED_GLYPH_4;
+        case '5': return OLED_GLYPH_5;
+        case '6': return OLED_GLYPH_6;
+        case '7': return OLED_GLYPH_7;
+        case '8': return OLED_GLYPH_8;
+        case '9': return OLED_GLYPH_9;
+        case ':': return OLED_GLYPH_COLON;
+        case '.': return OLED_GLYPH_DOT;
+        case 'R': return OLED_GLYPH_R;
+        case 'U': return OLED_GLYPH_U;
+        case 'N': return OLED_GLYPH_N;
+        case 'T': return OLED_GLYPH_T;
+        case 'I': return OLED_GLYPH_I;
+        case 'M': return OLED_GLYPH_M;
+        case 'E': return OLED_GLYPH_E;
+        case ' ':
+        default:
+            return OLED_GLYPH_SPACE;
+    }
+}
+
+static void OLED_DrawChar2x(
+    int16_t x,
+    int16_t y,
+    char character)
+{
+    const uint8_t *glyph;
+    uint8_t column;
+    uint8_t row;
+
+    glyph =
+        OLED_GetGlyph(character);
+
+    for (column = 0U;
+         column < 5U;
+         column++)
+    {
+        for (row = 0U;
+             row < 7U;
+             row++)
+        {
+            if ((glyph[column] &
+                 (uint8_t)(1U << row)) != 0U)
+            {
+                OLED_SetPixel(
+                    (int16_t)(
+                        x +
+                        (int16_t)column * 2),
+                    (int16_t)(
+                        y +
+                        (int16_t)row * 2));
+
+                OLED_SetPixel(
+                    (int16_t)(
+                        x +
+                        (int16_t)column * 2 +
+                        1),
+                    (int16_t)(
+                        y +
+                        (int16_t)row * 2));
+
+                OLED_SetPixel(
+                    (int16_t)(
+                        x +
+                        (int16_t)column * 2),
+                    (int16_t)(
+                        y +
+                        (int16_t)row * 2 +
+                        1));
+
+                OLED_SetPixel(
+                    (int16_t)(
+                        x +
+                        (int16_t)column * 2 +
+                        1),
+                    (int16_t)(
+                        y +
+                        (int16_t)row * 2 +
+                        1));
+            }
+        }
+    }
+}
+
+static void OLED_DrawString2x(
+    int16_t x,
+    int16_t y,
+    const char *text)
+{
+    while ((text != (void *)0) &&
+           (*text != '\0'))
+    {
+        OLED_DrawChar2x(
+            x,
+            y,
+            *text);
+
+        x = (int16_t)(x + 12);
+        text++;
+    }
+}
+
+static void OLED_FormatTime(
+    uint32_t elapsed_ms,
+    char text[9])
+{
+    uint32_t minutes;
+    uint32_t seconds;
+    uint32_t hundredths;
+
+    minutes =
+        elapsed_ms / 60000U;
+
+    if (minutes > 99U)
+    {
+        minutes = 99U;
+    }
+
+    seconds =
+        (elapsed_ms / 1000U) %
+        60U;
+
+    hundredths =
+        (elapsed_ms / 10U) %
+        100U;
+
+    text[0] =
+        (char)(
+            '0' +
+            (minutes / 10U));
+
+    text[1] =
+        (char)(
+            '0' +
+            (minutes % 10U));
+
+    text[2] = ':';
+
+    text[3] =
+        (char)(
+            '0' +
+            (seconds / 10U));
+
+    text[4] =
+        (char)(
+            '0' +
+            (seconds % 10U));
+
+    text[5] = '.';
+
+    text[6] =
+        (char)(
+            '0' +
+            (hundredths / 10U));
+
+    text[7] =
+        (char)(
+            '0' +
+            (hundredths % 10U));
+
+    text[8] = '\0';
+}
+
+static void OLED_ShowRunTime(uint32_t elapsed_ms)
+{
+    char time_text[9];
+
+    OLED_FormatTime(
+        elapsed_ms,
+        time_text);
+
+    OLED_ClearBuffer();
+
+    /* 8个字符×12像素=96像素，x=16后水平居中。 */
+    OLED_DrawString2x(
+        16,
+        8,
+        "RUN TIME");
+
+    OLED_DrawString2x(
+        16,
+        40,
+        time_text);
+
+    /*
+     * 只刷新有内容的4页，减少OLED刷新对循迹周期的影响。
+     */
+    (void)OLED_UpdatePage(1U);
+    (void)OLED_UpdatePage(2U);
+    (void)OLED_UpdatePage(5U);
+    (void)OLED_UpdatePage(6U);
+}
+
+static void OLED_Init(void)
+{
+    static const uint8_t init_commands[] =
+    {
+        0xAEU,
+        0x20U, 0x02U,
+        0xB0U,
+        0xC8U,
+        0x00U,
+        0x10U,
+        0x40U,
+        0x81U, 0x7FU,
+        0xA1U,
+        0xA6U,
+        0xA8U, 0x3FU,
+        0xA4U,
+        0xD3U, 0x00U,
+        0xD5U, 0x80U,
+        0xD9U, 0xF1U,
+        0xDAU, 0x12U,
+        0xDBU, 0x40U,
+        0x8DU, 0x14U,
+        0xAFU
+    };
+
+    uint8_t page;
+
+    OLED_SDA_Release();
+    OLED_SCL_Release();
+
+    ShortDelay(50000U);
+
+    (void)OLED_WriteCommandList(
+        init_commands,
+        (uint16_t)sizeof(
+            init_commands));
+
+    OLED_ClearBuffer();
+
+    for (page = 0U;
+         page < 8U;
+         page++)
+    {
+        (void)OLED_UpdatePage(page);
+    }
+}
+
+
+/*============================================================
+ * GPIO初始化
+ *============================================================*/
+
+static void ApplicationGPIO_Init(void)
+{
+    /*
+     * 先把所有电机引脚拉低。
+     */
+    DL_GPIO_clearPins(
+        GPIOB,
+        LEFT_IN1_PIN |
+        RIGHT_IN3_PIN |
+        RIGHT_IN4_PIN |
+        LEFT_EN_PIN |
+        RIGHT_EN_PIN);
+
+    DL_GPIO_clearPins(
+        GPIOA,
+        LEFT_IN2_PIN |
+        STATUS_LED_PIN);
+
+    /*
+     * 将电机相关GPIO设置为输出。
+     */
+    DL_GPIO_enableOutput(
+        GPIOB,
+        LEFT_IN1_PIN |
+        RIGHT_IN3_PIN |
+        RIGHT_IN4_PIN |
+        LEFT_EN_PIN |
+        RIGHT_EN_PIN);
+
+    DL_GPIO_enableOutput(
+        GPIOA,
+        LEFT_IN2_PIN |
+        STATUS_LED_PIN);
+
+    /*
+     * 软件I2C空闲状态：
+     * SDA和SCL均释放。
+     */
+    DL_GPIO_clearPins(
+        LINE_SDA_PORT,
+        LINE_SDA_PIN);
+
+    DL_GPIO_clearPins(
+        LINE_SCL_PORT,
+        LINE_SCL_PIN);
+
+    /*
+     * OLED软件I2C空闲状态。
+     */
+    DL_GPIO_clearPins(
+        OLED_SDA_PORT,
+        OLED_SDA_PIN);
+
+    DL_GPIO_clearPins(
+        OLED_SCL_PORT,
+        OLED_SCL_PIN);
+
+    SDA_Release();
+    SCL_Release();
+
+    OLED_SDA_Release();
+    OLED_SCL_Release();
+
+    Motor_StopImmediately();
+
+    SoftI2C_BusRecover();
+}
+
+
+/*============================================================
+ * SysTick中断
+ *============================================================*/
+
+void SysTick_Handler(void)
+{
+    /*
+     * 左电机软件PWM。
+     */
+    if (g_left_pwm > g_pwm_phase)
+    {
+        DL_GPIO_setPins(
+            LEFT_EN_PORT,
+            LEFT_EN_PIN);
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            LEFT_EN_PORT,
+            LEFT_EN_PIN);
+    }
+
+    /*
+     * 右电机软件PWM。
+     */
+    if (g_right_pwm > g_pwm_phase)
+    {
+        DL_GPIO_setPins(
+            RIGHT_EN_PORT,
+            RIGHT_EN_PIN);
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            RIGHT_EN_PORT,
+            RIGHT_EN_PIN);
+    }
+
+    /*
+     * 软件PWM相位更新。
+     */
+    g_pwm_phase++;
+
+    if (g_pwm_phase >=
+        PWM_PERIOD_COUNT)
+    {
+        g_pwm_phase = 0U;
+    }
+
+    /*
+     * 每5ms启动一次循迹计算。
+     */
+    g_control_tick++;
+
+    if (g_control_tick >=
+        CONTROL_INTERVAL_TICKS)
+    {
+        g_control_tick = 0U;
+        g_control_due = 1U;
+    }
+
+    /*
+     * 100us累计成1ms。
+     */
+    g_ms_divider++;
+
+    if (g_ms_divider >= 10U)
+    {
+        g_ms_divider = 0U;
+        g_system_ms++;
+
+        if (g_run_started &&
+            (!g_stop_latched))
+        {
+            g_run_elapsed_ms++;
+        }
+    }
+}
+
+
+/*============================================================
+ * 主函数
+ *============================================================*/
+
+int main(void)
+{
+    uint8_t raw_line_bits = 0U;
+    uint32_t oled_time_snapshot;
+
+    /*
+     * 初始化SysConfig生成的外设。
+     *
+     * 注意：
+     * PA0、PA1需要在SysConfig中配置成普通GPIO，
+     * 不要配置成硬件I2C复用功能。
+     */
+    SYSCFG_DL_init();
+
+    ApplicationGPIO_Init();
+
+    OLED_Init();
+    OLED_ShowRunTime(0U);
+
+    /*
+     * 启动10kHz SysTick。
+     */
+    DL_SYSTICK_config(
+        CPUCLK_FREQ /
+        SYSTICK_FREQUENCY_HZ);
+
+    DL_SYSTICK_enable();
+
+    /*
+     * 上电等待300ms，让六路传感器稳定。
+     */
+    /*
+ * 打开电源开关后保持停车15秒。
+ *
+ * 等待期间：
+ * 1. 左右电机保持停止；
+ * 2. OLED保持显示00:00.00；
+ * 3. 15秒不计入小车运行时间；
+ * 4. 15秒结束后才开始读取循迹传感器并启动。
+ */
+Motor_StopImmediately();
+
+while (g_system_ms < POWER_ON_START_DELAY_MS)
+{
+    __WFI();
+}
+
+/*
+ * 清除等待期间产生的控制请求，
+ * 从等待结束时重新开始一个完整的5ms控制周期。
+ */
+__disable_irq();
+
+g_control_due = 0U;
+g_control_tick = 0U;
+
+__enable_irq();
+
+/* 清除循迹控制历史量，保证起步状态干净。 */
+g_last_valid_error = 0;
+g_filtered_error = 0;
+g_previous_filtered_error = 0;
+g_sensor_fail_count = 0U;
+g_stop_confirm_count = 0U;
+
+g_last_oled_refresh_ms =
+    g_system_ms;
+
+    while (1)
+    {
+        /*
+         * 停车线尚未触发时才继续循迹。
+         */
+        if ((g_control_due != 0U) &&
+            (!g_stop_latched))
+        {
+            g_control_due = 0U;
+
+            if (LineSensor_ReadDigital(
+                    &raw_line_bits))
+            {
+                g_sensor_fail_count = 0U;
+
+                DL_GPIO_setPins(
+                    STATUS_LED_PORT,
+                    STATUS_LED_PIN);
+
+                LineFollow_Control(
+                    raw_line_bits);
+            }
+            else
+            {
+                DL_GPIO_clearPins(
+                    STATUS_LED_PORT,
+                    STATUS_LED_PIN);
+
+                if (g_sensor_fail_count <
+                    255U)
+                {
+                    g_sensor_fail_count++;
+                }
+
+                /*
+                 * 六路传感器连续通信失败约100ms后停车。
+                 * 通信恢复后仍可继续循迹；
+                 * 只有停车线触发才会永久锁存。
+                 */
+                if (g_sensor_fail_count >=
+                    SENSOR_FAIL_STOP_COUNT)
+                {
+                    Motor_StopImmediately();
+                }
+            }
+        }
+        else if (g_stop_latched)
+        {
+            /*
+             * 清除积累的控制请求，并持续保证电机关闭。
+             */
+            g_control_due = 0U;
+            Motor_StopImmediately();
+        }
+
+        /*
+         * OLED每100ms刷新一次。
+         * 停车时强制立即刷新并锁定最终时间。
+         */
+        if (g_oled_force_refresh ||
+            ((g_system_ms -
+              g_last_oled_refresh_ms) >=
+             OLED_REFRESH_INTERVAL_MS))
+        {
+            g_oled_force_refresh = false;
+
+            g_last_oled_refresh_ms =
+                g_system_ms;
+
+            __disable_irq();
+            oled_time_snapshot =
+                g_run_elapsed_ms;
+            __enable_irq();
+
+            OLED_ShowRunTime(
+                oled_time_snapshot);
+        }
+
+        __WFI();
+    }
+}
