@@ -1,0 +1,1611 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ * ================================================================
+ * MSPM0G3507 + JY60 + D36A + MS42C
+ *
+ * 仅使用JY60纵向加速度控制步进电机，不使用K230。
+ *
+ * 控制流程：
+ *
+ *   JY60纵向加速度
+ *          ↓
+ *   上电静止零偏校准
+ *          ↓
+ *   启动/停车独立低通滤波
+ *          ↓
+ *   theta = atan(a / g)
+ *          ↓
+ *   补偿增益、角度限幅、角速度限制
+ *          ↓
+ *   步进电机软件位置控制
+ *
+ * 功能：
+ *
+ * 1. 小车启动或加速时，轨道向补偿方向倾斜；
+ * 2. 小车减速或停车时，轨道向相反方向倾斜；
+ * 3. 小车匀速或静止时，步进电机自动回到软件零位；
+ * 4. JY60掉线后，步进电机缓慢回零；
+ * 5. 不需要K230，也不包含K230 UART、坐标、PID或预测代码。
+ *
+ * 接线：
+ *
+ *   JY60 TX  -> PA18，MSPM0 UART1 RX
+ *   JY60 RX  <- PA17，MSPM0 UART1 TX（只接收时可不接）
+ *   JY60 GND -> MSPM0 GND
+ *
+ *   PB1 -> D36A ST1
+ *   PB2 -> D36A DIR1
+ *   PB4 -> D36A EN1
+ *
+ * SysConfig要求：
+ *
+ *   UART1实例名称：JY60_UART
+ *   波特率：9600
+ *   数据位：8
+ *   停止位：1
+ *   校验：None
+ *
+ * 上电后前2秒：
+ *
+ *   1. 小车必须保持静止；
+ *   2. 手动把轨道调到机械水平位置；
+ *   3. 程序会把这时的位置作为步进电机软件零位；
+ *   4. 程序会同时标定JY60纵向加速度零偏。
+ * ================================================================
+ */
+
+
+/*==============================================================
+ * 1. 系统时钟与调度频率
+ *==============================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                         (32000000UL)
+#endif
+
+/* SysTick每100us进入一次，即10kHz。 */
+#define SYSTICK_FREQUENCY_HZ                (10000U)
+
+/* JY60补偿控制100Hz，每10ms执行一次。 */
+#define COMPENSATION_CONTROL_FREQUENCY_HZ   (100U)
+#define COMPENSATION_CONTROL_INTERVAL_TICKS \
+    (SYSTICK_FREQUENCY_HZ /                 \
+     COMPENSATION_CONTROL_FREQUENCY_HZ)
+#define COMPENSATION_CONTROL_DT_S           (0.01f)
+
+/* 步进电机位置环1kHz，每1ms执行一次。 */
+#define MOTOR_CONTROL_FREQUENCY_HZ          (1000U)
+#define MOTOR_CONTROL_INTERVAL_TICKS        \
+    (SYSTICK_FREQUENCY_HZ /                 \
+     MOTOR_CONTROL_FREQUENCY_HZ)
+#define MOTOR_CONTROL_DT_S                  (0.001f)
+
+
+/*==============================================================
+ * 2. D36A控制引脚
+ *==============================================================*/
+
+#define STEP_PORT                           (GPIOB)
+#define STEP_PIN                            (DL_GPIO_PIN_1)
+
+#define DIR_PORT                            (GPIOB)
+#define DIR_PIN                             (DL_GPIO_PIN_2)
+
+#define EN_PORT                             (GPIOB)
+#define EN_PIN                              (DL_GPIO_PIN_4)
+
+
+/*==============================================================
+ * 3. 步进电机参数
+ *==============================================================*/
+
+/* MS42C步距角1.8°，一圈200整步。 */
+#define MOTOR_FULL_STEPS_PER_REV            (200.0f)
+
+/* D36A当前使用16细分。 */
+#define MOTOR_MICROSTEP                     (16.0f)
+
+/* 一圈3200个STEP脉冲。 */
+#define MOTOR_PULSES_PER_REV                \
+    (MOTOR_FULL_STEPS_PER_REV *             \
+     MOTOR_MICROSTEP)
+
+/* 每旋转1°约8.8889个脉冲。 */
+#define MOTOR_PULSES_PER_DEG                \
+    (MOTOR_PULSES_PER_REV / 360.0f)
+
+
+/*==============================================================
+ * 4. 电机方向、使能和角度限位
+ *==============================================================*/
+
+/* PB4高电平使能D36A。 */
+#define ENABLE_ACTIVE_HIGH                  (1U)
+
+/* 正脉冲方向时PB2输出高电平。 */
+#define POSITIVE_DIRECTION_LEVEL            (1U)
+
+/*
+ * 陀螺仪补偿角到实际电机角度的方向。
+ *
+ * 当前沿用原程序的最终控制方向：-1.0。
+ * 若小车加速后轨道倾斜方向完全相反，只改为1.0f。
+ */
+#define MOTOR_COMPENSATION_POLARITY         (1.0f)
+
+/*
+ * 软件水平零点修正。
+ *
+ * 上电时已经手动调平，一般保持0。
+ * 若机械水平总差一个固定角度，可小范围修改。
+ */
+#define MOTOR_LEVEL_OFFSET_DEG              (0.0f)
+
+/* 步进电机允许的最大正负角度。 */
+#define MAX_MOTOR_ANGLE_DEG                 (16.0f)
+
+
+/*==============================================================
+ * 5. JY60帧格式和安装方向
+ *==============================================================*/
+
+/*
+ * WIT/JY60常见加速度帧：
+ *
+ * 0x55 0x51 AxL AxH AyL AyH AzL AzH TL TH SUM
+ */
+#define JY60_FRAME_LENGTH                   (11U)
+#define JY60_FRAME_HEADER                   (0x55U)
+#define JY60_FRAME_ACCELERATION             (0x51U)
+
+/* 超过200ms未收到有效加速度帧，认为JY60离线。 */
+#define JY60_TIMEOUT_MS                     (200U)
+
+/*
+ * 选择JY60哪一个轴作为小车前后方向：
+ *
+ * 0 = X轴
+ * 1 = Y轴
+ * 2 = Z轴
+ *
+ * 推荐让JY60 X轴箭头沿小车前进方向，保持0。
+ */
+#define JY60_FORWARD_AXIS                   (0U)
+
+/*
+ * 让“小车向前启动/加速”对应正加速度。
+ *
+ * Watch中观察g_debug_raw_accel_mg：
+ * 小车向前加速时若显示负数，将1.0f改为-1.0f。
+ */
+#define JY60_ACCEL_AXIS_POLARITY            (1.0f)
+
+/* JY60 ±16g量程对应的标准换算系数。 */
+#define JY60_ACCEL_RAW_TO_G                 (16.0f / 32768.0f)
+
+/* 上电标定至少需要30个有效0x51帧。 */
+#define JY60_CALIBRATION_MIN_SAMPLES        (30U)
+#define JY60_CALIBRATION_MAX_SAMPLES        (2000U)
+
+
+/*==============================================================
+ * 6. 加速度滤波和补偿参数
+ *==============================================================*/
+
+/*
+ * 启动/加速滤波系数。
+ * 越大响应越快，但噪声也越明显。
+ * 推荐范围：0.25～0.50。
+ */
+#define VEHICLE_START_FILTER_ALPHA          (0.80f)
+
+/*
+ * 减速/停车滤波系数。
+ * 停车通常更突然，所以设置得更大。
+ * 推荐范围：0.40～0.70。
+ */
+#define VEHICLE_STOP_FILTER_ALPHA           (0.65f)
+
+/*
+ * 小于0.015g约等于0.147m/s²，视为噪声。
+ * 原点附近电机频繁小动时可适当增大。
+ */
+#define VEHICLE_ACCEL_DEADBAND_G            (0.015f)
+
+/* 最大只使用±0.30g进行计算。 */
+#define VEHICLE_ACCEL_LIMIT_G               (0.30f)
+
+/*
+ * 启动/加速补偿增益。
+ *
+ * 启动时钢球仍明显向后移动：逐步增大。
+ * 启动时钢球反而明显向前移动：逐步减小。
+ */
+#define VEHICLE_START_COMPENSATION_GAIN     (6.00f)
+
+/*
+ * 减速/停车补偿增益。
+ *
+ * 停车时钢球仍向车头冲：逐步增大。
+ * 停车时钢球反而向车尾冲：逐步减小。
+ *
+ * 原代码为8.00，先保留。
+ */
+#define VEHICLE_STOP_COMPENSATION_GAIN      (8.00f)
+
+/* JY60补偿角最多使用±8°。 */
+#define VEHICLE_COMPENSATION_MAX_ANGLE_DEG  (8.0f)
+
+/* 启动补偿角最大变化速度。 */
+#define VEHICLE_START_SLEW_DEG_S            (520.0f)
+
+/* 停车补偿角最大变化速度。 */
+#define VEHICLE_STOP_SLEW_DEG_S             (720.0f)
+
+/*
+ * 加速度进入死区后，补偿角回到0°的速度。
+ * 太大容易二次反弹，太小则轨道回水平太慢。
+ */
+#define VEHICLE_ZERO_RETURN_SLEW_DEG_S      (180.0f)
+
+/* JY60掉线时的安全回零速度。 */
+#define VEHICLE_OFFLINE_RETURN_DEG_S        (220.0f)
+
+#define RAD_TO_DEG                          (57.2957795f)
+
+
+/*==============================================================
+ * 7. 步进电机位置控制参数
+ *==============================================================*/
+
+/* 位置误差转换为STEP频率。 */
+#define MOTOR_POSITION_KP                   (22.0f)
+
+/* 最大STEP频率。 */
+#define MOTOR_MAX_STEP_RATE_SPS             (1800.0f)
+
+/* 小误差时最低STEP频率，克服静摩擦。 */
+#define MOTOR_MIN_STEP_RATE_SPS             (85.0f)
+
+/* STEP频率最大变化率。 */
+#define MOTOR_MAX_ACCEL_SPS2                (30000.0f)
+
+/* 位置误差不超过1个脉冲时停止。 */
+#define MOTOR_POSITION_DEADBAND_PULSE       (1)
+
+
+/*==============================================================
+ * 8. 上电参数
+ *==============================================================*/
+
+/* 上电后关闭驱动2秒，用于调平和JY60零偏标定。 */
+#define START_DELAY_MS                      (2000U)
+
+/* D36A使能后等待100ms再开始控制。 */
+#define ENABLE_SETTLE_MS                    (100U)
+
+
+/*==============================================================
+ * 9. 全局调试变量
+ *==============================================================*/
+
+volatile uint32_t g_system_ms = 0U;
+
+/* JY60最近一帧三轴原始值。 */
+volatile int16_t g_jy60_accel_raw_x = 0;
+volatile int16_t g_jy60_accel_raw_y = 0;
+volatile int16_t g_jy60_accel_raw_z = 0;
+
+/* JY60通信统计。 */
+volatile uint32_t g_jy60_last_rx_ms = 0U;
+volatile uint32_t g_jy60_valid_count = 0U;
+volatile uint32_t g_jy60_checksum_error_count = 0U;
+
+/* 上电零偏标定统计。 */
+volatile uint8_t g_jy60_collect_calibration = 1U;
+volatile int32_t g_jy60_calibration_sum_raw = 0;
+volatile uint32_t g_jy60_calibration_count = 0U;
+
+/* 调度标志。 */
+volatile uint8_t g_compensation_control_due = 0U;
+volatile uint8_t g_motor_control_due = 0U;
+
+/*
+ * Watch建议添加：
+ *
+ * g_debug_jy60_online
+ * g_debug_jy60_calibrated
+ * g_debug_jy60_age_ms
+ * g_debug_jy60_forward_raw
+ * g_debug_jy60_zero_raw
+ * g_debug_raw_accel_mg
+ * g_debug_filtered_accel_mg
+ * g_debug_compensation_phase
+ * g_debug_filter_alpha_x1000
+ * g_debug_compensation_gain_x1000
+ * g_debug_comp_target_angle_x100
+ * g_debug_motor_command_angle_x100
+ * g_debug_motor_actual_angle_x100
+ * g_motor_target_pulse
+ * g_motor_current_pulse
+ * g_step_rate_sps
+ */
+volatile uint32_t g_debug_jy60_online = 0U;
+volatile uint32_t g_debug_jy60_calibrated = 0U;
+volatile uint32_t g_debug_jy60_age_ms = 0U;
+
+volatile int32_t g_debug_jy60_forward_raw = 0;
+volatile int32_t g_debug_jy60_zero_raw = 0;
+
+/* 未滤波加速度，单位mg。 */
+volatile int32_t g_debug_raw_accel_mg = 0;
+
+/* 滤波后加速度，单位mg。 */
+volatile int32_t g_debug_filtered_accel_mg = 0;
+
+/*
+ * 0 = 静止、匀速或加速度死区
+ * 1 = 启动或向前加速
+ * 2 = 减速或停车
+ * 3 = JY60离线或标定失败
+ */
+volatile uint32_t g_debug_compensation_phase = 3U;
+
+volatile int32_t g_debug_filter_alpha_x1000 = 0;
+volatile int32_t g_debug_compensation_gain_x1000 = 0;
+volatile int32_t g_debug_compensation_slew_deg_s = 0;
+
+/* 理论补偿目标角，单位0.01°，尚未乘电机方向。 */
+volatile int32_t g_debug_comp_target_angle_x100 = 0;
+
+/* 发送给电机位置环的目标角，单位0.01°。 */
+volatile int32_t g_debug_motor_command_angle_x100 = 0;
+
+/* 软件累计的实际电机角，单位0.01°。 */
+volatile int32_t g_debug_motor_actual_angle_x100 = 0;
+
+/* 步进电机调试量。 */
+volatile int32_t g_motor_target_pulse = 0;
+volatile int32_t g_motor_current_pulse = 0;
+volatile int32_t g_step_rate_sps = 0;
+
+volatile uint32_t g_step_output_level = 0U;
+volatile uint32_t g_direction_output_level = 0U;
+volatile uint32_t g_enable_output_level = 0U;
+
+
+/*==============================================================
+ * 10. 内部状态变量
+ *==============================================================*/
+
+/* JY60静止标定得到的纵向轴原始零偏。 */
+static int32_t g_jy60_zero_raw = 0;
+
+/* 1表示已经完成有效标定。 */
+static uint8_t g_jy60_calibrated = 0U;
+
+/* 当前滤波后的车辆纵向加速度，单位g。 */
+static float g_vehicle_accel_filtered_g = 0.0f;
+
+/* 理论补偿目标角，尚未执行角速度限制。 */
+static float g_vehicle_comp_target_angle_deg = 0.0f;
+
+/* 角速度限制后的补偿角。 */
+static float g_vehicle_comp_angle_deg = 0.0f;
+
+/* 最终发送给步进电机位置环的角度。 */
+static float g_motor_command_angle_deg = 0.0f;
+
+
+/*==============================================================
+ * 11. 基础数学函数
+ *==============================================================*/
+
+static float FloatAbs(float value)
+{
+    if (value < 0.0f)
+    {
+        return -value;
+    }
+
+    return value;
+}
+
+
+static float FloatClamp(
+    float value,
+    float minimum,
+    float maximum)
+{
+    if (value > maximum)
+    {
+        return maximum;
+    }
+
+    if (value < minimum)
+    {
+        return minimum;
+    }
+
+    return value;
+}
+
+
+static int32_t Int32Abs(int32_t value)
+{
+    if (value < 0)
+    {
+        return -value;
+    }
+
+    return value;
+}
+
+
+static int32_t FloatToInt32(float value)
+{
+    if (value >= 0.0f)
+    {
+        return (int32_t)(value + 0.5f);
+    }
+
+    return (int32_t)(value - 0.5f);
+}
+
+
+/*
+ * atan近似。
+ *
+ * 本项目只使用|a/g|<=0.30，
+ * x-x^3/3+x^5/5在这个范围内精度足够，
+ * 不需要链接math库。
+ */
+static float AtanApproxRad(float value)
+{
+    float squared;
+
+    value =
+        FloatClamp(
+            value,
+            -0.50f,
+            0.50f);
+
+    squared =
+        value *
+        value;
+
+    return
+        value *
+        (
+            1.0f -
+            squared / 3.0f +
+            squared * squared / 5.0f
+        );
+}
+
+
+/* 根据宏选择JY60的纵向轴。 */
+static int16_t SelectJY60ForwardRaw(
+    int16_t rawX,
+    int16_t rawY,
+    int16_t rawZ)
+{
+#if JY60_FORWARD_AXIS == 0U
+
+    (void)rawY;
+    (void)rawZ;
+    return rawX;
+
+#elif JY60_FORWARD_AXIS == 1U
+
+    (void)rawX;
+    (void)rawZ;
+    return rawY;
+
+#else
+
+    (void)rawX;
+    (void)rawY;
+    return rawZ;
+
+#endif
+}
+
+
+/*==============================================================
+ * 12. 延时函数
+ *==============================================================*/
+
+static void DelayMs(uint32_t milliseconds)
+{
+    while (milliseconds > 0U)
+    {
+        DL_Common_delayCycles(
+            CPUCLK_FREQ / 1000U);
+
+        milliseconds--;
+    }
+}
+
+
+/*==============================================================
+ * 13. 电机GPIO和使能
+ *==============================================================*/
+
+static void StepperGPIOInit(void)
+{
+    DL_GPIO_enableOutput(
+        GPIOB,
+        STEP_PIN |
+        DIR_PIN |
+        EN_PIN);
+
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN);
+
+    DL_GPIO_clearPins(
+        DIR_PORT,
+        DIR_PIN);
+
+    g_step_output_level = 0U;
+    g_direction_output_level = 0U;
+}
+
+
+static void StepperEnable(uint32_t enable)
+{
+#if ENABLE_ACTIVE_HIGH == 1U
+
+    if (enable != 0U)
+    {
+        DL_GPIO_setPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 1U;
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 0U;
+    }
+
+#else
+
+    if (enable != 0U)
+    {
+        DL_GPIO_clearPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 0U;
+    }
+    else
+    {
+        DL_GPIO_setPins(
+            EN_PORT,
+            EN_PIN);
+
+        g_enable_output_level = 1U;
+    }
+
+#endif
+}
+
+
+static void SetMotorDirection(int32_t direction)
+{
+    uint32_t outputLevel;
+
+    if (direction > 0)
+    {
+        outputLevel =
+            POSITIVE_DIRECTION_LEVEL;
+    }
+    else
+    {
+        outputLevel =
+            (POSITIVE_DIRECTION_LEVEL == 0U) ?
+            1U : 0U;
+    }
+
+    if (outputLevel != 0U)
+    {
+        DL_GPIO_setPins(
+            DIR_PORT,
+            DIR_PIN);
+
+        g_direction_output_level = 1U;
+    }
+    else
+    {
+        DL_GPIO_clearPins(
+            DIR_PORT,
+            DIR_PIN);
+
+        g_direction_output_level = 0U;
+    }
+}
+
+
+/*==============================================================
+ * 14. 角度与脉冲换算
+ *==============================================================*/
+
+static int32_t MotorAngleToPulse(float angleDeg)
+{
+    return
+        FloatToInt32(
+            angleDeg *
+            MOTOR_PULSES_PER_DEG);
+}
+
+
+static float MotorPulseToAngle(int32_t pulse)
+{
+    return
+        (float)pulse /
+        MOTOR_PULSES_PER_DEG;
+}
+
+
+/*==============================================================
+ * 15. STEP脉冲服务，调用频率10kHz
+ *==============================================================*/
+
+static void StepPulseService100us(void)
+{
+    static uint32_t phaseAccumulator = 0U;
+    static uint8_t stepPinHigh = 0U;
+    static int32_t appliedDirection = 0;
+
+    int32_t requestedRate;
+    int32_t direction;
+    uint32_t magnitude;
+
+    requestedRate =
+        g_step_rate_sps;
+
+    /*
+     * STEP高电平保持一个100us周期，
+     * 下一次中断先拉低。
+     */
+    if (stepPinHigh != 0U)
+    {
+        DL_GPIO_clearPins(
+            STEP_PORT,
+            STEP_PIN);
+
+        stepPinHigh = 0U;
+        g_step_output_level = 0U;
+    }
+
+    if (requestedRate == 0)
+    {
+        phaseAccumulator = 0U;
+        return;
+    }
+
+    if (requestedRate > 0)
+    {
+        direction = 1;
+        magnitude = (uint32_t)requestedRate;
+    }
+    else
+    {
+        direction = -1;
+        magnitude = (uint32_t)(-requestedRate);
+    }
+
+    /* 已经到达目标脉冲位置。 */
+    if ((direction > 0) &&
+        (g_motor_current_pulse >=
+         g_motor_target_pulse))
+    {
+        g_step_rate_sps = 0;
+        phaseAccumulator = 0U;
+        return;
+    }
+
+    if ((direction < 0) &&
+        (g_motor_current_pulse <=
+         g_motor_target_pulse))
+    {
+        g_step_rate_sps = 0;
+        phaseAccumulator = 0U;
+        return;
+    }
+
+    /*
+     * 改变方向后先空一个100us周期，
+     * 给D36A留DIR建立时间。
+     */
+    if (direction != appliedDirection)
+    {
+        SetMotorDirection(
+            direction);
+
+        appliedDirection =
+            direction;
+
+        phaseAccumulator = 0U;
+        return;
+    }
+
+    /* 软件正负角度限位。 */
+    if ((direction > 0) &&
+        (g_motor_current_pulse >=
+         MotorAngleToPulse(
+             MAX_MOTOR_ANGLE_DEG)))
+    {
+        g_step_rate_sps = 0;
+        phaseAccumulator = 0U;
+        return;
+    }
+
+    if ((direction < 0) &&
+        (g_motor_current_pulse <=
+         MotorAngleToPulse(
+             -MAX_MOTOR_ANGLE_DEG)))
+    {
+        g_step_rate_sps = 0;
+        phaseAccumulator = 0U;
+        return;
+    }
+
+    phaseAccumulator +=
+        magnitude;
+
+    if (phaseAccumulator >=
+        SYSTICK_FREQUENCY_HZ)
+    {
+        phaseAccumulator -=
+            SYSTICK_FREQUENCY_HZ;
+
+        DL_GPIO_setPins(
+            STEP_PORT,
+            STEP_PIN);
+
+        stepPinHigh = 1U;
+        g_step_output_level = 1U;
+
+        g_motor_current_pulse +=
+            direction;
+    }
+}
+
+
+/*==============================================================
+ * 16. JY60加速度帧提交
+ *==============================================================*/
+
+static void CommitJY60AccelerationFrame(
+    const uint8_t *frame)
+{
+    int16_t rawX;
+    int16_t rawY;
+    int16_t rawZ;
+    int16_t forwardRaw;
+
+    rawX =
+        (int16_t)(
+            (uint16_t)frame[2] |
+            ((uint16_t)frame[3] << 8));
+
+    rawY =
+        (int16_t)(
+            (uint16_t)frame[4] |
+            ((uint16_t)frame[5] << 8));
+
+    rawZ =
+        (int16_t)(
+            (uint16_t)frame[6] |
+            ((uint16_t)frame[7] << 8));
+
+    g_jy60_accel_raw_x = rawX;
+    g_jy60_accel_raw_y = rawY;
+    g_jy60_accel_raw_z = rawZ;
+
+    g_jy60_last_rx_ms =
+        g_system_ms;
+
+    g_jy60_valid_count++;
+
+    /*
+     * 上电标定期间直接累计纵向轴原始值。
+     * 这段时间小车必须保持静止。
+     */
+    if ((g_jy60_collect_calibration != 0U) &&
+        (g_jy60_calibration_count <
+         JY60_CALIBRATION_MAX_SAMPLES))
+    {
+        forwardRaw =
+            SelectJY60ForwardRaw(
+                rawX,
+                rawY,
+                rawZ);
+
+        g_jy60_calibration_sum_raw +=
+            (int32_t)forwardRaw;
+
+        g_jy60_calibration_count++;
+    }
+}
+
+
+/*==============================================================
+ * 17. JY60字节流解析
+ *==============================================================*/
+
+static void ParseJY60Byte(uint8_t data)
+{
+    static uint8_t frame[
+        JY60_FRAME_LENGTH];
+
+    static uint8_t index = 0U;
+
+    uint8_t checksum;
+    uint32_t i;
+
+    /* 等待帧头0x55。 */
+    if (index == 0U)
+    {
+        if (data ==
+            JY60_FRAME_HEADER)
+        {
+            frame[0] = data;
+            index = 1U;
+        }
+
+        return;
+    }
+
+    frame[index] = data;
+    index++;
+
+    if (index <
+        JY60_FRAME_LENGTH)
+    {
+        return;
+    }
+
+    checksum = 0U;
+
+    for (i = 0U;
+         i < 10U;
+         i++)
+    {
+        checksum =
+            (uint8_t)(
+                checksum +
+                frame[i]);
+    }
+
+    if (checksum ==
+        frame[10])
+    {
+        if (frame[1] ==
+            JY60_FRAME_ACCELERATION)
+        {
+            CommitJY60AccelerationFrame(
+                frame);
+        }
+    }
+    else
+    {
+        g_jy60_checksum_error_count++;
+    }
+
+    /*
+     * 处理完一帧后重新等待帧头。
+     * JY60会连续发送0x51、0x52、0x53等不同类型帧。
+     */
+    index = 0U;
+}
+
+
+/*==============================================================
+ * 18. UART1中断：只接收JY60
+ *==============================================================*/
+
+void UART1_IRQHandler(void)
+{
+    uint32_t pendingInterrupt;
+
+    pendingInterrupt =
+        DL_UART_Main_getPendingInterrupt(
+            JY60_UART_INST);
+
+    switch (pendingInterrupt)
+    {
+        case DL_UART_MAIN_IIDX_RX:
+
+            while (!DL_UART_Main_isRXFIFOEmpty(
+                        JY60_UART_INST))
+            {
+                uint8_t receivedByte;
+
+                receivedByte =
+                    (uint8_t)
+                    DL_UART_Main_receiveData(
+                        JY60_UART_INST);
+
+                ParseJY60Byte(
+                    receivedByte);
+            }
+
+            break;
+
+        default:
+
+            break;
+    }
+}
+
+
+/*==============================================================
+ * 19. 补偿角斜率限制
+ *==============================================================*/
+
+static float ApplyCompensationSlewLimit(
+    float currentAngle,
+    float requestedAngle,
+    float slewRateDegS)
+{
+    float maximumChange;
+    float difference;
+
+    maximumChange =
+        slewRateDegS *
+        COMPENSATION_CONTROL_DT_S;
+
+    difference =
+        requestedAngle -
+        currentAngle;
+
+    difference =
+        FloatClamp(
+            difference,
+            -maximumChange,
+            maximumChange);
+
+    return
+        currentAngle +
+        difference;
+}
+
+
+/*==============================================================
+ * 20. 完成JY60上电静止标定
+ *==============================================================*/
+
+static void FinishJY60Calibration(void)
+{
+    int32_t calibrationSum;
+    uint32_t calibrationCount;
+
+    int16_t rawX;
+    int16_t rawY;
+    int16_t rawZ;
+
+    __disable_irq();
+
+    g_jy60_collect_calibration = 0U;
+
+    calibrationSum =
+        g_jy60_calibration_sum_raw;
+
+    calibrationCount =
+        g_jy60_calibration_count;
+
+    rawX = g_jy60_accel_raw_x;
+    rawY = g_jy60_accel_raw_y;
+    rawZ = g_jy60_accel_raw_z;
+
+    __enable_irq();
+
+    if (calibrationCount >=
+        JY60_CALIBRATION_MIN_SAMPLES)
+    {
+        g_jy60_zero_raw =
+            calibrationSum /
+            (int32_t)calibrationCount;
+
+        g_jy60_calibrated = 1U;
+    }
+    else
+    {
+        /*
+         * 帧数不足时记录当前值，但不启用补偿，
+         * 防止串口未工作时电机突然转动。
+         */
+        g_jy60_zero_raw =
+            (int32_t)
+            SelectJY60ForwardRaw(
+                rawX,
+                rawY,
+                rawZ);
+
+        g_jy60_calibrated = 0U;
+    }
+
+    g_vehicle_accel_filtered_g = 0.0f;
+    g_vehicle_comp_target_angle_deg = 0.0f;
+    g_vehicle_comp_angle_deg = 0.0f;
+    g_motor_command_angle_deg = MOTOR_LEVEL_OFFSET_DEG;
+
+    g_debug_jy60_zero_raw =
+        g_jy60_zero_raw;
+
+    g_debug_jy60_calibrated =
+        g_jy60_calibrated;
+}
+
+
+/*==============================================================
+ * 21. 100Hz：JY60加速度转步进电机目标角
+ *==============================================================*/
+
+static void UpdateJY60Compensation100Hz(void)
+{
+    int16_t rawX;
+    int16_t rawY;
+    int16_t rawZ;
+    int16_t forwardRaw;
+
+    uint32_t lastRxMs;
+    uint32_t ageMs;
+    uint8_t calibrated;
+
+    float measuredAccelG;
+    float filteredForControl;
+    float filterAlpha;
+    float compensationGain;
+    float compensationSlewDegS;
+    float targetAngleDeg;
+    float finalMotorAngleDeg;
+
+    uint32_t compensationPhase;
+
+    __disable_irq();
+
+    rawX = g_jy60_accel_raw_x;
+    rawY = g_jy60_accel_raw_y;
+    rawZ = g_jy60_accel_raw_z;
+
+    lastRxMs = g_jy60_last_rx_ms;
+    calibrated = g_jy60_calibrated;
+
+    __enable_irq();
+
+    ageMs =
+        g_system_ms -
+        lastRxMs;
+
+    g_debug_jy60_age_ms =
+        ageMs;
+
+    forwardRaw =
+        SelectJY60ForwardRaw(
+            rawX,
+            rawY,
+            rawZ);
+
+    g_debug_jy60_forward_raw =
+        (int32_t)forwardRaw;
+
+    /*
+     * 未完成标定或JY60掉线：
+     * 不再使用传感器数据，目标角安全回到水平。
+     */
+    if ((calibrated == 0U) ||
+        (ageMs >
+         JY60_TIMEOUT_MS))
+    {
+        g_debug_jy60_online = 0U;
+
+        g_vehicle_accel_filtered_g *=
+            0.82f;
+
+        g_vehicle_comp_target_angle_deg =
+            0.0f;
+
+        g_vehicle_comp_angle_deg =
+            ApplyCompensationSlewLimit(
+                g_vehicle_comp_angle_deg,
+                0.0f,
+                VEHICLE_OFFLINE_RETURN_DEG_S);
+
+        finalMotorAngleDeg =
+            MOTOR_LEVEL_OFFSET_DEG +
+            MOTOR_COMPENSATION_POLARITY *
+            g_vehicle_comp_angle_deg;
+
+        g_motor_command_angle_deg =
+            FloatClamp(
+                finalMotorAngleDeg,
+                -MAX_MOTOR_ANGLE_DEG,
+                MAX_MOTOR_ANGLE_DEG);
+
+        g_debug_raw_accel_mg = 0;
+
+        g_debug_filtered_accel_mg =
+            FloatToInt32(
+                g_vehicle_accel_filtered_g *
+                1000.0f);
+
+        g_debug_compensation_phase = 3U;
+        g_debug_filter_alpha_x1000 = 0;
+        g_debug_compensation_gain_x1000 = 0;
+
+        g_debug_compensation_slew_deg_s =
+            FloatToInt32(
+                VEHICLE_OFFLINE_RETURN_DEG_S);
+
+        g_debug_comp_target_angle_x100 = 0;
+
+        g_debug_motor_command_angle_x100 =
+            FloatToInt32(
+                g_motor_command_angle_deg *
+                100.0f);
+
+        return;
+    }
+
+    g_debug_jy60_online = 1U;
+
+    /*
+     * 去除上电静止零偏，并换算为g。
+     */
+    measuredAccelG =
+        (
+            (float)(
+                (int32_t)forwardRaw -
+                g_jy60_zero_raw)
+        ) *
+        JY60_ACCEL_RAW_TO_G *
+        JY60_ACCEL_AXIS_POLARITY;
+
+    measuredAccelG =
+        FloatClamp(
+            measuredAccelG,
+            -VEHICLE_ACCEL_LIMIT_G,
+            VEHICLE_ACCEL_LIMIT_G);
+
+    g_debug_raw_accel_mg =
+        FloatToInt32(
+            measuredAccelG *
+            1000.0f);
+
+    /*
+     * 负加速度按停车参数滤波，
+     * 正加速度按启动参数滤波。
+     */
+    if (measuredAccelG <
+        -VEHICLE_ACCEL_DEADBAND_G)
+    {
+        filterAlpha =
+            VEHICLE_STOP_FILTER_ALPHA;
+    }
+    else
+    {
+        filterAlpha =
+            VEHICLE_START_FILTER_ALPHA;
+    }
+
+    g_vehicle_accel_filtered_g +=
+        filterAlpha *
+        (
+            measuredAccelG -
+            g_vehicle_accel_filtered_g
+        );
+
+    filteredForControl =
+        g_vehicle_accel_filtered_g;
+
+    if (FloatAbs(
+            filteredForControl) <
+        VEHICLE_ACCEL_DEADBAND_G)
+    {
+        filteredForControl = 0.0f;
+    }
+
+    /*
+     * 根据滤波后的加速度方向选择增益和角速度。
+     */
+    if (filteredForControl <
+        -VEHICLE_ACCEL_DEADBAND_G)
+    {
+        compensationPhase = 2U;
+
+        compensationGain =
+            VEHICLE_STOP_COMPENSATION_GAIN;
+
+        compensationSlewDegS =
+            VEHICLE_STOP_SLEW_DEG_S;
+    }
+    else if (filteredForControl >
+             VEHICLE_ACCEL_DEADBAND_G)
+    {
+        compensationPhase = 1U;
+
+        compensationGain =
+            VEHICLE_START_COMPENSATION_GAIN;
+
+        compensationSlewDegS =
+            VEHICLE_START_SLEW_DEG_S;
+    }
+    else
+    {
+        compensationPhase = 0U;
+
+        compensationGain =
+            VEHICLE_START_COMPENSATION_GAIN;
+
+        compensationSlewDegS =
+            VEHICLE_ZERO_RETURN_SLEW_DEG_S;
+    }
+
+    /*
+     * 对沿轨道方向的惯性进行近似补偿：
+     *
+     *   a_ball = g*sin(theta) - a_car*cos(theta)
+     *
+     * 令a_ball=0：
+     *
+     *   tan(theta) = a_car/g
+     *   theta = atan(acceleration_g)
+     */
+    targetAngleDeg =
+        AtanApproxRad(
+            filteredForControl) *
+        RAD_TO_DEG *
+        compensationGain;
+
+    targetAngleDeg =
+        FloatClamp(
+            targetAngleDeg,
+            -VEHICLE_COMPENSATION_MAX_ANGLE_DEG,
+            VEHICLE_COMPENSATION_MAX_ANGLE_DEG);
+
+    g_vehicle_comp_target_angle_deg =
+        targetAngleDeg;
+
+    g_vehicle_comp_angle_deg =
+        ApplyCompensationSlewLimit(
+            g_vehicle_comp_angle_deg,
+            g_vehicle_comp_target_angle_deg,
+            compensationSlewDegS);
+
+    finalMotorAngleDeg =
+        MOTOR_LEVEL_OFFSET_DEG +
+        MOTOR_COMPENSATION_POLARITY *
+        g_vehicle_comp_angle_deg;
+
+    g_motor_command_angle_deg =
+        FloatClamp(
+            finalMotorAngleDeg,
+            -MAX_MOTOR_ANGLE_DEG,
+            MAX_MOTOR_ANGLE_DEG);
+
+    g_debug_filtered_accel_mg =
+        FloatToInt32(
+            g_vehicle_accel_filtered_g *
+            1000.0f);
+
+    g_debug_compensation_phase =
+        compensationPhase;
+
+    g_debug_filter_alpha_x1000 =
+        FloatToInt32(
+            filterAlpha *
+            1000.0f);
+
+    g_debug_compensation_gain_x1000 =
+        FloatToInt32(
+            compensationGain *
+            1000.0f);
+
+    g_debug_compensation_slew_deg_s =
+        FloatToInt32(
+            compensationSlewDegS);
+
+    g_debug_comp_target_angle_x100 =
+        FloatToInt32(
+            g_vehicle_comp_target_angle_deg *
+            100.0f);
+
+    g_debug_motor_command_angle_x100 =
+        FloatToInt32(
+            g_motor_command_angle_deg *
+            100.0f);
+}
+
+
+/*==============================================================
+ * 22. 1kHz：步进电机软件位置控制
+ *==============================================================*/
+
+static void MotorPositionControl1ms(
+    float targetAngleDeg)
+{
+    static float previousRate = 0.0f;
+
+    int32_t targetPulse;
+    int32_t positionError;
+
+    float requestedRate;
+    float maximumRateChange;
+
+    targetAngleDeg =
+        FloatClamp(
+            targetAngleDeg,
+            -MAX_MOTOR_ANGLE_DEG,
+            MAX_MOTOR_ANGLE_DEG);
+
+    targetPulse =
+        MotorAngleToPulse(
+            targetAngleDeg);
+
+    g_motor_target_pulse =
+        targetPulse;
+
+    positionError =
+        targetPulse -
+        g_motor_current_pulse;
+
+    /* 到达目标位置后停止发脉冲，电机仍保持使能锁轴。 */
+    if (Int32Abs(positionError) <=
+        MOTOR_POSITION_DEADBAND_PULSE)
+    {
+        g_step_rate_sps = 0;
+        previousRate = 0.0f;
+
+        g_debug_motor_actual_angle_x100 =
+            FloatToInt32(
+                MotorPulseToAngle(
+                    g_motor_current_pulse) *
+                100.0f);
+
+        return;
+    }
+
+    /* 目标方向反转时清除旧方向速度。 */
+    if (((positionError > 0) &&
+         (previousRate < 0.0f)) ||
+        ((positionError < 0) &&
+         (previousRate > 0.0f)))
+    {
+        previousRate = 0.0f;
+    }
+
+    requestedRate =
+        MOTOR_POSITION_KP *
+        (float)positionError;
+
+    /* 小误差时仍给出最低STEP频率。 */
+    if ((requestedRate > 0.0f) &&
+        (requestedRate <
+         MOTOR_MIN_STEP_RATE_SPS))
+    {
+        requestedRate =
+            MOTOR_MIN_STEP_RATE_SPS;
+    }
+
+    if ((requestedRate < 0.0f) &&
+        (requestedRate >
+         -MOTOR_MIN_STEP_RATE_SPS))
+    {
+        requestedRate =
+            -MOTOR_MIN_STEP_RATE_SPS;
+    }
+
+    requestedRate =
+        FloatClamp(
+            requestedRate,
+            -MOTOR_MAX_STEP_RATE_SPS,
+            MOTOR_MAX_STEP_RATE_SPS);
+
+    maximumRateChange =
+        MOTOR_MAX_ACCEL_SPS2 *
+        MOTOR_CONTROL_DT_S;
+
+    requestedRate =
+        FloatClamp(
+            requestedRate,
+            previousRate -
+            maximumRateChange,
+            previousRate +
+            maximumRateChange);
+
+    g_step_rate_sps =
+        FloatToInt32(
+            requestedRate);
+
+    previousRate =
+        requestedRate;
+
+    g_debug_motor_actual_angle_x100 =
+        FloatToInt32(
+            MotorPulseToAngle(
+                g_motor_current_pulse) *
+            100.0f);
+}
+
+
+/*==============================================================
+ * 23. SysTick中断
+ *==============================================================*/
+
+void SysTick_Handler(void)
+{
+    static uint32_t millisecondDivider = 0U;
+    static uint32_t compensationDivider = 0U;
+    static uint32_t motorControlDivider = 0U;
+
+    /* STEP脉冲服务10kHz。 */
+    StepPulseService100us();
+
+    /* 毫秒计时。 */
+    millisecondDivider++;
+
+    if (millisecondDivider >= 10U)
+    {
+        millisecondDivider = 0U;
+        g_system_ms++;
+    }
+
+    /* JY60补偿控制100Hz。 */
+    compensationDivider++;
+
+    if (compensationDivider >=
+        COMPENSATION_CONTROL_INTERVAL_TICKS)
+    {
+        compensationDivider = 0U;
+        g_compensation_control_due = 1U;
+    }
+
+    /* 电机位置控制1kHz。 */
+    motorControlDivider++;
+
+    if (motorControlDivider >=
+        MOTOR_CONTROL_INTERVAL_TICKS)
+    {
+        motorControlDivider = 0U;
+        g_motor_control_due = 1U;
+    }
+}
+
+
+/*==============================================================
+ * 24. 主函数
+ *==============================================================*/
+
+int main(void)
+{
+    uint8_t compensationControlDue;
+    uint8_t motorControlDue;
+
+    SYSCFG_DL_init();
+
+    StepperGPIOInit();
+
+    /* 上电先关闭D36A。 */
+    StepperEnable(0U);
+
+    /*
+     * 只打开JY60 UART1接收中断。
+     * 本程序没有K230 UART0中断。
+     */
+    DL_UART_Main_enableInterrupt(
+        JY60_UART_INST,
+        DL_UART_MAIN_INTERRUPT_RX);
+
+    NVIC_ClearPendingIRQ(
+        JY60_UART_INST_INT_IRQN);
+
+    NVIC_EnableIRQ(
+        JY60_UART_INST_INT_IRQN);
+
+    /* 开启10kHz SysTick。 */
+    if (SysTick_Config(
+            CPUCLK_FREQ /
+            SYSTICK_FREQUENCY_HZ) != 0U)
+    {
+        while (1)
+        {
+            __WFI();
+        }
+    }
+
+    __enable_irq();
+
+    /*
+     * 前2秒保持静止并手动调平。
+     * 此时UART中断持续接收JY60数据并累计零偏。
+     */
+    DelayMs(
+        START_DELAY_MS);
+
+    FinishJY60Calibration();
+
+    /*
+     * 把当前机械水平位置作为软件零点。
+     * 本程序没有编码器，位置由已发送的STEP脉冲累计估算。
+     */
+    g_motor_current_pulse = 0;
+    g_motor_target_pulse = 0;
+    g_step_rate_sps = 0;
+
+    g_vehicle_accel_filtered_g = 0.0f;
+    g_vehicle_comp_target_angle_deg = 0.0f;
+    g_vehicle_comp_angle_deg = 0.0f;
+    g_motor_command_angle_deg = MOTOR_LEVEL_OFFSET_DEG;
+
+    g_debug_comp_target_angle_x100 = 0;
+
+    g_debug_motor_command_angle_x100 =
+        FloatToInt32(
+            MOTOR_LEVEL_OFFSET_DEG *
+            100.0f);
+
+    g_debug_motor_actual_angle_x100 = 0;
+
+    /* 使能D36A并锁轴。 */
+    StepperEnable(1U);
+
+    DelayMs(
+        ENABLE_SETTLE_MS);
+
+    while (1)
+    {
+        /*
+         * 读取并清除100Hz补偿控制标志。
+         */
+        __disable_irq();
+
+        compensationControlDue =
+            g_compensation_control_due;
+
+        if (compensationControlDue != 0U)
+        {
+            g_compensation_control_due = 0U;
+        }
+
+        __enable_irq();
+
+        if (compensationControlDue != 0U)
+        {
+            UpdateJY60Compensation100Hz();
+        }
+
+        /*
+         * 读取并清除1kHz电机位置控制标志。
+         */
+        __disable_irq();
+
+        motorControlDue =
+            g_motor_control_due;
+
+        if (motorControlDue != 0U)
+        {
+            g_motor_control_due = 0U;
+        }
+
+        __enable_irq();
+
+        if (motorControlDue != 0U)
+        {
+            MotorPositionControl1ms(
+                g_motor_command_angle_deg);
+        }
+
+        __WFI();
+    }
+}
