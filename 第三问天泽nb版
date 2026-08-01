@@ -1,0 +1,1849 @@
+#include "ti_msp_dl_config.h"
+#include <stdint.h>
+
+/*
+ * ============================================================
+ * MSPM0G3507 + D36A 步进电机五组左右运动
+ *
+ * 改进内容：
+ *
+ * 1. GPIO先设置电平，再开启输出，减少上电误脉冲。
+ * 2. 等待期间电机保持锁轴，不再等待3秒后突然使能。
+ * 3. 每段运动加入梯形加减速，避免突然高速启动。
+ * 4. 换向前加入最短停顿，避免立即反转造成晃动。
+ * 5. 每组之间加入最短停顿。
+ * 6. STEP始终在低电平结束。
+ *
+ * 接线：
+ *
+ * PB1 -> D36A ST1 / STEP
+ * PB2 -> D36A DIR1
+ * PB4 -> D36A EN1
+ *
+ * 开发板GND必须与D36A GND共地。
+ *
+ * 电机：
+ * 步距角1.8°
+ * 16细分
+ * 每圈脉冲数 = 200 × 16 = 3200
+ * ============================================================
+ */
+
+
+/*============================================================
+ * 1. 系统时钟
+ *============================================================*/
+
+#ifndef CPUCLK_FREQ
+#define CPUCLK_FREQ                         (32000000UL)
+#endif
+
+
+/*============================================================
+ * 2. GPIO引脚
+ *============================================================*/
+
+#define STEP_PORT                           (GPIOB)
+#define STEP_PIN                            (DL_GPIO_PIN_1)
+
+#define DIR_PORT                            (GPIOB)
+#define DIR_PIN                             (DL_GPIO_PIN_2)
+
+#define EN_PORT                             (GPIOB)
+#define EN_PIN                              (DL_GPIO_PIN_4)
+
+
+/*============================================================
+ * 3. 总过程数量
+ *============================================================*/
+
+#define PROCESS_COUNT                       (5U)
+
+
+/*============================================================
+ * 4. 第1组参数
+ *============================================================*/
+
+#define PROCESS_1_ENABLE                    (1U)
+
+/* 单位0.01°，1000表示10.00° */
+#define PROCESS_1_LEFT_ANGLE_X100           (1000U)
+
+/* 单位ms */
+#define PROCESS_1_LEFT_TIME_MS              (570U)
+
+/* 左转完成后的停留时间 */
+#define PROCESS_1_MIDDLE_HOLD_MS            (0U)
+
+/* 右转30.00° */
+#define PROCESS_1_RIGHT_ANGLE_X100          (3000U)
+
+#define PROCESS_1_RIGHT_TIME_MS             (1000U)
+
+/* 第1组完成后停留 */
+#define PROCESS_1_END_HOLD_MS               (0U)
+
+
+/*============================================================
+ * 5. 第2组参数
+ *============================================================*/
+
+#define PROCESS_2_ENABLE                    (1U)
+
+#define PROCESS_2_LEFT_ANGLE_X100           (4500U)
+#define PROCESS_2_LEFT_TIME_MS              (400U)
+
+#define PROCESS_2_MIDDLE_HOLD_MS            (0U)
+
+#define PROCESS_2_RIGHT_ANGLE_X100          (3500U)
+#define PROCESS_2_RIGHT_TIME_MS             (500U)
+
+#define PROCESS_2_END_HOLD_MS               (0U)
+
+
+/*============================================================
+ * 6. 第3组参数
+ *============================================================*/
+
+#define PROCESS_3_ENABLE                    (1U)
+
+#define PROCESS_3_LEFT_ANGLE_X100           (1000U)
+#define PROCESS_3_LEFT_TIME_MS              (150U)
+
+#define PROCESS_3_MIDDLE_HOLD_MS            (0U)
+
+#define PROCESS_3_RIGHT_ANGLE_X100          (200U)
+#define PROCESS_3_RIGHT_TIME_MS             (100U)
+
+#define PROCESS_3_END_HOLD_MS               (500U)
+
+
+/*============================================================
+ * 7. 第4组参数
+ *============================================================*/
+
+#define PROCESS_4_ENABLE                    (0U)
+
+#define PROCESS_4_LEFT_ANGLE_X100           (2000U)
+#define PROCESS_4_LEFT_TIME_MS              (1000U)
+
+#define PROCESS_4_MIDDLE_HOLD_MS            (1000U)
+
+#define PROCESS_4_RIGHT_ANGLE_X100          (2000U)
+#define PROCESS_4_RIGHT_TIME_MS             (1000U)
+
+#define PROCESS_4_END_HOLD_MS               (500U)
+
+
+/*============================================================
+ * 8. 第5组参数
+ *============================================================*/
+
+#define PROCESS_5_ENABLE                    (0U)
+
+#define PROCESS_5_LEFT_ANGLE_X100           (2000U)
+#define PROCESS_5_LEFT_TIME_MS              (1000U)
+
+#define PROCESS_5_MIDDLE_HOLD_MS            (1000U)
+
+#define PROCESS_5_RIGHT_ANGLE_X100          (2000U)
+#define PROCESS_5_RIGHT_TIME_MS             (1000U)
+
+#define PROCESS_5_END_HOLD_MS               (0U)
+
+
+/*============================================================
+ * 9. 启动参数
+ *============================================================*/
+
+/*
+ * 上电后等待3秒再开始动作。
+ *
+ * 注意：
+ * 这3秒内电机已经通电锁轴，不能再手动转动电机。
+ *
+ * 这样可以避免等待3秒后突然使能造成“弹一下”。
+ */
+#define START_DELAY_MS                      (3000U)
+
+/*
+ * 驱动使能后稳定时间。
+ */
+#define ENABLE_SETTLE_MS                    (100U)
+
+/*
+ * 改变方向后等待时间。
+ */
+#define DIR_SETTLE_MS                       (5U)
+
+/*
+ * 左转结束后，即使用户设置停留时间为0，
+ * 也至少等待这么长时间再反转。
+ */
+#define MIN_REVERSE_HOLD_MS                 (50U)
+
+/*
+ * 每组动作结束后，至少等待这么长时间。
+ */
+#define MIN_PROCESS_GAP_MS                  (30U)
+
+
+/*============================================================
+ * 10. 电机参数
+ *============================================================*/
+
+#define MOTOR_FULL_STEPS_PER_REV            (200U)
+
+#define MOTOR_MICROSTEP                     (16U)
+
+#define MOTOR_PULSES_PER_REV                \
+    (MOTOR_FULL_STEPS_PER_REV * MOTOR_MICROSTEP)
+
+
+/*============================================================
+ * 11. 方向与使能设置
+ *============================================================*/
+
+/*
+ * 左转时DIR电平：
+ *
+ * 1：PB2高电平为左转
+ * 0：PB2低电平为左转
+ */
+#define LEFT_DIR_LEVEL                      (1U)
+
+/*
+ * D36A使能极性：
+ *
+ * 1：PB4高电平使能
+ * 0：PB4低电平使能
+ */
+#define EN_ACTIVE_HIGH                      (1U)
+
+/*
+ * 所有动作完成后是否继续锁轴：
+ *
+ * 1：继续锁轴
+ * 0：关闭驱动
+ */
+#define HOLD_AFTER_FINISH                   (1U)
+
+
+/*============================================================
+ * 12. 加减速参数
+ *============================================================*/
+
+/*
+ * 是否启用平滑加减速：
+ *
+ * 1：启用
+ * 0：关闭
+ */
+#define RAMP_ENABLE                         (1U)
+
+/*
+ * 每段运动前25%的脉冲用于加速，
+ * 后25%的脉冲用于减速。
+ */
+#define RAMP_PERCENT                        (25U)
+
+/*
+ * 加速或减速阶段最多使用80个脉冲。
+ */
+#define RAMP_MAX_PULSES                     (80U)
+
+/*
+ * 启动时周期倍率。
+ *
+ * 3000表示启动时脉冲周期是匀速阶段的3倍，
+ * 即启动速度大约是最高速度的1/3。
+ *
+ * 数值越大：
+ * 启动越平滑，但起步越慢。
+ *
+ * 推荐范围：
+ * 2000～4000
+ */
+#define RAMP_START_FACTOR_X1000             (3000U)
+
+/*
+ * 匀速阶段倍率，固定为1000。
+ */
+#define RAMP_NORMAL_FACTOR_X1000            (1000U)
+
+/*
+ * 软件允许的最大STEP频率。
+ *
+ * 当前设置为5000Hz。
+ */
+#define MAX_STEP_FREQUENCY_HZ               (5000U)
+
+#define MIN_HALF_PERIOD_CYCLES              \
+    (CPUCLK_FREQ / (2U * MAX_STEP_FREQUENCY_HZ))
+
+
+/*============================================================
+ * 13. 状态定义
+ *============================================================*/
+
+#define STATE_WAITING                       (0U)
+#define STATE_DRIVER_ENABLED                (10U)
+
+#define STATE_ROTATING_LEFT                 (20U)
+#define STATE_HOLDING_LEFT                  (30U)
+
+#define STATE_ROTATING_RIGHT                (40U)
+#define STATE_HOLDING_AFTER_PROCESS         (50U)
+
+#define STATE_FINISHED                      (100U)
+#define STATE_ERROR                         (900U)
+
+
+/*============================================================
+ * 14. 错误代码
+ *============================================================*/
+
+#define ERROR_NONE                          (0U)
+#define ERROR_ANGLE_TOO_SMALL               (1U)
+#define ERROR_TIME_ZERO                     (2U)
+#define ERROR_SPEED_TOO_HIGH                (3U)
+
+
+/*============================================================
+ * 15. 五组运行参数
+ *============================================================*/
+
+volatile uint32_t g_process_enable[PROCESS_COUNT] = {
+    PROCESS_1_ENABLE,
+    PROCESS_2_ENABLE,
+    PROCESS_3_ENABLE,
+    PROCESS_4_ENABLE,
+    PROCESS_5_ENABLE
+};
+
+
+volatile uint32_t g_left_angle_x100[PROCESS_COUNT] = {
+    PROCESS_1_LEFT_ANGLE_X100,
+    PROCESS_2_LEFT_ANGLE_X100,
+    PROCESS_3_LEFT_ANGLE_X100,
+    PROCESS_4_LEFT_ANGLE_X100,
+    PROCESS_5_LEFT_ANGLE_X100
+};
+
+
+volatile uint32_t g_left_time_ms[PROCESS_COUNT] = {
+    PROCESS_1_LEFT_TIME_MS,
+    PROCESS_2_LEFT_TIME_MS,
+    PROCESS_3_LEFT_TIME_MS,
+    PROCESS_4_LEFT_TIME_MS,
+    PROCESS_5_LEFT_TIME_MS
+};
+
+
+volatile uint32_t g_middle_hold_ms[PROCESS_COUNT] = {
+    PROCESS_1_MIDDLE_HOLD_MS,
+    PROCESS_2_MIDDLE_HOLD_MS,
+    PROCESS_3_MIDDLE_HOLD_MS,
+    PROCESS_4_MIDDLE_HOLD_MS,
+    PROCESS_5_MIDDLE_HOLD_MS
+};
+
+
+volatile uint32_t g_right_angle_x100[PROCESS_COUNT] = {
+    PROCESS_1_RIGHT_ANGLE_X100,
+    PROCESS_2_RIGHT_ANGLE_X100,
+    PROCESS_3_RIGHT_ANGLE_X100,
+    PROCESS_4_RIGHT_ANGLE_X100,
+    PROCESS_5_RIGHT_ANGLE_X100
+};
+
+
+volatile uint32_t g_right_time_ms[PROCESS_COUNT] = {
+    PROCESS_1_RIGHT_TIME_MS,
+    PROCESS_2_RIGHT_TIME_MS,
+    PROCESS_3_RIGHT_TIME_MS,
+    PROCESS_4_RIGHT_TIME_MS,
+    PROCESS_5_RIGHT_TIME_MS
+};
+
+
+volatile uint32_t g_process_end_hold_ms[PROCESS_COUNT] = {
+    PROCESS_1_END_HOLD_MS,
+    PROCESS_2_END_HOLD_MS,
+    PROCESS_3_END_HOLD_MS,
+    PROCESS_4_END_HOLD_MS,
+    PROCESS_5_END_HOLD_MS
+};
+
+
+/*============================================================
+ * 16. 计算后的运动参数
+ *============================================================*/
+
+/* 左转脉冲数 */
+volatile uint32_t g_left_target_pulses[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+/* 左转匀速阶段半周期 */
+volatile uint32_t g_left_half_period_cycles[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+/* 左转加速阶段脉冲数 */
+volatile uint32_t g_left_ramp_pulses[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+/* 左转实际角度 */
+volatile uint32_t g_left_actual_angle_x100[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+/* 左转最大脉冲频率 */
+volatile uint32_t g_left_frequency_hz[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+/* 左转实际时间 */
+volatile uint32_t g_left_actual_time_ms[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+
+/* 右转脉冲数 */
+volatile uint32_t g_right_target_pulses[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+/* 右转匀速阶段半周期 */
+volatile uint32_t g_right_half_period_cycles[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+/* 右转加速阶段脉冲数 */
+volatile uint32_t g_right_ramp_pulses[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+/* 右转实际角度 */
+volatile uint32_t g_right_actual_angle_x100[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+/* 右转最大脉冲频率 */
+volatile uint32_t g_right_frequency_hz[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+/* 右转实际时间 */
+volatile uint32_t g_right_actual_time_ms[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+
+/*============================================================
+ * 17. 调试变量
+ *============================================================*/
+
+volatile uint32_t g_run_state =
+    STATE_WAITING;
+
+volatile uint32_t g_current_process = 0U;
+volatile uint32_t g_current_process_index = 0U;
+
+volatile uint32_t g_error_code =
+    ERROR_NONE;
+
+volatile uint32_t g_error_process = 0U;
+volatile uint32_t g_error_stage = 0U;
+
+volatile uint32_t g_left_output_pulses[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+volatile uint32_t g_right_output_pulses[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+volatile uint32_t g_process_finished[PROCESS_COUNT] = {
+    0U, 0U, 0U, 0U, 0U
+};
+
+volatile uint32_t g_total_output_pulses = 0U;
+volatile uint32_t g_finished_process_count = 0U;
+volatile uint32_t g_all_motion_finished = 0U;
+
+volatile uint32_t g_enable_output_level = 0U;
+volatile uint32_t g_direction_output_level = 0U;
+volatile uint32_t g_step_output_level = 0U;
+
+/*
+ * 当前输出脉冲的半周期，可在Watch中观察。
+ */
+volatile uint32_t g_current_half_period_cycles = 0U;
+
+/*
+ * 当前输出脉冲编号。
+ */
+volatile uint32_t g_current_pulse_index = 0U;
+
+
+/*============================================================
+ * 18. 延时函数
+ *============================================================*/
+
+static void DelayMs(uint32_t milliseconds)
+{
+    while (milliseconds > 0U) {
+        DL_Common_delayCycles(
+            CPUCLK_FREQ / 1000U
+        );
+
+        milliseconds--;
+    }
+}
+
+
+/*============================================================
+ * 19. 驱动使能电平设置
+ *============================================================*/
+
+static void SetEnableInactiveLatch(void)
+{
+#if EN_ACTIVE_HIGH == 1U
+
+    DL_GPIO_clearPins(
+        EN_PORT,
+        EN_PIN
+    );
+
+    g_enable_output_level = 0U;
+
+#else
+
+    DL_GPIO_setPins(
+        EN_PORT,
+        EN_PIN
+    );
+
+    g_enable_output_level = 1U;
+
+#endif
+}
+
+
+static void StepperEnable(uint32_t enable)
+{
+#if EN_ACTIVE_HIGH == 1U
+
+    if (enable != 0U) {
+        DL_GPIO_setPins(
+            EN_PORT,
+            EN_PIN
+        );
+
+        g_enable_output_level = 1U;
+    }
+    else {
+        DL_GPIO_clearPins(
+            EN_PORT,
+            EN_PIN
+        );
+
+        g_enable_output_level = 0U;
+    }
+
+#else
+
+    if (enable != 0U) {
+        DL_GPIO_clearPins(
+            EN_PORT,
+            EN_PIN
+        );
+
+        g_enable_output_level = 0U;
+    }
+    else {
+        DL_GPIO_setPins(
+            EN_PORT,
+            EN_PIN
+        );
+
+        g_enable_output_level = 1U;
+    }
+
+#endif
+}
+
+
+/*============================================================
+ * 20. GPIO初始化
+ *============================================================*/
+
+static void StepperGPIOInit(void)
+{
+    /*
+     * 重要：
+     *
+     * 先设置GPIO输出锁存状态，
+     * 最后才调用DL_GPIO_enableOutput。
+     *
+     * 这样能够减少初始化瞬间的STEP误脉冲。
+     */
+
+    /* STEP先固定为低电平 */
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN
+    );
+
+    g_step_output_level = 0U;
+
+
+    /* DIR预先设置成左转方向 */
+#if LEFT_DIR_LEVEL == 1U
+
+    DL_GPIO_setPins(
+        DIR_PORT,
+        DIR_PIN
+    );
+
+    g_direction_output_level = 1U;
+
+#else
+
+    DL_GPIO_clearPins(
+        DIR_PORT,
+        DIR_PIN
+    );
+
+    g_direction_output_level = 0U;
+
+#endif
+
+
+    /* EN预先设置为关闭状态 */
+    SetEnableInactiveLatch();
+
+
+    /*
+     * 所有锁存电平准备完成后，
+     * 再将三个GPIO切换为输出。
+     */
+    DL_GPIO_enableOutput(
+        GPIOB,
+        STEP_PIN |
+        DIR_PIN |
+        EN_PIN
+    );
+
+
+    /*
+     * 确保STEP保持低电平。
+     */
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN
+    );
+
+    g_step_output_level = 0U;
+
+
+    DelayMs(10U);
+}
+
+
+/*============================================================
+ * 21. 设置方向
+ *============================================================*/
+
+static void SetDirectionLevel(uint32_t level)
+{
+    uint32_t targetLevel;
+
+    targetLevel = (level != 0U) ? 1U : 0U;
+
+
+    /*
+     * 设置方向之前保证STEP为低。
+     */
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN
+    );
+
+    g_step_output_level = 0U;
+
+
+    if (targetLevel != 0U) {
+        DL_GPIO_setPins(
+            DIR_PORT,
+            DIR_PIN
+        );
+
+        g_direction_output_level = 1U;
+    }
+    else {
+        DL_GPIO_clearPins(
+            DIR_PORT,
+            DIR_PIN
+        );
+
+        g_direction_output_level = 0U;
+    }
+
+
+    /*
+     * 给驱动器足够的方向建立时间。
+     */
+    DelayMs(
+        DIR_SETTLE_MS
+    );
+}
+
+
+static void SetLeftDirection(void)
+{
+    SetDirectionLevel(
+        LEFT_DIR_LEVEL
+    );
+}
+
+
+static void SetRightDirection(void)
+{
+#if LEFT_DIR_LEVEL == 1U
+
+    SetDirectionLevel(0U);
+
+#else
+
+    SetDirectionLevel(1U);
+
+#endif
+}
+
+
+/*============================================================
+ * 22. 角度转换为脉冲
+ *============================================================*/
+
+static uint32_t AngleX100ToPulses(
+    uint32_t angleX100)
+{
+    uint64_t numerator;
+
+    numerator =
+        (uint64_t)angleX100 *
+        (uint64_t)MOTOR_PULSES_PER_REV;
+
+    /*
+     * 四舍五入。
+     */
+    numerator += 18000ULL;
+
+    return (uint32_t)(
+        numerator / 36000ULL
+    );
+}
+
+
+/*============================================================
+ * 23. 计算加速阶段脉冲数
+ *============================================================*/
+
+static uint32_t GetRampPulseCount(
+    uint32_t totalPulses)
+{
+#if RAMP_ENABLE == 0U
+
+    (void)totalPulses;
+
+    return 0U;
+
+#else
+
+    uint32_t rampPulses;
+
+    /*
+     * 脉冲数太少时不使用加减速。
+     */
+    if (totalPulses < 4U) {
+        return 0U;
+    }
+
+
+    rampPulses =
+        (
+            totalPulses *
+            RAMP_PERCENT
+        ) /
+        100U;
+
+
+    /*
+     * 至少使用2个脉冲。
+     */
+    if (rampPulses < 2U) {
+        rampPulses = 2U;
+    }
+
+
+    /*
+     * 限制最大加速脉冲数。
+     */
+    if (rampPulses > RAMP_MAX_PULSES) {
+        rampPulses = RAMP_MAX_PULSES;
+    }
+
+
+    /*
+     * 加速和减速脉冲总和不能超过总脉冲数。
+     */
+    if (
+        (rampPulses * 2U) >
+        totalPulses
+    ) {
+        rampPulses =
+            totalPulses / 2U;
+    }
+
+
+    return rampPulses;
+
+#endif
+}
+
+
+/*============================================================
+ * 24. 获取某一个脉冲的周期倍率
+ *============================================================*/
+
+static uint32_t GetRampFactorX1000(
+    uint32_t pulseIndex,
+    uint32_t totalPulses,
+    uint32_t rampPulses)
+{
+    uint32_t factorDifference;
+    uint32_t rampPosition;
+
+
+    if (
+        rampPulses < 2U ||
+        totalPulses < 4U
+    ) {
+        return RAMP_NORMAL_FACTOR_X1000;
+    }
+
+
+    factorDifference =
+        RAMP_START_FACTOR_X1000 -
+        RAMP_NORMAL_FACTOR_X1000;
+
+
+    /*
+     * 加速阶段：
+     *
+     * 第一个脉冲最慢，
+     * 随后逐渐加速到正常速度。
+     */
+    if (pulseIndex < rampPulses) {
+        rampPosition =
+            rampPulses -
+            1U -
+            pulseIndex;
+
+        return
+            RAMP_NORMAL_FACTOR_X1000 +
+            (
+                factorDifference *
+                rampPosition
+            ) /
+            (rampPulses - 1U);
+    }
+
+
+    /*
+     * 减速阶段：
+     *
+     * 从正常速度逐渐减速。
+     */
+    if (
+        pulseIndex >=
+        (totalPulses - rampPulses)
+    ) {
+        rampPosition =
+            pulseIndex -
+            (totalPulses - rampPulses);
+
+        return
+            RAMP_NORMAL_FACTOR_X1000 +
+            (
+                factorDifference *
+                rampPosition
+            ) /
+            (rampPulses - 1U);
+    }
+
+
+    /*
+     * 匀速阶段。
+     */
+    return RAMP_NORMAL_FACTOR_X1000;
+}
+
+
+/*============================================================
+ * 25. 计算整个加减速曲线倍率总和
+ *============================================================*/
+
+static uint64_t CalculateRampFactorSum(
+    uint32_t totalPulses,
+    uint32_t rampPulses)
+{
+    uint32_t pulseIndex;
+    uint64_t factorSum;
+
+    factorSum = 0ULL;
+
+    for (
+        pulseIndex = 0U;
+        pulseIndex < totalPulses;
+        pulseIndex++
+    ) {
+        factorSum +=
+            (uint64_t)GetRampFactorX1000(
+                pulseIndex,
+                totalPulses,
+                rampPulses
+            );
+    }
+
+    return factorSum;
+}
+
+
+/*============================================================
+ * 26. 计算单段运动参数
+ *============================================================*/
+
+static uint32_t CalculateMotionParameters(
+    uint32_t angleX100,
+    uint32_t rotateTimeMs,
+
+    volatile uint32_t *pulseCount,
+    volatile uint32_t *baseHalfPeriodCycles,
+    volatile uint32_t *rampPulseCount,
+
+    volatile uint32_t *actualAngleX100,
+    volatile uint32_t *frequencyHz,
+    volatile uint32_t *actualTimeMs)
+{
+    uint32_t calculatedPulseCount;
+    uint32_t calculatedRampPulses;
+    uint32_t calculatedBaseHalfPeriod;
+
+    uint32_t pulseIndex;
+    uint32_t factorX1000;
+    uint32_t currentHalfPeriod;
+
+    uint64_t totalCpuCycles;
+    uint64_t factorSum;
+    uint64_t numerator;
+    uint64_t denominator;
+    uint64_t actualTotalCycles;
+
+
+    /*
+     * 角度为0时跳过此阶段。
+     */
+    if (angleX100 == 0U) {
+        *pulseCount = 0U;
+        *baseHalfPeriodCycles = 0U;
+        *rampPulseCount = 0U;
+
+        *actualAngleX100 = 0U;
+        *frequencyHz = 0U;
+        *actualTimeMs = 0U;
+
+        g_error_code = ERROR_NONE;
+
+        return 1U;
+    }
+
+
+    /*
+     * 角度不为0，时间不能为0。
+     */
+    if (rotateTimeMs == 0U) {
+        g_error_code =
+            ERROR_TIME_ZERO;
+
+        return 0U;
+    }
+
+
+    calculatedPulseCount =
+        AngleX100ToPulses(
+            angleX100
+        );
+
+
+    if (calculatedPulseCount == 0U) {
+        g_error_code =
+            ERROR_ANGLE_TOO_SMALL;
+
+        return 0U;
+    }
+
+
+    calculatedRampPulses =
+        GetRampPulseCount(
+            calculatedPulseCount
+        );
+
+
+    factorSum =
+        CalculateRampFactorSum(
+            calculatedPulseCount,
+            calculatedRampPulses
+        );
+
+
+    if (factorSum == 0ULL) {
+        g_error_code =
+            ERROR_SPEED_TOO_HIGH;
+
+        return 0U;
+    }
+
+
+    /*
+     * 设定时间对应的CPU总周期。
+     */
+    totalCpuCycles =
+        (
+            (uint64_t)CPUCLK_FREQ *
+            (uint64_t)rotateTimeMs
+        ) /
+        1000ULL;
+
+
+    /*
+     * 计算匀速阶段的半周期。
+     *
+     * 每个脉冲：
+     * 高电平半周期 + 低电平半周期。
+     *
+     * 加减速阶段通过倍率改变半周期。
+     */
+    numerator =
+        totalCpuCycles *
+        1000ULL;
+
+    denominator =
+        2ULL *
+        factorSum;
+
+
+    calculatedBaseHalfPeriod =
+        (uint32_t)(
+            (
+                numerator +
+                denominator / 2ULL
+            ) /
+            denominator
+        );
+
+
+    /*
+     * 速度过高。
+     */
+    if (
+        calculatedBaseHalfPeriod <
+        MIN_HALF_PERIOD_CYCLES
+    ) {
+        g_error_code =
+            ERROR_SPEED_TOO_HIGH;
+
+        return 0U;
+    }
+
+
+    *pulseCount =
+        calculatedPulseCount;
+
+    *baseHalfPeriodCycles =
+        calculatedBaseHalfPeriod;
+
+    *rampPulseCount =
+        calculatedRampPulses;
+
+
+    /*
+     * 计算整数脉冲对应的实际角度。
+     */
+    *actualAngleX100 =
+        (uint32_t)(
+            (
+                (uint64_t)calculatedPulseCount *
+                36000ULL +
+                MOTOR_PULSES_PER_REV / 2U
+            ) /
+            MOTOR_PULSES_PER_REV
+        );
+
+
+    /*
+     * 最大频率，也就是匀速阶段的频率。
+     */
+    *frequencyHz =
+        CPUCLK_FREQ /
+        (
+            2U *
+            calculatedBaseHalfPeriod
+        );
+
+
+    /*
+     * 计算采用整数周期后的实际时间。
+     */
+    actualTotalCycles = 0ULL;
+
+    for (
+        pulseIndex = 0U;
+        pulseIndex < calculatedPulseCount;
+        pulseIndex++
+    ) {
+        factorX1000 =
+            GetRampFactorX1000(
+                pulseIndex,
+                calculatedPulseCount,
+                calculatedRampPulses
+            );
+
+        currentHalfPeriod =
+            (uint32_t)(
+                (
+                    (uint64_t)calculatedBaseHalfPeriod *
+                    (uint64_t)factorX1000 +
+                    500ULL
+                ) /
+                1000ULL
+            );
+
+
+        if (
+            currentHalfPeriod <
+            MIN_HALF_PERIOD_CYCLES
+        ) {
+            currentHalfPeriod =
+                MIN_HALF_PERIOD_CYCLES;
+        }
+
+
+        actualTotalCycles +=
+            2ULL *
+            (uint64_t)currentHalfPeriod;
+    }
+
+
+    *actualTimeMs =
+        (uint32_t)(
+            (
+                actualTotalCycles *
+                1000ULL +
+                CPUCLK_FREQ / 2U
+            ) /
+            CPUCLK_FREQ
+        );
+
+
+    g_error_code =
+        ERROR_NONE;
+
+    return 1U;
+}
+
+
+/*============================================================
+ * 27. 输出一个STEP脉冲
+ *============================================================*/
+
+static void OutputOneStepPulse(
+    uint32_t halfPeriodCycles)
+{
+    if (
+        halfPeriodCycles <
+        MIN_HALF_PERIOD_CYCLES
+    ) {
+        halfPeriodCycles =
+            MIN_HALF_PERIOD_CYCLES;
+    }
+
+
+    g_current_half_period_cycles =
+        halfPeriodCycles;
+
+
+    /*
+     * STEP上升沿。
+     */
+    DL_GPIO_setPins(
+        STEP_PORT,
+        STEP_PIN
+    );
+
+    g_step_output_level = 1U;
+
+
+    DL_Common_delayCycles(
+        halfPeriodCycles
+    );
+
+
+    /*
+     * STEP拉低。
+     */
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN
+    );
+
+    g_step_output_level = 0U;
+
+
+    DL_Common_delayCycles(
+        halfPeriodCycles
+    );
+
+
+    g_total_output_pulses++;
+}
+
+
+/*============================================================
+ * 28. 输出带加减速的脉冲
+ *============================================================*/
+
+static void OutputSmoothPulses(
+    uint32_t targetPulses,
+    uint32_t baseHalfPeriodCycles,
+    uint32_t rampPulses,
+    volatile uint32_t *outputPulseCounter)
+{
+    uint32_t pulseIndex;
+    uint32_t factorX1000;
+    uint32_t currentHalfPeriod;
+
+
+    *outputPulseCounter = 0U;
+
+
+    if (targetPulses == 0U) {
+        return;
+    }
+
+
+    for (
+        pulseIndex = 0U;
+        pulseIndex < targetPulses;
+        pulseIndex++
+    ) {
+        g_current_pulse_index =
+            pulseIndex;
+
+
+        factorX1000 =
+            GetRampFactorX1000(
+                pulseIndex,
+                targetPulses,
+                rampPulses
+            );
+
+
+        currentHalfPeriod =
+            (uint32_t)(
+                (
+                    (uint64_t)baseHalfPeriodCycles *
+                    (uint64_t)factorX1000 +
+                    500ULL
+                ) /
+                1000ULL
+            );
+
+
+        if (
+            currentHalfPeriod <
+            MIN_HALF_PERIOD_CYCLES
+        ) {
+            currentHalfPeriod =
+                MIN_HALF_PERIOD_CYCLES;
+        }
+
+
+        OutputOneStepPulse(
+            currentHalfPeriod
+        );
+
+
+        (*outputPulseCounter)++;
+    }
+
+
+    /*
+     * 每段运动结束后保证STEP为低。
+     */
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN
+    );
+
+    g_step_output_level = 0U;
+}
+
+
+/*============================================================
+ * 29. 执行左转
+ *============================================================*/
+
+static void RotateLeft(
+    uint32_t processIndex)
+{
+    g_left_output_pulses[
+        processIndex
+    ] = 0U;
+
+
+    if (
+        g_left_target_pulses[
+            processIndex
+        ] == 0U
+    ) {
+        return;
+    }
+
+
+    SetLeftDirection();
+
+
+    OutputSmoothPulses(
+        g_left_target_pulses[
+            processIndex
+        ],
+
+        g_left_half_period_cycles[
+            processIndex
+        ],
+
+        g_left_ramp_pulses[
+            processIndex
+        ],
+
+        &g_left_output_pulses[
+            processIndex
+        ]
+    );
+}
+
+
+/*============================================================
+ * 30. 执行右转
+ *============================================================*/
+
+static void RotateRight(
+    uint32_t processIndex)
+{
+    g_right_output_pulses[
+        processIndex
+    ] = 0U;
+
+
+    if (
+        g_right_target_pulses[
+            processIndex
+        ] == 0U
+    ) {
+        return;
+    }
+
+
+    SetRightDirection();
+
+
+    OutputSmoothPulses(
+        g_right_target_pulses[
+            processIndex
+        ],
+
+        g_right_half_period_cycles[
+            processIndex
+        ],
+
+        g_right_ramp_pulses[
+            processIndex
+        ],
+
+        &g_right_output_pulses[
+            processIndex
+        ]
+    );
+}
+
+
+/*============================================================
+ * 31. 进入错误状态
+ *============================================================*/
+
+static void EnterError(
+    uint32_t processIndex,
+    uint32_t errorStage)
+{
+    g_error_process =
+        processIndex + 1U;
+
+    g_error_stage =
+        errorStage;
+
+    g_run_state =
+        STATE_ERROR;
+
+
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN
+    );
+
+    g_step_output_level = 0U;
+
+
+    /*
+     * 参数错误时关闭驱动。
+     */
+    StepperEnable(0U);
+}
+
+
+/*============================================================
+ * 32. 计算全部运动参数
+ *============================================================*/
+
+static uint32_t CalculateAllProcesses(void)
+{
+    uint32_t processIndex;
+
+
+    for (
+        processIndex = 0U;
+        processIndex < PROCESS_COUNT;
+        processIndex++
+    ) {
+        if (
+            g_process_enable[
+                processIndex
+            ] == 0U
+        ) {
+            continue;
+        }
+
+
+        /*
+         * 计算左转参数。
+         */
+        if (
+            CalculateMotionParameters(
+                g_left_angle_x100[
+                    processIndex
+                ],
+
+                g_left_time_ms[
+                    processIndex
+                ],
+
+                &g_left_target_pulses[
+                    processIndex
+                ],
+
+                &g_left_half_period_cycles[
+                    processIndex
+                ],
+
+                &g_left_ramp_pulses[
+                    processIndex
+                ],
+
+                &g_left_actual_angle_x100[
+                    processIndex
+                ],
+
+                &g_left_frequency_hz[
+                    processIndex
+                ],
+
+                &g_left_actual_time_ms[
+                    processIndex
+                ]
+            ) == 0U
+        ) {
+            EnterError(
+                processIndex,
+                1U
+            );
+
+            return 0U;
+        }
+
+
+        /*
+         * 计算右转参数。
+         */
+        if (
+            CalculateMotionParameters(
+                g_right_angle_x100[
+                    processIndex
+                ],
+
+                g_right_time_ms[
+                    processIndex
+                ],
+
+                &g_right_target_pulses[
+                    processIndex
+                ],
+
+                &g_right_half_period_cycles[
+                    processIndex
+                ],
+
+                &g_right_ramp_pulses[
+                    processIndex
+                ],
+
+                &g_right_actual_angle_x100[
+                    processIndex
+                ],
+
+                &g_right_frequency_hz[
+                    processIndex
+                ],
+
+                &g_right_actual_time_ms[
+                    processIndex
+                ]
+            ) == 0U
+        ) {
+            EnterError(
+                processIndex,
+                2U
+            );
+
+            return 0U;
+        }
+    }
+
+
+    return 1U;
+}
+
+
+/*============================================================
+ * 33. 执行一组动作
+ *============================================================*/
+
+static void ExecuteOneProcess(
+    uint32_t processIndex)
+{
+    uint32_t holdTimeMs;
+
+
+    g_current_process =
+        processIndex + 1U;
+
+    g_current_process_index =
+        processIndex;
+
+
+    /*
+     * 禁用的过程直接跳过。
+     */
+    if (
+        g_process_enable[
+            processIndex
+        ] == 0U
+    ) {
+        g_process_finished[
+            processIndex
+        ] = 2U;
+
+        return;
+    }
+
+
+    /*
+     * 第一步：平滑向左转。
+     */
+    g_run_state =
+        STATE_ROTATING_LEFT;
+
+    RotateLeft(
+        processIndex
+    );
+
+
+    /*
+     * 第二步：左转结束后停留。
+     */
+    g_run_state =
+        STATE_HOLDING_LEFT;
+
+
+    holdTimeMs =
+        g_middle_hold_ms[
+            processIndex
+        ];
+
+
+    /*
+     * 左右两段都存在时，强制加入最短换向停顿。
+     */
+    if (
+        g_left_target_pulses[
+            processIndex
+        ] > 0U &&
+        g_right_target_pulses[
+            processIndex
+        ] > 0U
+    ) {
+        if (
+            holdTimeMs <
+            MIN_REVERSE_HOLD_MS
+        ) {
+            holdTimeMs =
+                MIN_REVERSE_HOLD_MS;
+        }
+    }
+
+
+    if (holdTimeMs > 0U) {
+        DelayMs(
+            holdTimeMs
+        );
+    }
+
+
+    /*
+     * 第三步：平滑向右转。
+     */
+    g_run_state =
+        STATE_ROTATING_RIGHT;
+
+    RotateRight(
+        processIndex
+    );
+
+
+    g_process_finished[
+        processIndex
+    ] = 1U;
+
+    g_finished_process_count++;
+
+
+    /*
+     * 第四步：本组结束后停留。
+     */
+    g_run_state =
+        STATE_HOLDING_AFTER_PROCESS;
+
+
+    holdTimeMs =
+        g_process_end_hold_ms[
+            processIndex
+        ];
+
+
+    if (
+        holdTimeMs <
+        MIN_PROCESS_GAP_MS
+    ) {
+        holdTimeMs =
+            MIN_PROCESS_GAP_MS;
+    }
+
+
+    DelayMs(
+        holdTimeMs
+    );
+}
+
+
+/*============================================================
+ * 34. 初始化调试变量
+ *============================================================*/
+
+static void ResetDebugVariables(void)
+{
+    uint32_t processIndex;
+
+
+    g_run_state =
+        STATE_WAITING;
+
+    g_current_process = 0U;
+    g_current_process_index = 0U;
+
+    g_error_code =
+        ERROR_NONE;
+
+    g_error_process = 0U;
+    g_error_stage = 0U;
+
+    g_total_output_pulses = 0U;
+    g_finished_process_count = 0U;
+    g_all_motion_finished = 0U;
+
+    g_current_half_period_cycles = 0U;
+    g_current_pulse_index = 0U;
+
+
+    for (
+        processIndex = 0U;
+        processIndex < PROCESS_COUNT;
+        processIndex++
+    ) {
+        g_left_output_pulses[
+            processIndex
+        ] = 0U;
+
+        g_right_output_pulses[
+            processIndex
+        ] = 0U;
+
+        g_process_finished[
+            processIndex
+        ] = 0U;
+    }
+}
+
+
+/*============================================================
+ * 35. 主函数
+ *============================================================*/
+
+int main(void)
+{
+    uint32_t processIndex;
+
+
+    /*
+     * SysConfig初始化。
+     */
+    SYSCFG_DL_init();
+
+
+    /*
+     * GPIO安全初始化。
+     */
+    StepperGPIOInit();
+
+
+    /*
+     * 初始化所有调试变量。
+     */
+    ResetDebugVariables();
+
+
+    /*
+     * 先计算所有参数。
+     */
+    if (
+        CalculateAllProcesses() == 0U
+    ) {
+        while (1) {
+            __WFI();
+        }
+    }
+
+
+    /*
+     * 尽早使能驱动并保持锁轴。
+     *
+     * 不再先关闭3秒，再突然使能。
+     */
+    StepperEnable(1U);
+
+    g_run_state =
+        STATE_DRIVER_ENABLED;
+
+
+    /*
+     * 等待驱动电流稳定。
+     */
+    DelayMs(
+        ENABLE_SETTLE_MS
+    );
+
+
+    /*
+     * 等待开始。
+     *
+     * 此时电机已经锁住，
+     * 不能手动旋转电机。
+     */
+    g_run_state =
+        STATE_WAITING;
+
+    DelayMs(
+        START_DELAY_MS
+    );
+
+
+    /*
+     * 依次执行五组动作。
+     */
+    for (
+        processIndex = 0U;
+        processIndex < PROCESS_COUNT;
+        processIndex++
+    ) {
+        ExecuteOneProcess(
+            processIndex
+        );
+    }
+
+
+    /*
+     * 所有动作完成。
+     */
+    g_all_motion_finished = 1U;
+
+    g_run_state =
+        STATE_FINISHED;
+
+
+    /*
+     * 保证STEP最终为低。
+     */
+    DL_GPIO_clearPins(
+        STEP_PORT,
+        STEP_PIN
+    );
+
+    g_step_output_level = 0U;
+
+
+#if HOLD_AFTER_FINISH == 0U
+
+    /*
+     * 关闭驱动，允许手动转动。
+     */
+    StepperEnable(0U);
+
+#endif
+
+
+    while (1) {
+        __WFI();
+    }
+}
